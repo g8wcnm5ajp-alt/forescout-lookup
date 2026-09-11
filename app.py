@@ -73,18 +73,22 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 # ---------------------------------------------------------------------
 # Login -- David's ask, 2026-08-26 (Phase D of the EM-hosted package):
-# one Admin account, default password "ForescoutTechSupport123",
-# forced change on first login. Password hashed with werkzeug's own
-# generate_password_hash/check_password_hash (already a Flask
-# dependency -- no new package needed; check_password_hash does a
+# one Admin account, forced change on first login. Password hashed with
+# werkzeug's own generate_password_hash/check_password_hash (already a
+# Flask dependency -- no new package needed; check_password_hash does a
 # timing-safe compare internally) and stored in /data/auth.json, never
 # plaintext. Every route requires a session except /login itself and
 # static assets -- gated via one before_request hook rather than
 # decorating each view individually, so a route added later can't
 # accidentally ship unauthenticated by omission.
+#
+# The initial password is generated fresh on first boot (not a fixed
+# string baked into source -- this repo is public) and written once to
+# INITIAL_PASSWORD_PATH plus stdout, so whoever deploys can retrieve it
+# once; must_change_password then forces it to be replaced immediately.
 # ---------------------------------------------------------------------
 AUTH_PATH = os.path.join(DATA_DIR, "auth.json")
-DEFAULT_ADMIN_PASSWORD = "ForescoutTechSupport123"
+INITIAL_PASSWORD_PATH = os.path.join(DATA_DIR, "initial-admin-password.txt")
 
 # Persisted, not regenerated each boot -- a fresh secret key on every
 # container restart would silently log everyone out every redeploy,
@@ -112,12 +116,17 @@ app.config["SESSION_COOKIE_SECURE"] = bool(os.environ.get("FORESCOUT_SSL_CERT"))
 
 def _load_auth():
     if not os.path.isfile(AUTH_PATH):
+        initial_password = secrets.token_urlsafe(12)
         auth = {
             "username": "admin",
-            "password_hash": generate_password_hash(DEFAULT_ADMIN_PASSWORD),
+            "password_hash": generate_password_hash(initial_password),
             "must_change_password": True,
         }
         _save_auth(auth)
+        with open(INITIAL_PASSWORD_PATH, "w") as f:
+            f.write(initial_password + "\n")
+        os.chmod(INITIAL_PASSWORD_PATH, 0o600)
+        print(f"[forescout-lookup] Generated initial admin password: {initial_password}", flush=True)
         return auth
     with open(AUTH_PATH) as f:
         return json.load(f)
@@ -204,12 +213,14 @@ def change_password_route():
                 error = "New password must be at least 8 characters."
             elif new_password != confirm_password:
                 error = "New password and confirmation do not match."
-            elif new_password == DEFAULT_ADMIN_PASSWORD:
-                error = "Choose a password different from the default."
+            elif check_password_hash(auth["password_hash"], new_password):
+                error = "Choose a password different from your current one."
             else:
                 auth["password_hash"] = generate_password_hash(new_password)
                 auth["must_change_password"] = False
                 _save_auth(auth)
+                if os.path.isfile(INITIAL_PASSWORD_PATH):
+                    os.remove(INITIAL_PASSWORD_PATH)
                 _log_activity("password_changed", username=session.get("username"))
                 return redirect(url_for("index"))
     return render_template(

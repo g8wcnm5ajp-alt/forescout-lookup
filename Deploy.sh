@@ -243,7 +243,9 @@ cat <<EOF
 
   https://${EM_IP:-<this-EM-ip>}:${HTTPS_PORT}/
 
-Default login: admin / ForescoutTechSupport123
+Default login: admin / a random password generated on first boot --
+run 'docker logs' or check /data/initial-admin-password.txt on the
+container's data volume to retrieve it.
 (you will be forced to change this on first sign-in)
 
 To uninstall later: sudo ./Remove.sh

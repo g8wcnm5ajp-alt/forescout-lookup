@@ -26,7 +26,7 @@ Safe to re-run — every step is idempotent.
 https://<this-EM's-IP>:8443/
 ```
 
-Default login: `admin` / `ForescoutTechSupport123` — you'll be forced to change this on first sign-in.
+Default login: `admin` / a random password generated on first boot, printed to the container logs (`docker logs`) and written once to `/data/initial-admin-password.txt` — you'll be forced to change this on first sign-in, after which that file is deleted.
 
 ## Uninstall
 
