@@ -12,9 +12,10 @@
 #      keypair for this app, and registers its public half in this
 #      EM's own authorized_keys restricted to ONLY that wrapper -- the
 #      private key never leaves this box.
-#   2. Uses a cert.pem + private.key already dropped into certs/ by
-#      hand (e.g. one issued by your own internal CA), or falls back
-#      to copying this EM's own Apache SSL cert if none was supplied.
+#   2. Generates a self-signed HTTPS cert on first install (browsers
+#      show a one-time trust warning) -- reuses it as-is on any rerun,
+#      including one dropped into certs/ later via the app's own
+#      Certificate page.
 #   3. Creates the TechSupportBridge docker network.
 #   4. Loads and runs the bundled image -- auto-restarts on reboot.
 #   5. Opens the app's port through this EM's own built-in firewall via
@@ -110,63 +111,20 @@ KEY_PASSWORD_FILE="${CERT_DIR}/key_password.txt"
 
 if [ -f "$CERT_DIR/cert.pem" ] && [ -f "$CERT_DIR/private.key" ]; then
     echo "Using cert/key already in $CERT_DIR from a previous run -- not touching them"
-    echo "(delete $CERT_DIR/cert.pem and $CERT_DIR/private.key first if you want to supply new ones)"
+    echo "(delete $CERT_DIR/cert.pem and $CERT_DIR/private.key first if you want a new one generated,"
+    echo " or replace them via the app's own Certificate page once it's running)"
 else
-    echo "No cert/key found in $CERT_DIR yet."
-    echo
-    echo "  1) I have a cert + key to use (e.g. one issued by our own internal CA)"
-    echo "  2) Use this EM's own Apache web cert (${APACHE_CERT})"
-    echo "  3) Generate a self-signed cert (browsers will show a one-time trust warning)"
-    echo
-    read -r -p "Choice [1/2/3]: " CERT_CHOICE
-
-    case "$CERT_CHOICE" in
-        1)
-            read -r -p "Path to the certificate (PEM, leaf or full chain): " USER_CERT_PATH
-            read -r -p "Path to the private key (PEM): " USER_KEY_PATH
-            if [ ! -f "$USER_CERT_PATH" ] || [ ! -f "$USER_KEY_PATH" ]; then
-                echo "Error: could not find one or both of those files." >&2
-                exit 1
-            fi
-            cp "$USER_CERT_PATH" "$CERT_DIR/cert.pem"
-            cp "$USER_KEY_PATH" "$CERT_DIR/private.key"
-            chmod 600 "$CERT_DIR/private.key"
-            echo "Installed the supplied cert/key into $CERT_DIR"
-            ;;
-        2)
-            if [ ! -f "$APACHE_CERT" ] || [ ! -f "$APACHE_KEY" ]; then
-                echo "Error: $APACHE_CERT / $APACHE_KEY not found -- this isn't a real EM, or the cert has moved." >&2
-                exit 1
-            fi
-            cp "$APACHE_CERT" "$CERT_DIR/cert.pem"
-            cp "$APACHE_KEY" "$CERT_DIR/private.key"
-            chmod 600 "$CERT_DIR/private.key"
-            echo "Copied this EM's own Apache web cert into $CERT_DIR"
-            ;;
-        3)
-            EM_IP_FOR_CERT="$(hostname -I 2>/dev/null | awk '{print $1}')"
-            EM_FQDN="$(hostname -f 2>/dev/null || hostname)"
-            openssl req -x509 -newkey rsa:4096 -nodes \
-                -keyout "$CERT_DIR/private.key" -out "$CERT_DIR/cert.pem" \
-                -days 825 -subj "/CN=${EM_FQDN}" \
-                -addext "subjectAltName=DNS:${EM_FQDN},IP:${EM_IP_FOR_CERT:-127.0.0.1}" \
-                >/dev/null 2>&1
-            chmod 600 "$CERT_DIR/private.key"
-            echo "Generated a self-signed cert for ${EM_FQDN} in $CERT_DIR"
-            echo "(browsers will show a one-time trust warning for this cert -- expected)"
-            ;;
-        *)
-            echo "Error: invalid choice." >&2
-            exit 1
-            ;;
-    esac
-
-    if grep -q "ENCRYPTED" "$CERT_DIR/private.key" 2>/dev/null; then
-        read -r -s -p "That key is passphrase-protected -- enter its passphrase: " KEY_PASS
-        echo
-        printf "%s" "$KEY_PASS" > "$KEY_PASSWORD_FILE"
-        chmod 600 "$KEY_PASSWORD_FILE"
-    fi
+    echo "No cert/key found in $CERT_DIR yet -- generating a self-signed one."
+    echo "(browsers will show a one-time trust warning; replace it later via the app's own Certificate page)"
+    EM_IP_FOR_CERT="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    EM_FQDN="$(hostname -f 2>/dev/null || hostname)"
+    openssl req -x509 -newkey rsa:4096 -nodes \
+        -keyout "$CERT_DIR/private.key" -out "$CERT_DIR/cert.pem" \
+        -days 825 -subj "/CN=${EM_FQDN}" \
+        -addext "subjectAltName=DNS:${EM_FQDN},IP:${EM_IP_FOR_CERT:-127.0.0.1}" \
+        >/dev/null 2>&1
+    chmod 600 "$CERT_DIR/private.key"
+    echo "Generated a self-signed cert for ${EM_FQDN} in $CERT_DIR"
 fi
 
 if grep -q "ENCRYPTED" "$CERT_DIR/private.key" 2>/dev/null && [ ! -f "$KEY_PASSWORD_FILE" ]; then

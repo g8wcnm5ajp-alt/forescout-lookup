@@ -11,7 +11,7 @@ sudo ./Deploy.sh
 Run this **on the EM itself**, as root, from inside this unpacked directory. It:
 
 1. Installs the bundled `webapp-query.py` forced-command wrapper onto this EM (if not already present), generates a dedicated SSH keypair for this app, and registers it in this EM's own `authorized_keys`, restricted to that wrapper. The private key never leaves this box.
-2. Sets up an HTTPS certificate — interactively asks for one to upload, offers to reuse this EM's own Apache SSL cert, or generates a self-signed one if you don't have either handy.
+2. Generates a self-signed HTTPS cert on first install (browsers show a one-time trust warning). Reused as-is on any rerun — replace it later via the app's own Certificate page, or drop a real cert/key into `certs/` by hand before rerunning `Deploy.sh`.
 3. Creates the `TechSupportBridge` docker network.
 4. Loads and starts the container (auto-restarts on reboot).
 5. Opens port 8443 through this EM's own firewall via `fstool fw addhook` (survives a firewall reactivation/reboot).
