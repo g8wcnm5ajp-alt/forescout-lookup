@@ -35,7 +35,8 @@ app = Flask(__name__)
 # process start time, not a hand-maintained date -- every deploy does a
 # fresh `docker rm -f` + `docker run` (see start.sh), so this is always
 # accurate without needing to remember to update it separately from the
-# version string. Shown on the Help tab, not a page footer (David's call).
+# version string. Shown next to the page title (David's ask, 2026-09-12)
+# and in the Help tab's own detail table.
 APP_VERSION = "1.1.0"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
