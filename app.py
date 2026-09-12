@@ -36,7 +36,7 @@ app = Flask(__name__)
 # fresh `docker rm -f` + `docker run` (see start.sh), so this is always
 # accurate without needing to remember to update it separately from the
 # version string. Shown on the Help tab, not a page footer (David's call).
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
@@ -1733,6 +1733,137 @@ def lookup_debug_log_download_route():
         data.get("log", ""),
         mimetype="text/plain",
         headers={"Content-Disposition": 'attachment; filename="lookup-debug.log"'},
+    )
+
+
+# ---------------------------------------------------------------------
+# Support log download -- David's ask, 2026-09-12: a button for someone
+# hitting a problem with THIS APP itself (not a specific Forescout host
+# lookup -- that's what the Debug Log above already covers) to describe
+# what's wrong and get back one zip bundling that description together
+# with everything this app already logs about its own operation, so a
+# case doesn't depend on someone pulling files off the EM by hand or
+# pasting console output. Generated synchronously (these are small,
+# already-local/already-tailed text files, not a multi-minute fstool
+# build) and written to one fixed path -- a new click just overwrites
+# the last one, no cleanup/retention logic needed for something this
+# small and disposable.
+# ---------------------------------------------------------------------
+SUPPORT_LOG_PATH = os.path.join(DATA_DIR, "support_log.zip")
+
+# Local, already-written-elsewhere logs worth bundling if present -- not
+# a reason on their own to create anything new. Each entry in these
+# .jsonl files carries its own "username" key (this app's own login,
+# see _log_activity/api_client_debug_log above) -- stripped out below,
+# not copied verbatim, since this bundle can leave the building.
+_SUPPORT_LOG_LOCAL_FILES = [
+    (ACTIVITY_LOG_PATH, "activity_log.jsonl"),
+    (CLIENT_DEBUG_LOG_PATH, "client_debug_log.jsonl"),
+    (LOG_PATH, "scheduled_debug_log.jsonl"),
+]
+
+# Credential-shaped key=value / "key": "value" patterns, redacted out of
+# everything that goes into a support log bundle -- David's explicit
+# ask, 2026-09-12, since this zip is meant to leave the building (email,
+# a case attachment) and nothing here should ever have to be scrubbed by
+# hand first. Covers this app's own JSON logs and the plain-text
+# EM-side ones alike; deliberately broad (any *_password/_pwd/_secret-
+# shaped key too, not just the exact words) since a future log line
+# this app doesn't control the format of (fstool/EM output) could use a
+# slightly different key name.
+_SECRET_KV_RE = re.compile(
+    r"""(?i)(\b\w*(?:user(?:name)?|pass(?:word)?|pwd|secret)\w*"?\s*[:=]\s*)("[^"\n]*"|'[^'\n]*'|\S+)"""
+)
+
+
+def _redact_secrets(text):
+    return _SECRET_KV_RE.sub(lambda m: m.group(1) + "[redacted]", text)
+
+
+def _redact_jsonl_username(path):
+    """Strips the "username" field out of each entry rather than regex-guessing over already-serialized
+    JSON -- exact, and doesn't risk mangling the surrounding JSON structure the way a text-level redaction
+    of a JSON value could (e.g. a value containing an escaped quote)."""
+    lines = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            entry.pop("username", None)
+            lines.append(json.dumps(entry))
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+@app.route("/api/support_log", methods=["POST"])
+def api_support_log():
+    # JSON body, same reasoning as /api/client_debug_log above --
+    # _check_csrf() only reads request.form.
+    payload = request.get_json(silent=True) or {}
+    token = payload.pop("csrf_token", "")
+    if not (token and secrets.compare_digest(token, session.get("csrf_token", ""))):
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    description = (payload.get("description") or "").strip()
+    generated_at = datetime.now(timezone.utc)
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        info_lines = [
+            f"Generated: {generated_at.isoformat()}",
+            f"Remote address: {request.remote_addr}",
+            f"User agent: {request.headers.get('User-Agent', '')}",
+            f"App version: {APP_VERSION}",
+            f"Deployed at: {DEPLOYED_AT.isoformat()}",
+            "",
+            "Issue description:",
+            description or "(none provided)",
+        ]
+        zf.writestr("description.txt", _redact_secrets("\n".join(info_lines)))
+
+        for src_path, arcname in _SUPPORT_LOG_LOCAL_FILES:
+            if os.path.isfile(src_path):
+                zf.writestr(arcname, _redact_jsonl_username(src_path))
+
+        # Best-effort -- an SSH hiccup to the EM shouldn't block getting
+        # the rest of the bundle back, same reasoning as the live-poll
+        # log views above.
+        try:
+            data = tail_lookup_debug_log()
+            zf.writestr("lookup_debug_log.log", _redact_secrets(data.get("log", "")))
+        except ForescoutClientError as e:
+            zf.writestr("lookup_debug_log.log", f"(unavailable: {e})")
+
+        try:
+            data = tail_techsupport_log()
+            zf.writestr("techsupport_log.log", _redact_secrets(data.get("log", "")))
+        except ForescoutClientError as e:
+            zf.writestr("techsupport_log.log", f"(unavailable: {e})")
+
+    with open(SUPPORT_LOG_PATH, "wb") as f:
+        f.write(buf.getvalue())
+
+    _log_activity(
+        "support_log_generated", username=session.get("username"),
+        description_preview=description[:200],
+    )
+    return jsonify({
+        "ok": True,
+        "download_url": url_for("support_log_download_route"),
+        "filename": f"forescout-lookup-support-{generated_at.strftime('%Y%m%d-%H%M%S')}.zip",
+    })
+
+
+@app.route("/support_log/download", methods=["GET"])
+def support_log_download_route():
+    if not os.path.isfile(SUPPORT_LOG_PATH):
+        return "No support log has been generated yet -- click Support Log and Generate first.", 404
+    return send_file(
+        SUPPORT_LOG_PATH, mimetype="application/zip", as_attachment=True,
+        download_name="forescout-lookup-support-log.zip",
     )
 
 

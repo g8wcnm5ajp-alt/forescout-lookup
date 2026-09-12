@@ -41,7 +41,7 @@ h1 { margin-bottom: 0.2rem; }
     margin: 1.5rem 0;
 }
 
-input[type="text"], select {
+input[type="text"], select, textarea {
     background: var(--panel);
     border: 1px solid var(--border);
     color: var(--text);
@@ -51,6 +51,7 @@ input[type="text"], select {
 }
 
 input[type="text"] { flex: 1; }
+textarea { font-family: inherit; resize: vertical; box-sizing: border-box; }
 
 button {
     background: var(--accent);

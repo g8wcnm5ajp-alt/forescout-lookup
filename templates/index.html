@@ -21,6 +21,7 @@
                 <a href="{{ url_for('certs_route') }}">Certificates</a>
                 &middot; <a href="{{ url_for('change_password_route') }}">Change password</a>
                 &middot; <a href="#" id="openDebugLogBtn">Debug Log</a>
+                &middot; <a href="#" id="openSupportLogBtn">Support Log</a>
                 &middot; <form method="post" action="{{ url_for('logout_route') }}" style="display:inline;"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit" class="btn-small btn-secondary">Logout</button></form>
             </div>
         </div>
@@ -33,6 +34,22 @@
             <button type="button" class="page-tab-btn{% if active_page_tab == "techsupport" %} active{% endif %}" data-page-tab-target="techsupport">Tech Support Bundle Generator</button>
             <button type="button" class="page-tab-btn" data-page-tab-target="templates">Templates</button>
             <button type="button" class="page-tab-btn" data-page-tab-target="help">Help</button>
+        </div>
+
+        <div id="support-log-modal" class="modal-overlay" style="display:none;">
+            <div class="modal-box">
+                <h3>Support log download</h3>
+                <p class="hint">Describe what's going wrong -- this bundles that description together with this app's own recent activity/debug logs into one zip you can send back for diagnosis.</p>
+                <textarea id="support-log-description" rows="5" style="width:100%;" placeholder="What were you trying to do, and what happened instead?"></textarea>
+                <div id="support-log-status" class="hint" style="min-height:1.2em;"></div>
+                <div id="support-log-result" style="display:none;">
+                    <a id="support-log-download-link" href="#" class="btn-small btn-gold" download>Download support log</a>
+                </div>
+                <div class="modal-actions">
+                    <button type="button" id="support-log-cancel" class="btn-secondary">Close</button>
+                    <button type="button" id="support-log-generate" class="btn-gold">Generate</button>
+                </div>
+            </div>
         </div>
 
         <section class="page-tab-panel{% if active_page_tab != "lookup" %} page-tab-panel-hidden{% endif %}" data-page-tab-panel="lookup">
@@ -2920,6 +2937,69 @@
                     });
                 }
                 pollDebugLog();
+            });
+        })();
+
+        // Support log download modal -- David's ask, 2026-09-12: for
+        // problems with this app itself (not a specific lookup's trace,
+        // which the Debug Log popup above already covers). Describe the
+        // issue, POST it to /api/support_log which bundles it with this
+        // app's own recent logs server-side and returns a download
+        // link -- self-contained IIFE, no shared state with Debug Log.
+        (function () {
+            const openBtn = document.getElementById("openSupportLogBtn");
+            const modal = document.getElementById("support-log-modal");
+            if (!openBtn || !modal) return;
+            const descEl = document.getElementById("support-log-description");
+            const statusEl = document.getElementById("support-log-status");
+            const resultEl = document.getElementById("support-log-result");
+            const linkEl = document.getElementById("support-log-download-link");
+            const generateBtn = document.getElementById("support-log-generate");
+            const cancelBtn = document.getElementById("support-log-cancel");
+
+            function closeModal() { modal.style.display = "none"; }
+
+            openBtn.addEventListener("click", (e) => {
+                e.preventDefault();
+                statusEl.textContent = "";
+                resultEl.style.display = "none";
+                generateBtn.disabled = false;
+                generateBtn.textContent = "Generate";
+                modal.style.display = "";
+                descEl.focus();
+            });
+
+            cancelBtn.addEventListener("click", closeModal);
+            modal.addEventListener("click", (e) => { if (e.target === modal) closeModal(); });
+
+            generateBtn.addEventListener("click", () => {
+                generateBtn.disabled = true;
+                generateBtn.textContent = "Generating…";
+                statusEl.textContent = "Collecting logs…";
+                resultEl.style.display = "none";
+                fetch("/api/support_log", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ description: descEl.value, csrf_token: CSRF_TOKEN }),
+                })
+                    .then(r => r.json())
+                    .then(d => {
+                        generateBtn.disabled = false;
+                        generateBtn.textContent = "Generate";
+                        if (d.error) {
+                            statusEl.textContent = d.error;
+                            return;
+                        }
+                        statusEl.textContent = "Support log ready.";
+                        linkEl.href = d.download_url;
+                        linkEl.setAttribute("download", d.filename || "forescout-lookup-support-log.zip");
+                        resultEl.style.display = "";
+                    })
+                    .catch(() => {
+                        generateBtn.disabled = false;
+                        generateBtn.textContent = "Generate";
+                        statusEl.textContent = "Something went wrong generating the support log -- try again.";
+                    });
             });
         })();
     </script>
