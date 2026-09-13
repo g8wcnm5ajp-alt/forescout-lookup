@@ -90,11 +90,15 @@ enabled policies found for this host", which is silently wrong rather than broke
 this isn't a stale cache: grepped `nprules.xml`/`nptree.xml` directly on the EM, bypassing the app's
 own `policy_tree_cache.json`.
 
-**Not yet fixed** -- David's call, 2026-08-28: report only for now, no code change. Options on the
-table for later: (a) widen `build_policy_tree()` to include every top-level folder, not just NINHS
-(simplest, but the tree grows well past 2712 nodes), or (b) keep NINHS-only but have the UI surface
-"N matched rule(s) exist outside the displayed tree" instead of a bare "no matches" when
-`/api/matched` returns IDs the tree doesn't contain.
+**Fixed 2026-09-13** (see the vault's Forescout Host Lookup Web App note, Round 40 -- was report-only
+at the time, 2026-08-28: David's call then was no code change yet). `build_policy_tree()` now sources
+the whole real tree structurally from `nptree.xml` itself (whatever folders actually exist on the
+deployed system), not a hardcoded `NINHS` name -- confirmed live post-fix that `Test-Polices` is
+present in the tree. Original options that were on the table: (a) widen `build_policy_tree()` to
+include every top-level folder, not just NINHS (simplest, but the tree grows well past 2712 nodes;
+this is the option effectively taken, generalized to not hardcode any name at all), or (b) keep
+NINHS-only but have the UI surface "N matched rule(s) exist outside the displayed tree" instead of a
+bare "no matches" when `/api/matched` returns IDs the tree doesn't contain.
 
 ---
 

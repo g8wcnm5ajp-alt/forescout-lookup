@@ -271,7 +271,7 @@
                 </div>
 
                 <div class="card">
-                    <h3>Policy tree <span class="muted">(NINHS -- last-checked rule(s) highlighted)</span></h3>
+                    <h3>Current Policy Tree</h3>
                     <div class="tree-filter-row">
                         <label class="tree-filter-toggle">
                             <input type="checkbox" id="tree-filter-{{ slug }}" checked>
@@ -745,7 +745,7 @@
         {% set result = entry.result %}
         {% set slug = result.ip|replace('.', '-') %}
         <script>
-        // Renders the NINHS policy tree client-side (fetched once) and
+        // Renders the full policy tree client-side (fetched once) and
         // highlights whichever rule(s) were most recently evaluated for
         // this host. No auto-refresh -- an earlier version polled every
         // ~7s and re-ran the highlight (including an auto-scroll), which
@@ -821,7 +821,8 @@
             // custom SVG node-link layout, not an external charting library -- avoids adding an
             // outbound/CDN dependency for what's really a simple tree shape, and the default
             // "matched only" filter keeps the typical render small (a handful of nodes); the
-            // unfiltered full NINHS tree (2712 nodes) is large but pannable/scrollable, and every
+            // unfiltered full tree (thousands of nodes across every top-level folder) is large but
+            // pannable/scrollable, and every
             // node with children is click-to-collapse so it stays navigable. collapsedIds persists
             // across re-renders (filter toggle, window change) so expand/collapse state isn't lost
             // by an unrelated control changing.
