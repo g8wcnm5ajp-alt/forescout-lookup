@@ -37,6 +37,25 @@ def valid_ip(ip):
     return bool(IP_RE.match(ip or ""))
 
 
+# A managed target (the EM or a specific appliance) may be addressed by
+# IP or, on some deployments, by DNS hostname -- the EM's own reg table
+# can store either (see _get_fstool_dns_servers/_resolve_target_host in
+# webapp-query.py, added 2026-08-28 for exactly this). Confirmed live
+# 2026-09-14: every target-taking verb here was rejecting a real,
+# working hostname target outright at this shape-check layer, before
+# the EM's own resolve_target ever got a chance to match it against the
+# reg table's own (hostname-shaped) address values -- not a DNS
+# problem, this app's own validation was just IP-only. valid_ip stays
+# separate and unchanged for HOST ips (the thing actually being looked
+# up), which are always IP-addressed in this app's domain.
+HOSTNAME_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+TARGET_RE = re.compile(rf"^(?:{IP_RE.pattern[1:-1]}|{HOSTNAME_LABEL}(?:\.{HOSTNAME_LABEL})+)$")
+
+
+def valid_target(target):
+    return bool(TARGET_RE.match(target or ""))
+
+
 def _run_verb(verb_command, timeout):
     if not os.path.isfile(SSH_KEY_PATH):
         raise ForescoutClientError(
@@ -117,8 +136,8 @@ def debug_set_appliance(target, spec, case_ref=None, timeout=45):
     "-" -for-none convention as every other optional wire token here, so
     the EM-side verb pattern stays unambiguous.
     """
-    if not valid_ip(target):
-        raise ForescoutClientError(f"'{target}' is not a valid target IP.")
+    if not valid_target(target):
+        raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
     items = [i for i in (spec or "").split(",") if i]
     if not items or not all(DEBUGSET_ITEM_RE.match(i) for i in items):
         raise ForescoutClientError("Invalid debug configuration.")
@@ -139,15 +158,15 @@ TRACE_ITEM_RE = re.compile(r"^[A-Za-z0-9_]{1,80}:(on|off):(error|warning|normal|
 
 def trace_list(target, timeout=20):
     """Every trace category on target, live state + captured-once default alongside each."""
-    if not valid_ip(target):
-        raise ForescoutClientError(f"'{target}' is not a valid target IP.")
+    if not valid_target(target):
+        raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
     return _run_verb(f"tracelist {target}", timeout=timeout)
 
 
 def trace_defaults(target, timeout=20):
     """Just the captured-once default snapshot for target -- used by the auto-revert timer."""
-    if not valid_ip(target):
-        raise ForescoutClientError(f"'{target}' is not a valid target IP.")
+    if not valid_target(target):
+        raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
     return _run_verb(f"tracedefaults {target}", timeout=timeout)
 
 
@@ -155,8 +174,8 @@ def trace_set(target, changes, timeout=20):
     """changes: {category: (enabled_bool, level_str), ...} -- shape-validated here (defense in depth)
     before ever reaching SSH; every category name is re-validated against the box's own live file
     EM-side regardless."""
-    if not valid_ip(target):
-        raise ForescoutClientError(f"'{target}' is not a valid target IP.")
+    if not valid_target(target):
+        raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
     if not changes:
         raise ForescoutClientError("No trace changes given.")
     parts = []
@@ -250,8 +269,8 @@ def _selected_plugins_token(selected_plugins):
         return "-"
     pairs = []
     for target, plugins in selected_plugins.items():
-        if not valid_ip(target):
-            raise ForescoutClientError(f"'{target}' is not a valid target IP.")
+        if not valid_target(target):
+            raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
         for plugin in plugins:
             if not PLUGIN_NAME_RE.match(plugin):
                 raise ForescoutClientError(f"'{plugin}' is not a valid plugin name.")
@@ -281,8 +300,8 @@ def _selected_dbtables_token(selected_dbtables):
         return "-"
     pairs = []
     for target, databases in selected_dbtables.items():
-        if not valid_ip(target):
-            raise ForescoutClientError(f"'{target}' is not a valid target IP.")
+        if not valid_target(target):
+            raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
         for database in databases:
             if not DBTABLE_NAME_RE.match(database):
                 raise ForescoutClientError(f"'{database}' is not a valid database name.")
@@ -364,8 +383,8 @@ def build_techsupport_window_appliance(target, start_epoch, end_epoch, plugins, 
     can't be backdated, so this pulls from already-rotated logs instead
     via fstool's own -t utc:X -t utc:Y range, confirmed live).
     """
-    if not valid_ip(target):
-        raise ForescoutClientError(f"'{target}' is not a valid target IP.")
+    if not valid_target(target):
+        raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
     if not (isinstance(start_epoch, int) and isinstance(end_epoch, int) and 0 < start_epoch < end_epoch):
         raise ForescoutClientError("Invalid time window.")
     if not plugins or not all(PLUGIN_NAME_RE.match(p) for p in plugins):
@@ -565,8 +584,8 @@ def run_show_errors(target, duration, timeout=1200):
     unscoped snapshot, hence the generous timeout (the caller runs this
     in a background thread and polls, never inline in a request).
     """
-    if not valid_ip(target):
-        raise ForescoutClientError(f"'{target}' is not a valid target IP.")
+    if not valid_target(target):
+        raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
     if not DURATION_RE.match(duration or ""):
         raise ForescoutClientError(f"'{duration}' is not a valid duration (expected e.g. 30m, 2h).")
     return _run_verb(f"runshowerrors {target} {duration}", timeout=timeout)

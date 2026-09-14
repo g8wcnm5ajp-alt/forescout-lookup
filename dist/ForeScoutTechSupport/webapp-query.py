@@ -244,6 +244,19 @@ import xml.etree.ElementTree as ET
 IP_OCTET = r"(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
 IP_RE = rf"{IP_OCTET}(?:\.{IP_OCTET}){{3}}"
 
+# A managed target (the EM or a specific appliance) may be addressed by
+# IP or, on some deployments, by DNS hostname -- the EM's own reg table
+# (get_node_map) can hold either. Confirmed live 2026-09-14: every
+# target-taking verb's dispatch pattern below required IP_RE, rejecting
+# a real, working hostname target (e.g. farncaapp1.yubique.com) before
+# resolve_target ever got a chance to match it against the reg table's
+# own (hostname-shaped) address value -- not a DNS problem, this
+# dispatcher's own shape check was just IP-only. Distinct from IP_RE,
+# which stays as-is for verbs addressing a HOST being looked up (always
+# IP-addressed in this app's domain, e.g. lookup/arplist/history).
+HOSTNAME_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+TARGET_RE = rf"(?:{IP_RE}|{HOSTNAME_LABEL}(?:\.{HOSTNAME_LABEL})+)"
+
 # One "<plugin>:<level>:<minutes>" triple, comma-separated list of them.
 # The plugin name here is only shape-validated (safe identifier charset,
 # matching real Forescout plugin directory names like "sw", "dot1x",
@@ -3302,27 +3315,27 @@ def main():
         return do_lookup(m.group(1))
 
     m = re.fullmatch(
-        rf"debugsetappliance ({IP_RE}) ({DEBUGSET_SPEC_RE}) ({CASE_REF_RE.pattern[1:-1]})", original.strip(),
+        rf"debugsetappliance ({TARGET_RE}) ({DEBUGSET_SPEC_RE}) ({CASE_REF_RE.pattern[1:-1]})", original.strip(),
     )
     if m:
         return do_debugsetappliance(m.group(1), m.group(2), None if m.group(3) == "-" else m.group(3))
 
-    m = re.fullmatch(rf"tracelist ({IP_RE})", original.strip())
+    m = re.fullmatch(rf"tracelist ({TARGET_RE})", original.strip())
     if m:
         return do_tracelist(m.group(1))
 
-    m = re.fullmatch(rf"tracedefaults ({IP_RE})", original.strip())
+    m = re.fullmatch(rf"tracedefaults ({TARGET_RE})", original.strip())
     if m:
         return do_tracedefaults(m.group(1))
 
-    m = re.fullmatch(rf"traceset ({IP_RE}) ({TRACE_CHANGES_RE})", original.strip())
+    m = re.fullmatch(rf"traceset ({TARGET_RE}) ({TRACE_CHANGES_RE})", original.strip())
     if m:
         return do_traceset(m.group(1), m.group(2))
 
     if original.strip() == "appliances":
         return do_appliances()
 
-    m = re.fullmatch(rf"runshowerrors ({IP_RE}) (\d{{1,4}}[mh])", original.strip())
+    m = re.fullmatch(rf"runshowerrors ({TARGET_RE}) (\d{{1,4}}[mh])", original.strip())
     if m:
         return do_run_show_errors(m.group(1), m.group(2))
 
@@ -3383,7 +3396,7 @@ def main():
         )
 
     m = re.fullmatch(
-        rf"techsupportwindowappliance ({IP_RE}) (\d{{1,10}}):(\d{{1,10}}) "
+        rf"techsupportwindowappliance ({TARGET_RE}) (\d{{1,10}}):(\d{{1,10}}) "
         rf"({DEBUGSET_PLUGIN_RE}(?:,{DEBUGSET_PLUGIN_RE})*) ({CASE_REF_RE.pattern[1:-1]})",
         original.strip(),
     )
