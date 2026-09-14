@@ -231,6 +231,9 @@ if iptables -L INPUT -n | grep -q "dpt:${HTTPS_PORT}"; then
 else
     echo "WARNING: could not confirm the firewall rule via iptables -- check by hand." >&2
 fi
+# Keeps the app's own Setup page (getadmincidr) accurate even when
+# ADMIN_CIDR was only ever set here, never through the GUI.
+echo "${ADMIN_CIDR}" > "$(dirname "$WEBAPP_QUERY_WRAPPER")/admin_cidr.state" 2>/dev/null || true
 
 echo
 echo "=== 6. Initial admin login ==="

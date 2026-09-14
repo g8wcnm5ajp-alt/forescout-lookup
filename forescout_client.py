@@ -473,6 +473,26 @@ def clear_lookup_debug_log(timeout=15):
     return _run_verb("lookuplogclear", timeout=timeout)
 
 
+# Shape only -- which CIDR is actually sensible is David's call, made in
+# the GUI; this just blocks garbage before it reaches SSH, same pattern
+# as every other validated-at-this-layer value above.
+CIDR_RE = re.compile(rf"^{IP_OCTET}(?:\.{IP_OCTET}){{3}}/(?:[0-9]|[12][0-9]|3[0-2])$")
+
+
+def valid_cidr(cidr):
+    return bool(CIDR_RE.match(cidr or ""))
+
+
+def get_admin_cidr(timeout=15):
+    return _run_verb("getadmincidr", timeout=timeout)
+
+
+def set_admin_cidr(cidr, timeout=20):
+    if not valid_cidr(cidr):
+        raise ForescoutClientError(f"'{cidr}' is not a valid CIDR (expected e.g. 192.168.1.0/24 or 0.0.0.0/0).")
+    return _run_verb(f"setadmincidr {cidr}", timeout=timeout)
+
+
 # Mirrors webapp-query.py's own BUNDLE_PATH_RE -- checked here too before
 # ever spending an SSH round-trip on an obviously-bogus path, but the EM
 # side re-validates independently regardless (never trust the browser).

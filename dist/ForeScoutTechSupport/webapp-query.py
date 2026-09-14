@@ -210,6 +210,15 @@ Verbs (see the plan this was built from, forescout-lookup):
                             errors/<category>/summary.txt tree -- a real,
                             unscoped snapshot that runs several minutes,
                             not a quick check; duration is <N>m or <N>h
+    getadmincidr            no args -- the source CIDR currently allowed
+                            through this EM's firewall to the app's own
+                            HTTPS port (from admin_cidr.state, written by
+                            this same verb and by Deploy.sh)
+    setadmincidr <cidr>     re-applies the app's own firewall hook
+                            (fstool fw delhook + addhook, same pair
+                            Deploy.sh's own step 5 runs) restricted to
+                            <cidr> instead of requiring a redeploy.
+                            David's ask, 2026-09-14 -- a GUI Setup page
 
 Every code path here re-derives which plugin(s)/appliance(s) actually
 matter for the given host from live data -- it never assumes the
@@ -1466,6 +1475,50 @@ def _detect_own_ip():
 
 
 EM_IP = _detect_own_ip()
+
+
+# ADMIN_CIDR live control -- David's ask, 2026-09-14: change the app's
+# own firewall-allowed source CIDR from the GUI instead of needing a
+# redeploy. FW_HOOK_NAME/HTTPS_PORT must match Deploy.sh's own values
+# exactly -- this replaces the exact same fstool fw delhook/addhook pair
+# Deploy.sh's own step 5 runs, so a GUI change and a redeploy always
+# converge on the same live rule. State file lives next to this script
+# (same convention as LOOKUP_LOG_PATH) so getadmincidr has a real answer
+# immediately after either path -- Deploy.sh also writes it, so a plain
+# redeploy without ever touching the GUI still leaves it accurate.
+FW_HOOK_NAME = "ForeScoutTechSupportHelper"
+HTTPS_PORT = 8443
+ADMIN_CIDR_STATE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admin_cidr.state")
+CIDR_RE = re.compile(rf"^{IP_RE}/(?:[0-9]|[12][0-9]|3[0-2])$")
+
+
+def do_get_admin_cidr():
+    try:
+        with open(ADMIN_CIDR_STATE_PATH) as f:
+            cidr = f.read().strip() or None
+    except OSError:
+        cidr = None
+    print(json.dumps({"admin_cidr": cidr}))
+
+
+def do_set_admin_cidr(cidr):
+    if not CIDR_RE.match(cidr):
+        fail(f"'{cidr}' is not a valid CIDR (expected e.g. 192.168.1.0/24 or 0.0.0.0/0)")
+    run(["fstool", "fw", "delhook", FW_HOOK_NAME], timeout=15)
+    out, err, rc = run(
+        ["fstool", "fw", "addhook", FW_HOOK_NAME,
+         f"iptables -I INPUT -s {cidr} -m tcp -p tcp --dport {HTTPS_PORT} -j ACCEPT"],
+        timeout=15,
+    )
+    if rc != 0:
+        fail(f"fstool fw addhook failed: {(err or out).strip()[:300]}")
+    _, _, confirm_rc = run(["bash", "-c", f"iptables -L INPUT -n | grep -q 'dpt:{HTTPS_PORT}'"], timeout=10)
+    try:
+        with open(ADMIN_CIDR_STATE_PATH, "w") as f:
+            f.write(cidr + "\n")
+    except OSError:
+        pass
+    print(json.dumps({"admin_cidr": cidr, "firewall_confirmed": confirm_rc == 0}))
 
 
 def resolve_target(target):
@@ -3382,6 +3435,13 @@ def main():
     if m:
         return do_arplist(m.group(1))
 
+    if original.strip() == "getadmincidr":
+        return do_get_admin_cidr()
+
+    m = re.fullmatch(rf"setadmincidr ({CIDR_RE.pattern[1:-1]})", original.strip())
+    if m:
+        return do_set_admin_cidr(m.group(1))
+
     fail(
         "rejected: command did not match an allowed pattern "
         "(lookup <ip> | debugsetappliance <target> <plugin:level:minutes,...> <case_ref> | "
@@ -3398,7 +3458,8 @@ def main():
         "techsupportcleanup </shared/shared/case/.../.../...> | "
         "policytree | "
         "lastchecked <ip> | matched <ip> <N>h|d|w | history <ip> <N>h|d|w | rawfields <ip> | "
-        "arplist <ip> | appliances | runshowerrors <target> <N>m|h)",
+        "arplist <ip> | appliances | runshowerrors <target> <N>m|h | "
+        "getadmincidr | setadmincidr <cidr>)",
         code=2,
     )
 

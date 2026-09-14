@@ -24,9 +24,10 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from forescout_client import (
     CASE_REF_RE, COMPANY_NAME_RE, LEVEL_RE, ForescoutClientError, arp_list, build_techsupport_em,
     build_techsupport_window_appliance, clear_lookup_debug_log, clear_techsupport_log, collect_techsupport,
-    debug_set_appliance, delete_techsupport_bundle, download_techsupport_bundle, last_checked, list_appliances,
-    lookup, matched_rules, policy_history, policy_tree, preview_techsupport, preview_techsupport_em, raw_fields,
-    run_show_errors, tail_lookup_debug_log, tail_techsupport_log, trace_defaults, trace_list, trace_set,
+    debug_set_appliance, delete_techsupport_bundle, download_techsupport_bundle, get_admin_cidr, last_checked,
+    list_appliances, lookup, matched_rules, policy_history, policy_tree, preview_techsupport,
+    preview_techsupport_em, raw_fields, run_show_errors, set_admin_cidr, tail_lookup_debug_log,
+    tail_techsupport_log, trace_defaults, trace_list, trace_set, valid_cidr,
 )
 
 app = Flask(__name__)
@@ -397,6 +398,45 @@ def certs_apply_route():
     return _render_certs_page(
         message="New certificate saved. Restarting the service now to apply it -- this page will be unreachable for a few seconds."
     )
+
+
+def _render_setup_page(error=None, message=None):
+    try:
+        admin_cidr = get_admin_cidr().get("admin_cidr")
+    except ForescoutClientError as exc:
+        admin_cidr = None
+        error = error or f"Could not read the current setting from the EM: {exc}"
+    return render_template(
+        "setup.html", admin_cidr=admin_cidr, csrf_token=_csrf_token(), error=error, message=message,
+    )
+
+
+@app.route("/admin/setup", methods=["GET"])
+def setup_route():
+    if not session.get("logged_in"):
+        return redirect(url_for("login_route"))
+    return _render_setup_page()
+
+
+@app.route("/admin/setup/admin_cidr", methods=["POST"])
+def setup_admin_cidr_route():
+    if not session.get("logged_in"):
+        return redirect(url_for("login_route"))
+    if not _check_csrf():
+        return _render_setup_page(error="Session expired -- please try again.")
+    cidr = request.form.get("admin_cidr", "").strip()
+    if not valid_cidr(cidr):
+        return _render_setup_page(error=f"'{cidr}' is not a valid CIDR (expected e.g. 192.168.1.0/24 or 0.0.0.0/0).")
+    try:
+        result = set_admin_cidr(cidr)
+    except ForescoutClientError as exc:
+        return _render_setup_page(error=f"Could not apply this on the EM: {exc}")
+    _log_activity("admin_cidr_changed", username=session.get("username"), admin_cidr=cidr)
+    if not result.get("firewall_confirmed"):
+        return _render_setup_page(
+            error=f"Set to {cidr}, but the firewall rule could not be confirmed via iptables on the EM -- check by hand."
+        )
+    return _render_setup_page(message=f"Access restricted to {cidr}. The firewall rule is confirmed active.")
 
 
 @app.route("/admin/certs/export-apache", methods=["GET"])
