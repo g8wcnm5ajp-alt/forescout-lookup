@@ -32,13 +32,18 @@ from forescout_client import (
 
 app = Flask(__name__)
 
-# Bump on every build (David's standing instruction). Deployed-at is the
-# process start time, not a hand-maintained date -- every deploy does a
-# fresh `docker rm -f` + `docker run` (see start.sh), so this is always
-# accurate without needing to remember to update it separately from the
-# version string. Shown next to the page title (David's ask, 2026-09-12)
-# and in the Help tab's own detail table.
-APP_VERSION = "1.1.0"
+# Bump on every build (David's standing instruction) -- match the
+# GitHub Release tag exactly (e.g. a "v1.2.4" release -> "1.2.4" here).
+# Confirmed live 2026-09-14 this had silently drifted (stuck at "1.1.0"
+# through releases v1.2.0-v1.2.3, showing a version that didn't match
+# what was actually downloadable) -- check this against the release tag
+# on every build going forward, not just when a feature happens to touch
+# app.py. Deployed-at is the process start time, not a hand-maintained
+# date -- every deploy does a fresh `docker rm -f` + `docker run` (see
+# start.sh), so this is always accurate without needing to remember to
+# update it separately from the version string. Shown next to the page
+# title (David's ask, 2026-09-12) and in the Help tab's own detail table.
+APP_VERSION = "1.2.4"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 

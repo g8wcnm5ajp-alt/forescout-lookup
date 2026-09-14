@@ -2646,6 +2646,34 @@
             const previewEl = document.getElementById("tmpl-preview");
             const filenameEl = document.getElementById("tmpl-filename");
 
+            // Prefill EM IP / Appliance List from the live appliance list on
+            // first load, but only if both fields are still empty -- David's
+            // ask, 2026-09-14: confirmed live a user coming from every other
+            // tab (which all auto-populate from /api/appliances) reasonably
+            // read a blank dropdown here as broken, even with real appliances
+            // connected. The header comment above's "no fetch, no live data"
+            // reasoning still holds for the genuinely common case this tab
+            // exists for -- a truly disconnected target environment -- but
+            // undersells the other common case: a portable version of the
+            // SAME EM this app is already looking at, which live data can
+            // safely default. The one fetch this otherwise-fetch-free tab
+            // makes; everything it fills in stays a plain, freely-editable
+            // text field afterward, so manual entry for a different
+            // environment is untouched.
+            if (!emIpEl.value.trim() && !appliancesEl.value.trim()) {
+                fetch("/api/appliances")
+                    .then(r => r.json())
+                    .then(d => {
+                        const appliances = d.appliances || [];
+                        if (!appliances.length) return;
+                        const em = appliances.find(a => a.is_em);
+                        if (em) emIpEl.value = em.address;
+                        appliancesEl.value = appliances.filter(a => !a.is_em).map(a => a.address).join("\n");
+                        refreshAllTargetSelects();
+                    })
+                    .catch(() => {});
+            }
+
             const IP_RE = /^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])$/;
             const NAME_RE = /^[A-Za-z0-9._-]{1,60}$/;
             const PLUGIN_RE = /^[a-z][a-z0-9_]{1,40}$/;
