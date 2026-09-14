@@ -1,7 +1,7 @@
 """
 forescout_client.py
 
-Talks to the EM (192.168.22.210) via the restricted SSH key set up for
+Talks to the EM (FORESCOUT_EM_HOST) via the restricted SSH key set up for
 this app -- never touches an appliance directly. The EM-side forced-
 command wrapper (webapp-query/webapp-query.py in this repo, deployed at
 /root/scripts/webapp-query/webapp-query.py on the EM) is the only thing
@@ -17,7 +17,12 @@ import os
 import re
 import subprocess
 
-EM_HOST = os.environ.get("FORESCOUT_EM_HOST", "192.168.22.210")
+EM_HOST = os.environ.get("FORESCOUT_EM_HOST")
+if not EM_HOST:
+    raise RuntimeError(
+        "FORESCOUT_EM_HOST is not set. Deploy.sh sets this automatically; "
+        "a standalone (start.sh-style) deployment must set it explicitly."
+    )
 SSH_KEY_PATH = os.environ.get("FORESCOUT_SSH_KEY", "/keys/webapp_query_rsa")
 
 IP_OCTET = r"(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])"
@@ -188,7 +193,7 @@ def _case_ref_token(case_ref):
 
 
 # fstool's own -company value, David's ask 2026-08-26 -- an editable
-# override for what used to be hardcoded ("Yubique"). No spaces, same
+# override for what used to be a hardcoded company name. No spaces, same
 # reason as CASE_REF_RE: this travels through webapp-query.py's
 # space-separated dispatch tokens.
 COMPANY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,60}$")
@@ -304,7 +309,7 @@ def preview_techsupport(
     see _selected_plugins_token. selected_dbtables: see
     _selected_dbtables_token. company: see _company_token -- David's ask
     2026-08-26, an editable override for the previously-hardcoded
-    "Yubique". send: see _send_token.
+    company name. send: see _send_token.
     """
     ips = _validated_ips(ips)
     level = _validated_level(level)

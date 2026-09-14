@@ -933,7 +933,7 @@ def get_case_history(limit=20):
 ACTIVITY_LOG_PATH = os.path.join(DATA_DIR, "activity_log.jsonl")
 
 # Client-side JS diagnostic beacon -- David's ask, 2026-08-28: a Graphic View
-# bug (only the root "NINHS" box rendering) couldn't be reproduced live, so
+# bug (only the root top-level policy box rendering) couldn't be reproduced live, so
 # the policy-tree JS beacons its own render-state/exception detail here
 # instead of relying on someone manually copying browser console output.
 # Never a substitute for real testing -- pulled back via SSH once David
@@ -1474,7 +1474,7 @@ COMPANY_ERROR = "Company name may only contain letters, numbers, '.', '-' and '_
 def _validate_company():
     """
     Empty -> None (forescout_client/webapp-query.py fall back to
-    DEFAULT_COMPANY, "Yubique"). Anything else must match
+    DEFAULT_COMPANY). Anything else must match
     COMPANY_NAME_RE -- returns (company, error_message_or_None). David's
     ask, 2026-08-26: an editable override for what used to be hardcoded,
     shown in a box at the top of the Tech Support Bundle Generator tab

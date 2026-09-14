@@ -3,9 +3,9 @@
 webapp-query.py -- SSH forced-command wrapper for the forescout-lookup
 web app's restricted key.
 
-Deployed on the EM (currently 192.168.22.215 -- see EM_IP below, detected live via
-`hostname -I` rather than hardcoded, since this environment's EM has changed IP before)
-at /root/scripts/webapp-query/webapp-query.py.
+Deployed on the EM (see EM_IP below, detected live via `hostname -I` rather
+than hardcoded, since an EM's IP can change over its lifetime) at
+/root/scripts/webapp-query/webapp-query.py.
 The corresponding authorized_keys line pins every connection using this
 key to run ONLY this script:
 
@@ -189,7 +189,7 @@ Verbs (see the plan this was built from, forescout-lookup):
                             that fired an action) -- cheap
     matched <ip> <N><h|d|w> distinct rule_ids matched (np_action fired,
                             or eval_status matched) within a real time
-                            window -- e.g. "matched 192.168.22.135 3d" --
+                            window -- e.g. "matched 203.0.113.10 3d" --
                             drives the "show only matched & enabled"
                             tree filter's adjustable window
     rawfields <ip>          the full raw hostinfo property dump (every
@@ -590,7 +590,7 @@ def _domain_managed_status(fields):
     """"Domain managed" in the Identity panel -- prefers manage_domain_strict (the same live
     "Windows Manageable Domain (Current)" check already shown separately under Host Details/General)
     over part_of_domain, which can get stuck in an unresolved error state for a long time without a
-    fresh retry. Confirmed live, 2026-08-28, on 192.168.22.253: part_of_domain had been stuck on
+    fresh retry. Confirmed live, 2026-08-28, on a real host: part_of_domain had been stuck on
     '???' (status gen_error_service_restart:err) since 2026-07-30, while manage_domain_strict was
     fresh (today) and agreed with a live `fstool va_test -h <ip> -c manage` check on the managing
     appliance (smb/rpc/wmi all genuinely failing right now due to a hostname-resolution problem --
@@ -916,9 +916,9 @@ def get_wlc_ips(mode, appliance):
     Per-host hostinfo's wifi_ap_wlc field isn't always populated -- confirmed
     live: shows "???" even on a host currently connected wirelessly. The
     Wireless plugin's own device config (dev_db.wifi) already knows which
-    WLC(s) it's paired with -- confirmed live on both .212 and .213: each
-    has exactly one entry, wifi_ip=192.168.22.254 (the one physical Cisco
-    WLC in this environment). Read directly from whichever box manages this
+    WLC(s) it's paired with -- confirmed live on two real appliances: each
+    has exactly one entry, wifi_ip set to the one physical Cisco
+    WLC in this deployment. Read directly from whichever box manages this
     host's wireless rather than relying on the per-host field alone.
     Returns a sorted list of distinct controller IPs found (normally one;
     only used as a fallback when there's exactly one, so this never guesses
@@ -1036,7 +1036,7 @@ def _do_lookup_inner(ip):
         "managing_appliance": source_box,
         # Same fact as managing_appliance, but always a clean dotted-IP
         # (managing_appliance is a display string, "Enterprise Manager
-        # (192.168.22.210)" for the EM case) -- added so the UI's
+        # (<EM's IP>)" for the EM case) -- added so the UI's
         # DB-table attach list (David's ask, 2026-08-26) can scope
         # itself to the same "own appliance always gets a bundle"
         # target set Round 25 guarantees server-side, without parsing
@@ -1049,8 +1049,8 @@ def _do_lookup_inner(ip):
         "active": get_field(fields, "active"),
         # manage_agent/domain-managed are the real fields behind what the
         # Console's own host log shows as e.g. "{Fully Trusted} Secure
-        # Connector Managed NOT Domain Managed" (policy NINHS 1.2.2.02
-        # Windows Enterprise Manageability) -- confirmed against a real
+        # Connector Managed NOT Domain Managed" (a "... 1.2.2.02
+        # Windows Enterprise Manageability" policy) -- confirmed against a real
         # Console export for this exact host before wiring this up,
         # rather than guessed from field names alone.
         "secureconnector_managed": tri_state(get_field(fields, "manage_agent")),
@@ -1175,7 +1175,7 @@ def get_enabled_plugins(mode, appliance):
     plugin -> True/False, live per box via `fstool plugin <anchor> list`
     -- the real "is this plugin genuinely active here" signal, distinct
     from get_installed_plugins (directory presence). Confirmed live
-    2026-08-25 (David's report on host 10.1.110.149): crowdstrike's
+    2026-08-25 (David's report on a real host): crowdstrike's
     plugin directory + a live running process + a socket exist on the EM
     AND both appliances identically, yet `fstool plugin crowdstrike
     status` reported "Plugin is up and running" only on the EM and
@@ -1341,7 +1341,7 @@ def detect_plugins(fields, mode, appliance):
     1. **Field-source decode** (resolve_source_appliance, same node-ID
     mechanism already used for mac_source_appliance elsewhere) -- trusted
     ONLY when it points to a box OTHER than the host's own local
-    appliance. Confirmed live 2026-08-25 (host 10.1.110.149): sw_ip/
+    appliance. Confirmed live 2026-08-25 (a real host): sw_ip/
     sw_port_desc/sw_hostname/mac are all genuinely source-attributed to
     a DIFFERENT appliance (.213) than the host's own (.212) -- real,
     precise, per-host/per-device evidence a coarse "is this plugin
@@ -1358,11 +1358,11 @@ def detect_plugins(fields, mode, appliance):
     didn't produce a trusted cross-box answer. This is what correctly
     catches crowdstrike: its directory is installed identically
     everywhere (get_installed_plugins alone can never distinguish it),
-    but it's only genuinely ENABLED on the EM in this lab, so it
+    but it's only genuinely ENABLED on the EM in this deployment, so it
     resolves there regardless of which appliance the host itself is
     assigned to. A plugin can legitimately be enabled on MORE than one
     box at once (confirmed live: most plugins besides crowdstrike show
-    enabled=true on the EM AND both appliances in this lab) -- rather
+    enabled=true on the EM AND both appliances in this deployment) -- rather
     than silently guessing one, every genuinely-enabled candidate is
     returned so the caller can offer all of them. do_lookup's
     debug_targets ends up with one row per (plugin, candidate target)
@@ -1404,8 +1404,8 @@ def detect_plugins(fields, mode, appliance):
             # Primary signal: the field's OWN node-ID source (same decode
             # resolve_source_appliance already uses for mac_source_appliance
             # etc), but ONLY trusted when it points to a box OTHER than the
-            # host's own local appliance. Confirmed live 2026-08-25 (host
-            # 10.1.110.149): sw_ip/sw_port_desc/sw_hostname/mac are all
+            # host's own local appliance. Confirmed live 2026-08-25 (a real
+            # host): sw_ip/sw_port_desc/sw_hostname/mac are all
             # genuinely source-attributed to a different appliance (.213)
             # than the host's own (.212) -- real, precise, per-host evidence
             # a coarse "is this plugin enabled anywhere" check can't produce.
@@ -1453,15 +1453,16 @@ def run_debug_cmd(plugin, level, minutes, mode, appliance):
 def _detect_own_ip():
     """This script always runs directly on the EM (see module docstring) -- asks the OS for its own
     primary IP rather than hardcoding one. David's ask, 2026-08-28: the "Tech-Support pick
-    appliance/EM" list was showing 192.168.22.210 as the EM's address when the real, live EM is
-    192.168.22.215 -- this environment's EM has actually changed IP at least once already this
-    session (a deliberate role switch, .210 -> .215), so a hardcoded value silently goes stale the
-    next time that happens too. Same `hostname -I` approach Deploy.sh already uses for the same
-    purpose. Falls back to the old hardcoded value only if that command is ever unavailable, so this
-    can't hard-crash the whole script over a display/targeting detail."""
+    appliance/EM" list was showing a stale EM address after a live EM IP change -- an EM's IP can
+    change over its lifetime (e.g. a deliberate role switch to a different box), so a hardcoded
+    value silently goes stale whenever that happens. Same `hostname -I` approach Deploy.sh already
+    uses for the same purpose. Falls back to a clearly-unset marker (never a real address, since any
+    hardcoded IP here would be wrong on every deployment but the one it was copied from) only if
+    that command is ever unavailable, so this can't hard-crash the whole script over a
+    display/targeting detail."""
     out, err, rc = run(["hostname", "-I"], timeout=5)
     ip = out.strip().split()[0] if out.strip() else None
-    return ip or "192.168.22.210"
+    return ip or "unknown-em-ip"
 
 
 EM_IP = _detect_own_ip()
@@ -1746,13 +1747,13 @@ CASE_REF_RE = re.compile(r"^[A-Za-z0-9_-]{1,40}$")
 # No spaces (same constraint as CASE_REF_RE) -- the dispatch commands
 # this travels through are space-separated positional tokens, so a
 # space inside the value would break parsing; -_. cover reasonable word
-# separators (e.g. "Yubique-Ltd") without that risk. ts_cmd embeds this
+# separators (e.g. "Acme-Ltd") without that risk. ts_cmd embeds this
 # quoted ("-company \"{company}\"", not argv) as defense in depth, but
 # the shape check is what actually rules out quote/backslash/shell-
 # metacharacters. David's ask, 2026-08-26: an editable override for the
-# previously-hardcoded "Yubique".
+# previously-hardcoded company name.
 COMPANY_NAME_RE = re.compile(r"^[A-Za-z0-9._-]{1,60}$")
-DEFAULT_COMPANY = "Yubique"
+DEFAULT_COMPANY = "YourCompany"
 COMPANY_TOKEN_RE = rf"(?:{COMPANY_NAME_RE.pattern[1:-1]}|-)"
 
 
@@ -2180,7 +2181,7 @@ def _build_combined_bundle(
     genuinely per-box and a name valid elsewhere would otherwise fail
     this specific build outright. company: fstool's own -company value,
     David's ask 2026-08-26 -- an editable override for what used to be a
-    hardcoded "Yubique"; defaults to DEFAULT_COMPANY when not given.
+    hardcoded company name; defaults to DEFAULT_COMPANY when not given.
     send: fstool's own --send flag, David's ask 2026-08-26 -- "Send
     support bundle directly to Forescout." Confirmed live via `fstool
     help tech-support`: --send and --pack are both listed together
@@ -2358,7 +2359,7 @@ def _group_plugins_by_target(ips_csv, selected_plugins=None, case_ref=None):
     carrying its hostinfo, regardless of whether any selected plugin
     happens to resolve there too (reversed 2026-08-26 -- David's earlier
     call was the opposite, "only if a selected plugin lands there," but
-    a real case -- host 10.1.110.149, own appliance 192.168.22.212, no
+    a real case -- a host whose own appliance had no
     checked plugin landing there since crowdstrike/sw both resolved
     elsewhere -- showed that left the host's own hostinfo with nowhere
     to go at all. Confirmed with David this is the standing rule now: an
@@ -2499,7 +2500,7 @@ def do_techsupport_preview(
     database list (get_databases) so the preview can't show a database
     dump that would actually get silently dropped at build time.
     company: fstool's own -company value, David's ask 2026-08-26 -- an
-    editable override for what used to be a hardcoded "Yubique";
+    editable override for what used to be a hardcoded company name;
     defaults to DEFAULT_COMPANY when not given.
     """
     company = company or DEFAULT_COMPANY
@@ -2826,17 +2827,17 @@ def build_policy_tree():
     Confirmed live 2026-09-13 (this box): nptree.xml's own document root
     is itself a <POLICY_FOLDER> (ID "0", NAME "Policy Folders") that
     already contains the entire real tree -- named tenant/customer
-    folders (this environment has "NINHS", "LSEG", "SAP Policies")
-    nested two levels down inside a generic inner "Policy Folders"
-    sub-container, and separate folders ("Test-Polices", "TEST-SNMP-
-    SEND", "Health Monitoring") only one level down -- i.e. real
-    top-level folders on this deployment sit at inconsistent depths, so
-    parsing the document root directly (which walks every POLICY_FOLDER
-    beneath it recursively, same as it always has) is what actually
-    finds all of them, not a fixed-depth or fixed-name scope. This is
-    also exactly why the 2026-08-28 diagnostic bug happened: a
-    NINHS-only name filter silently missed "Test-Polices", which was
-    live-matching real hosts the whole time.
+    folders (this environment has several distinct top-level tenant
+    folders) nested two levels down inside a generic inner "Policy
+    Folders" sub-container, and separate folders (e.g. general test/
+    monitoring folders) only one level down -- i.e. real top-level
+    folders on this deployment sit at inconsistent depths, so parsing
+    the document root directly (which walks every POLICY_FOLDER beneath
+    it recursively, same as it always has) is what actually finds all
+    of them, not a fixed-depth or fixed-name scope. This is also
+    exactly why the 2026-08-28 diagnostic bug happened: a single-
+    tenant-only name filter silently missed one of those other
+    folders, which was live-matching real hosts the whole time.
 
     Falls back to wrapping every direct top-level POLICY_FOLDER under a
     synthetic root only if some other deployment's nptree.xml root ever

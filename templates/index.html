@@ -55,7 +55,7 @@
         <section class="page-tab-panel{% if active_page_tab != "lookup" %} page-tab-panel-hidden{% endif %}" data-page-tab-panel="lookup">
         <form method="post" action="/lookup" class="lookup-form">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <input type="text" name="ip" placeholder="192.168.22.135 or 192.168.22.135,192.168.22.51" value="{{ ip }}" required
+            <input type="text" name="ip" placeholder="203.0.113.10 or 203.0.113.10,203.0.113.11" value="{{ ip }}" required
                    pattern="^\s*(\d{1,3}\.){3}\d{1,3}\s*(,\s*(\d{1,3}\.){3}\d{1,3}\s*)*$"
                    title="One or more IPv4 addresses, comma-separated">
             <button type="submit" id="lookup-submit-btn">Look up</button>
@@ -381,7 +381,7 @@
                 </select>
             </label>
             <label class="tree-filter-toggle">Company Name
-                <input type="text" id="techsupport-company" value="Yubique" maxlength="60"
+                <input type="text" id="techsupport-company" value="YourCompany" maxlength="60"
                     pattern="[A-Za-z0-9._-]{1,60}" title="Letters, numbers, '.', '-' and '_' only -- no spaces"
                     style="width:12em">
             </label>
@@ -647,7 +647,7 @@
                 <label class="tree-filter-toggle">Appliance List <span class="muted">(one IP per line)</span></label>
             </div>
             <textarea id="tmpl-appliances" rows="4" style="width:100%; max-width:28em; font-family:Consolas,Menlo,monospace;"
-                placeholder="192.168.22.212&#10;192.168.22.213"></textarea>
+                placeholder="203.0.113.12&#10;203.0.113.13"></textarea>
 
             <h4>Plugins</h4>
             <p class="hint">Which plugin's data to collect, on which box, at what debug level, for how long.</p>
@@ -890,7 +890,7 @@
             }
 
             // Debug-log helper -- David's ask, 2026-08-28: a Graphic View bug (only the root
-            // "NINHS" box rendering, despite the unfiltered tree/a nonzero matched count) couldn't
+            // top-level policy box rendering, despite the unfiltered tree/a nonzero matched count) couldn't
             // be reproduced live, so this beacons diagnostic detail to the server (/data/
             // client_debug_log.jsonl, pulled back via SSH) on every render pass -- both the normal
             // path (so a healthy render's shape is visible for comparison) and any caught exception

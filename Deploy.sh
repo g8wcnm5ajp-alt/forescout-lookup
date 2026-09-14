@@ -33,7 +33,7 @@ HTTPS_PORT=8443
 FW_HOOK_NAME="ForeScoutTechSupportHelper"
 # Source CIDR allowed to reach the app's HTTPS port. Override by exporting
 # ADMIN_CIDR before running this script if the management LAN differs.
-ADMIN_CIDR="${ADMIN_CIDR:-192.168.22.0/24}"
+ADMIN_CIDR="${ADMIN_CIDR:-203.0.113.0/24}"
 
 KEY_DIR="${DIR}/keys"
 KEY_FILE="${KEY_DIR}/webapp_query_rsa"
