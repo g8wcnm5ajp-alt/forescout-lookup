@@ -65,7 +65,13 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 if [ ! -f "${DIR}/image.tar" ]; then
-    echo "Error: ${DIR}/image.tar not found -- run this from inside the unpacked package." >&2
+    echo "Error: ${DIR}/image.tar not found." >&2
+    if [ -d "${DIR}/dist/ForeScoutTechSupport" ]; then
+        echo "You're running this from the source repo root -- the deployable package is in dist/ForeScoutTechSupport/." >&2
+        echo "  cd dist/ForeScoutTechSupport && ADMIN_CIDR=<your LAN> ./Deploy.sh" >&2
+    else
+        echo "Run this from inside the unpacked ForeScoutTechSupport package (the folder/zip that has Deploy.sh and image.tar together)." >&2
+    fi
     exit 1
 fi
 
