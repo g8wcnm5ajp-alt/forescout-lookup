@@ -5,8 +5,10 @@ Self-contained Forescout tech-support log collection tool, deployable directly o
 ## Install
 
 ```
-sudo ./Deploy.sh
+sudo ADMIN_CIDR=<your management LAN, e.g. 192.168.1.0/24> ./Deploy.sh
 ```
+
+`ADMIN_CIDR` is required -- the source subnet allowed to reach the app's HTTPS port. `Deploy.sh` refuses to run without it (there's deliberately no default -- a placeholder default here would either expose the app too broadly or silently firewall out your real admin LAN).
 
 Run this **on the EM itself**, as root, from inside this unpacked directory. It:
 
