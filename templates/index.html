@@ -1584,27 +1584,39 @@
             pagePrev.addEventListener("click", () => { pageStart = Math.max(0, pageStart - 1); renderTabbar(); });
             pageNext.addEventListener("click", () => { pageStart = Math.min(Math.max(0, runs.length - PAGE_SIZE), pageStart + 1); renderTabbar(); });
 
+            // Collapsible by default (David's ask, 2026-09-14) -- a real run
+            // can report several error categories plus 30+ diag files
+            // (see renderDiagFiles below), previously all rendered fully
+            // expanded one after another, making the report a very long,
+            // hard-to-scan page. Native <details>/<summary> per section:
+            // collapsed on load, click a name to expand just that one --
+            // no JS needed for the toggle itself. Print/PDF export still
+            // captures everything regardless of what's collapsed on
+            // screen (see the @media print override in style.css).
             function renderCategories(categories) {
                 if (!categories || !categories.length) {
                     return "<p class=\"hint\">No error categories reported for this window.</p>";
                 }
-                return categories.map(c => (
-                    "<div class=\"card appliance-error-table\"><h4>" + escapeHtml(c.category) + "</h4>" +
-                    "<div class=\"diag-html\">" + (c.html || "<p class=\"hint\">No detail available.</p>") + "</div></div>"
-                )).join("");
+                return "<h4 class=\"diag-section-heading\">Error Categories (" + categories.length + ")</h4>" +
+                    categories.map(c => (
+                        "<details class=\"data-section\"><summary>" + escapeHtml(c.category) + "</summary>" +
+                        "<div class=\"diag-html\">" + (c.html || "<p class=\"hint\">No detail available.</p>") + "</div></details>"
+                    )).join("");
             }
 
             // Every diag/*.txt file from the snapshot, rendered from its
             // own .html sibling (fstool already renders these as real
             // tables -- see _extract_html_fragment server-side) so each
             // one -- cpu, queues.bytes, policy_eval_changes, etc -- gets
-            // its own card with its own table(s), not one giant dump.
+            // its own collapsible section with its own table(s), not one
+            // giant dump.
             function renderDiagFiles(diagFiles) {
                 if (!diagFiles || !diagFiles.length) return "";
-                return "<h4 class=\"diag-section-heading\">Diagnostics</h4>" + diagFiles.map(f => (
-                    "<div class=\"card appliance-error-table\"><h4>" + escapeHtml(f.filename) + "</h4>" +
-                    "<div class=\"diag-html\">" + (f.html || "<p class=\"hint\">No data.</p>") + "</div></div>"
-                )).join("");
+                return "<h4 class=\"diag-section-heading\">Diagnostics (" + diagFiles.length + ")</h4>" +
+                    diagFiles.map(f => (
+                        "<details class=\"data-section\"><summary>" + escapeHtml(f.filename) + "</summary>" +
+                        "<div class=\"diag-html\">" + (f.html || "<p class=\"hint\">No data.</p>") + "</div></details>"
+                    )).join("");
             }
 
             // Standalone tree layout/draw -- David's ask, 2026-09-14: include a

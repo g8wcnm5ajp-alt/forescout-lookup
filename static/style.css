@@ -195,10 +195,39 @@ tr.row-prior-connection { opacity: 0.55; }
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 
-.appliance-error-table { margin: 0.5rem 0 1rem; }
 .appliance-error-table pre { white-space: pre-wrap; font-size: 0.82rem; margin: 0; font-family: inherit; }
 
 .diag-section-heading { margin: 1.5rem 0 0.5rem; color: var(--text); }
+
+/* Run Show Errors report -- David's ask, 2026-09-14: a real run can have
+   30+ diag files plus several error categories, previously all rendered
+   fully expanded one after another (a very long, hard-to-scan page).
+   Native <details>/<summary> instead -- collapsed by default, no JS
+   needed for the toggle itself, keyboard/accessible for free. */
+details.data-section {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    margin-bottom: 0.6rem;
+    padding: 0 1.25rem;
+}
+details.data-section[open] { padding-bottom: 1rem; }
+details.data-section summary {
+    cursor: pointer;
+    padding: 0.75rem 0;
+    font-weight: 600;
+    list-style: none;
+}
+details.data-section summary::-webkit-details-marker { display: none; }
+details.data-section summary::before {
+    content: "▸";
+    display: inline-block;
+    width: 1em;
+    color: var(--muted);
+    transition: transform 0.12s ease;
+}
+details.data-section[open] summary::before { transform: rotate(90deg); }
+details.data-section summary:hover { color: var(--accent); }
 
 /* fstool's own diag/*.html and errors/<category>/summary.html fragments,
    embedded as-is -- the app's table/th/td rules above already apply by
@@ -273,5 +302,12 @@ a.btn-small { display: inline-flex; align-items: center; border-radius: 6px; cur
        view in the 480px box is simply missing from the printed page, not
        just visually clipped (a real export-correctness bug, not cosmetic). */
     .rawfields-table-wrap { max-height: none !important; overflow: visible !important; }
+    /* Same class of bug: a collapsed <details> section is entirely absent
+       from the printed page, not just visually closed -- force every
+       Run Show Errors data section open (and hide the now-pointless
+       disclosure arrow) so Export to PDF always captures everything,
+       regardless of what's collapsed on screen. */
+    details.data-section summary::before { display: none; }
+    details.data-section:not([open]) > *:not(summary) { display: block !important; }
     body { background: #fff; color: #000; }
 }
