@@ -194,6 +194,13 @@ DEPLOY_COUNT=$(( $(cat "$DEPLOY_COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
 echo "$DEPLOY_COUNT" > "$DEPLOY_COUNT_FILE"
 echo "Deploy #${DEPLOY_COUNT}"
 
+# Recorded before the container starts -- tells the wait-for-password step
+# below whether this is a genuinely fresh account (redeployed into an empty
+# data dir) or a redeploy into existing data (account already set up, no
+# new password to show).
+ACCOUNT_ALREADY_EXISTED=0
+[ -f "${DATA_DIR}/auth.json" ] && ACCOUNT_ALREADY_EXISTED=1
+
 docker run -d \
     --name "$CONTAINER_NAME" \
     --network "$NETWORK_NAME" \
@@ -223,6 +230,33 @@ else
     echo "WARNING: could not confirm the firewall rule via iptables -- check by hand." >&2
 fi
 
+echo
+echo "=== 6. Initial admin login ==="
+# David's ask, 2026-09-14: print the actual login on this console right
+# after a deploy, not just point at docker logs/the data file -- app.py
+# now generates the account eagerly at startup (not lazily on first
+# /login attempt), so it should already exist by the time the container
+# is up; this just waits briefly for it and reads it back.
+LOGIN_LINE="Default login: admin / <not shown -- see below>"
+if [ "$ACCOUNT_ALREADY_EXISTED" -eq 1 ]; then
+    LOGIN_LINE="An admin account already existed in this data dir before this deploy -- login is unchanged from before, not shown here."
+else
+    INITIAL_PW=""
+    for _ in $(seq 1 10); do
+        if [ -f "${DATA_DIR}/initial-admin-password.txt" ]; then
+            INITIAL_PW="$(cat "${DATA_DIR}/initial-admin-password.txt")"
+            break
+        fi
+        sleep 1
+    done
+    if [ -n "$INITIAL_PW" ]; then
+        LOGIN_LINE="Default login: admin / ${INITIAL_PW}  (you will be forced to change this on first sign-in)"
+    else
+        LOGIN_LINE="Could not confirm the initial password within 10s -- check 'docker logs ${CONTAINER_NAME}' or ${DATA_DIR}/initial-admin-password.txt by hand."
+    fi
+fi
+echo "$LOGIN_LINE"
+
 EM_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 cat <<EOF
 
@@ -230,10 +264,7 @@ cat <<EOF
 
   https://${EM_IP:-<this-EM-ip>}:${HTTPS_PORT}/
 
-Default login: admin / a random password generated on first boot --
-run 'docker logs' or check /data/initial-admin-password.txt on the
-container's data volume to retrieve it.
-(you will be forced to change this on first sign-in)
+${LOGIN_LINE}
 
 To uninstall later: sudo ./Remove.sh
 EOF

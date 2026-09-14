@@ -17,6 +17,7 @@ Run this **on the EM itself**, as root, from inside this unpacked directory. It:
 3. Creates the `TechSupportBridge` docker network.
 4. Loads and starts the container (auto-restarts on reboot).
 5. Opens port 8443 through this EM's own firewall via `fstool fw addhook` (survives a firewall reactivation/reboot).
+6. On a genuinely fresh install, waits briefly for the container to generate the initial admin account and **prints the login straight to this console** — no need to dig through `docker logs` or the data volume by hand.
 
 Requires `docker`, `fstool`, and `python3` already present on the EM (all standard on a Forescout EM).
 
@@ -28,7 +29,7 @@ Safe to re-run — every step is idempotent.
 https://<this-EM's-IP>:8443/
 ```
 
-Default login: `admin` / a random password generated on first boot, printed to the container logs (`docker logs`) and written once to `/data/initial-admin-password.txt` — you'll be forced to change this on first sign-in, after which that file is deleted.
+Default login: `admin` / a random password generated on first boot -- `Deploy.sh` prints it directly to the console on a fresh install (see step 6 above). Also in the container logs (`docker logs`) and written once to `/data/initial-admin-password.txt` if you need it again before first sign-in — you'll be forced to change it on first sign-in, after which that file is deleted. On a redeploy into existing data (an account already set up), `Deploy.sh` says so instead of showing a password, since the login hasn't changed.
 
 ## Uninstall
 

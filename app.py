@@ -103,6 +103,13 @@ def _read_deploy_count():
 # string baked into source -- this repo is public) and written once to
 # INITIAL_PASSWORD_PATH plus stdout, so whoever deploys can retrieve it
 # once; must_change_password then forces it to be replaced immediately.
+#
+# Generated eagerly at startup (below), not lazily on the first /login
+# POST as this originally worked -- David's ask, 2026-09-14: Deploy.sh
+# itself now waits for and prints this file so a fresh deploy shows the
+# login on the console immediately, which only works if it already
+# exists by the time the container reports healthy, not only after
+# someone's first login attempt creates it.
 # ---------------------------------------------------------------------
 AUTH_PATH = os.path.join(DATA_DIR, "auth.json")
 INITIAL_PASSWORD_PATH = os.path.join(DATA_DIR, "initial-admin-password.txt")
@@ -131,20 +138,26 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 app.config["SESSION_COOKIE_SECURE"] = bool(os.environ.get("FORESCOUT_SSL_CERT"))
 
 
+def _ensure_auth_exists():
+    """Called once at startup (below), not lazily -- see the comment above
+    AUTH_PATH. No-op if auth.json already exists (a redeploy into the same
+    data dir must never silently reset the account)."""
+    if os.path.isfile(AUTH_PATH):
+        return
+    initial_password = secrets.token_urlsafe(12)
+    auth = {
+        "username": "admin",
+        "password_hash": generate_password_hash(initial_password),
+        "must_change_password": True,
+    }
+    _save_auth(auth)
+    with open(INITIAL_PASSWORD_PATH, "w") as f:
+        f.write(initial_password + "\n")
+    os.chmod(INITIAL_PASSWORD_PATH, 0o600)
+    print(f"[forescout-lookup] Generated initial admin password: {initial_password}", flush=True)
+
+
 def _load_auth():
-    if not os.path.isfile(AUTH_PATH):
-        initial_password = secrets.token_urlsafe(12)
-        auth = {
-            "username": "admin",
-            "password_hash": generate_password_hash(initial_password),
-            "must_change_password": True,
-        }
-        _save_auth(auth)
-        with open(INITIAL_PASSWORD_PATH, "w") as f:
-            f.write(initial_password + "\n")
-        os.chmod(INITIAL_PASSWORD_PATH, 0o600)
-        print(f"[forescout-lookup] Generated initial admin password: {initial_password}", flush=True)
-        return auth
     with open(AUTH_PATH) as f:
         return json.load(f)
 
@@ -154,6 +167,9 @@ def _save_auth(auth):
     with open(tmp, "w") as f:
         json.dump(auth, f)
     os.replace(tmp, AUTH_PATH)
+
+
+_ensure_auth_exists()
 
 
 def _csrf_token():
@@ -1834,7 +1850,7 @@ def api_support_log():
             f"Generated: {generated_at.isoformat()}",
             f"Remote address: {request.remote_addr}",
             f"User agent: {request.headers.get('User-Agent', '')}",
-            f"App version: {APP_VERSION}",
+            f"App version: {APP_VERSION}+{_read_deploy_count()}",
             f"Deployed at: {DEPLOYED_AT.isoformat()}",
             "",
             "Issue description:",

@@ -16,7 +16,7 @@
     </div>
     <main>
         <div style="display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:0.5rem;">
-            <h1 style="margin:0;">Forescout Tech Support Log Collection Tool <span class="muted" style="font-size:0.55em; font-weight:normal;">v{{ app_version }} &middot; deploy #{{ deploy_count }}</span></h1>
+            <h1 style="margin:0;">Forescout Tech Support Log Collection Tool <span class="muted" style="font-size:0.55em; font-weight:normal;">v{{ app_version }}+{{ deploy_count }}</span></h1>
             <div class="hint">
                 <a href="{{ url_for('certs_route') }}">Certificates</a>
                 &middot; <a href="{{ url_for('change_password_route') }}">Change password</a>
@@ -708,8 +708,7 @@
         <div class="card">
             <h3>About</h3>
             <table>
-                <tr><th>Version</th><td>{{ app_version }}</td></tr>
-                <tr><th>Deploy count</th><td>{{ deploy_count }}</td></tr>
+                <tr><th>Version</th><td>{{ app_version }}+{{ deploy_count }} <span class="muted">(build/deploy number after the +, per semver build-metadata convention)</span></td></tr>
                 <tr><th>Deployed</th><td>{{ deployed_at_display }}</td></tr>
                 <tr><th>Original design</th><td>{{ app_author }}</td></tr>
             </table>
