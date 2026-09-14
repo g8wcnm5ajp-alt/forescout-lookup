@@ -74,12 +74,27 @@ src = os.path.join(dist_dir, "ForeScoutTechSupport")
 if os.path.exists(zip_path):
     os.remove(zip_path)
 
+# Scripts that need +x once unzipped on the EM (a real Linux box).
+EXECUTABLE_NAMES = {"Deploy.sh", "Remove.sh", "webapp-query.py"}
+
 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
     for name in sorted(os.listdir(src)):
         full = os.path.join(src, name)
         arcname = "ForeScoutTechSupport/" + name
         info = zipfile.ZipInfo.from_file(full, arcname)
         info.create_system = 3  # Unix -- see the header comment for why this matters
+        # Set the Unix permission bits explicitly rather than trust what
+        # ZipInfo.from_file() read from os.stat() -- confirmed live
+        # 2026-09-14 that on Windows (where this script actually runs),
+        # os.stat().st_mode never reflects a real executable bit no
+        # matter what git or a local `ls` claims, so every script in the
+        # release zip extracted on the real (Linux) EM as -rw-rw-rw-,
+        # unrunnable without a manual chmod. This is the one place that
+        # bit actually has to be forced correct, since (unlike the plain
+        # git-tracked package folder) git's own mode tracking doesn't
+        # apply to a zip built by hand.
+        mode = 0o755 if name in EXECUTABLE_NAMES else 0o644
+        info.external_attr = (mode << 16) | (info.external_attr & 0xFFFF)
         info.compress_type = zipfile.ZIP_DEFLATED
         with open(full, "rb") as f:
             zf.writestr(info, f.read())
