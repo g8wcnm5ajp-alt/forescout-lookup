@@ -53,7 +53,7 @@
         </div>
 
         <section class="page-tab-panel{% if active_page_tab != "lookup" %} page-tab-panel-hidden{% endif %}" data-page-tab-panel="lookup">
-        <form method="post" action="/lookup" class="lookup-form">
+        <form method="post" action="/lookup" class="lookup-form no-print">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
             <input type="text" name="ip" placeholder="203.0.113.10 or 203.0.113.10,203.0.113.11" value="{{ ip }}" required
                    pattern="^\s*(\d{1,3}\.){3}\d{1,3}\s*(,\s*(\d{1,3}\.){3}\d{1,3}\s*)*$"
@@ -136,7 +136,7 @@
         {% set successful = results|selectattr('result')|list %}
         {% set tabbed = successful|length > 1 %}
         {% if tabbed %}
-        <div class="tabs">
+        <div class="tabs no-print">
             {% for entry in successful %}
             {% set is_active_tab = (entry.result.ip == active_ip) if active_ip else loop.first %}
             <button type="button" class="tab-btn{% if is_active_tab %} active{% endif %}" data-tab-target="{{ entry.result.ip|replace('.', '-') }}">{{ entry.result.ip }}
@@ -153,13 +153,17 @@
             <section class="result{% if tabbed %} tab-panel{% if not is_active_tab %} tab-panel-hidden{% endif %}{% endif %}" data-tab-panel="{{ slug }}">
                 <h2>
                     {{ result.ip }} <span class="verdict verdict-{{ result.wired_or_wireless }}">{{ result.wired_or_wireless }}</span>
+                    <span class="no-print">
                     <form method="post" action="/lookup" class="inline-form refresh-ip-form">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
                         <input type="hidden" name="ip" value="{{ ip }}">
                         <input type="hidden" name="active_ip" value="{{ result.ip }}">
                         <button type="submit" class="btn-small">&#8635; Refresh</button>
                     </form>
+                    <button type="button" class="btn-small btn-gold ip-report-export-btn" onclick="window.print()">Export to PDF</button>
+                    </span>
                 </h2>
+                <p class="hint no-print">Printed report includes this IP's identity, location, and policy data below -- other open IP tabs and the search controls above are left out.</p>
 
                 <div class="grid">
                     <div class="card">
@@ -225,7 +229,7 @@
 
                 <div class="card">
                     <h3>Host Details</h3>
-                    <button type="button" id="hostdetails-btn-{{ slug }}">Load Host Details</button>
+                    <button type="button" id="hostdetails-btn-{{ slug }}" class="no-print">Load Host Details</button>
                     <p class="hint">A categorized summary (Classification, General, User, Network Access, Classification Details, More) built from the same raw field data as the Raw fields table further down -- only shows fields this app actually recognizes.</p>
                     <div id="hostdetails-body-{{ slug }}"></div>
                 </div>
@@ -233,7 +237,7 @@
                 <div class="card">
                     <h3>Policy match history <span class="muted">(fleet-health noise filtered out)</span></h3>
                     <p class="hint">Current connection since: <strong>{{ result.connection_since or 'unknown' }}</strong> — rows from an earlier connection (e.g. a prior wired session before the host moved to its current medium) are dimmed and marked <span class="conn-badge conn-prior">prior</span>.</p>
-                    <div class="tree-filter-row">
+                    <div class="tree-filter-row no-print">
                         <label class="tree-filter-toggle">Showing matches from the last</label>
                         <input type="number" id="history-window-value-{{ slug }}" value="24" min="1" max="9999" step="1" style="width:4.5em">
                         <select id="history-window-unit-{{ slug }}">
@@ -272,7 +276,7 @@
 
                 <div class="card">
                     <h3>Current Policy Tree</h3>
-                    <div class="tree-filter-row">
+                    <div class="tree-filter-row no-print">
                         <label class="tree-filter-toggle">
                             <input type="checkbox" id="tree-filter-{{ slug }}" checked>
                             Show only policies matched within the last
@@ -285,15 +289,15 @@
                         </select>
                         <span class="muted" id="tree-window-status-{{ slug }}"></span>
                     </div>
-                    <p class="hint">Click and drag to pan around the tree.</p>
+                    <p class="hint no-print">Click and drag to pan around the tree.</p>
                     <div id="policy-tree-graphic-{{ slug }}" class="tree-graphic-container" data-initial-ids="{{ result.last_checked.rule_ids|tojson|forceescape }}">
                     </div>
                 </div>
 
                 <div class="card">
                     <h3>Raw fields <span class="muted">(the full `fstool hostinfo` property dump -- {{ result.raw_field_count }} fields total)</span></h3>
-                    <button type="button" id="rawfields-load-btn-{{ slug }}">Load raw fields</button>
-                    <div id="rawfields-controls-{{ slug }}" class="tree-filter-row" style="display:none; margin-top:0.75rem;">
+                    <button type="button" id="rawfields-load-btn-{{ slug }}" class="no-print">Load raw fields</button>
+                    <div id="rawfields-controls-{{ slug }}" class="tree-filter-row no-print" style="display:none; margin-top:0.75rem;">
                         <input type="text" id="rawfields-search-{{ slug }}" placeholder="Filter field names, e.g. dhcp" style="flex:1; min-width:200px;">
                         <select id="rawfields-mode-{{ slug }}">
                             <option value="all" selected>All fields</option>
@@ -302,7 +306,7 @@
                         </select>
                         <span class="muted" id="rawfields-status-{{ slug }}"></span>
                     </div>
-                    <div id="rawfields-table-wrap-{{ slug }}" style="max-height: 480px; overflow-y: auto; margin-top: 0.5rem;">
+                    <div id="rawfields-table-wrap-{{ slug }}" class="rawfields-table-wrap" style="max-height: 480px; overflow-y: auto; margin-top: 0.5rem;">
                         <table id="rawfields-table-{{ slug }}"><tr><th>Field</th><th>Value</th><th>Source</th><th>Appliance</th><th>Time</th></tr></table>
                     </div>
                     <p class="hint" id="rawfields-refresh-status-{{ slug }}"></p>

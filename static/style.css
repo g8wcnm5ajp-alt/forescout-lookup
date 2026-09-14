@@ -262,11 +262,16 @@ a.btn-small { display: inline-flex; align-items: center; border-radius: 6px; cur
 .preview-warning { color: var(--both); font-size: 0.85rem; margin: 0.3rem 0; }
 
 /* "Export to PDF" -- David's ask, 2026-09-14: an Appliance report (Run Show
-   Errors) should print cleanly via the browser's own print-to-PDF, with only
-   the report content visible, not the surrounding app chrome/controls. Any
-   element that shouldn't appear in the printed output gets .no-print. */
+   Errors) or an IP-lookup result should print cleanly via the browser's own
+   print-to-PDF, with only the report content visible, not the surrounding
+   app chrome/controls. Any element that shouldn't appear in the printed
+   output gets .no-print. */
 @media print {
     .no-print { display: none !important; }
     .tree-graphic-container { height: auto; overflow: visible; border: none; resize: none; }
+    /* Also fixed-height/scrollable -- without this, anything scrolled out of
+       view in the 480px box is simply missing from the printed page, not
+       just visually clipped (a real export-correctness bug, not cosmetic). */
+    .rawfields-table-wrap { max-height: none !important; overflow: visible !important; }
     body { background: #fff; color: #000; }
 }
