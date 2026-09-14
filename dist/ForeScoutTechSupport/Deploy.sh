@@ -31,17 +31,13 @@ CONTAINER_NAME="forescout-tech-support-collector"
 NETWORK_NAME="TechSupportBridge"
 HTTPS_PORT=8443
 FW_HOOK_NAME="ForeScoutTechSupportHelper"
-# Source CIDR allowed to reach the app's HTTPS port. Must be set explicitly
-# (no default) -- a placeholder default here would either expose the app
-# too broadly or silently firewall out the real admin LAN, confirmed live
-# 2026-09-14 when an earlier documentation-only placeholder default did
-# exactly that on a real deploy.
-if [ -z "${ADMIN_CIDR:-}" ]; then
-    echo "Error: ADMIN_CIDR is not set." >&2
-    echo "Export it before running, e.g.:" >&2
-    echo "    ADMIN_CIDR=192.168.1.0/24 ./Deploy.sh" >&2
-    exit 1
-fi
+# Source CIDR allowed to reach the app's HTTPS port. Defaults to
+# 0.0.0.0/0 (open to any source) -- David's explicit call 2026-09-14,
+# reverting the earlier same-day no-default hardening (which existed
+# because a placeholder default had once silently firewalled out the
+# real admin LAN). Override with ADMIN_CIDR=<cidr> ./Deploy.sh to scope
+# this down to a specific network.
+ADMIN_CIDR="${ADMIN_CIDR:-0.0.0.0/0}"
 
 KEY_DIR="${DIR}/keys"
 KEY_FILE="${KEY_DIR}/webapp_query_rsa"
