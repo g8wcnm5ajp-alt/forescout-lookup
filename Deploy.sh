@@ -102,14 +102,24 @@ chmod 644 "${KEY_FILE}.pub"
 
 mkdir -p "$(dirname "$AUTHORIZED_KEYS")"
 touch "$AUTHORIZED_KEYS"
-if ! grep -q "$KEY_COMMENT" "$AUTHORIZED_KEYS" 2>/dev/null; then
-    PUBKEY_CONTENT="$(cat "${KEY_FILE}.pub")"
-    echo "command=\"${WEBAPP_QUERY_WRAPPER}\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ${PUBKEY_CONTENT}" \
-        >> "$AUTHORIZED_KEYS"
-    chmod 600 "$AUTHORIZED_KEYS"
-    echo "Registered restricted key in $AUTHORIZED_KEYS"
-else
+PUBKEY_CONTENT="$(cat "${KEY_FILE}.pub")"
+DESIRED_LINE="command=\"${WEBAPP_QUERY_WRAPPER}\",no-port-forwarding,no-X11-forwarding,no-agent-forwarding,no-pty ${PUBKEY_CONTENT}"
+if grep -qF "$DESIRED_LINE" "$AUTHORIZED_KEYS" 2>/dev/null; then
     echo "Key already registered in $AUTHORIZED_KEYS -- skipped"
+else
+    # Compare actual key CONTENT, not just the comment -- a comment-only match
+    # left a stale entry registered across a keypair regeneration before
+    # (confirmed live 2026-09-14: the local keys/ dir got a fresh keypair on
+    # a later redeploy, but this comment-only check thought it was already
+    # registered and never updated authorized_keys, breaking every SSH call
+    # this app made until the mismatch was found and fixed by hand). Drop any
+    # existing entry for this app before adding the current one, so a stale
+    # key from an earlier keypair can never linger.
+    grep -v "$KEY_COMMENT" "$AUTHORIZED_KEYS" > "${AUTHORIZED_KEYS}.tmp" 2>/dev/null || true
+    mv "${AUTHORIZED_KEYS}.tmp" "$AUTHORIZED_KEYS"
+    echo "$DESIRED_LINE" >> "$AUTHORIZED_KEYS"
+    chmod 600 "$AUTHORIZED_KEYS"
+    echo "Registered restricted key in $AUTHORIZED_KEYS (replaced any stale entry)"
 fi
 
 echo
