@@ -71,6 +71,22 @@ MAX_LOOKUP_IPS = 10
 DATA_DIR = os.environ.get("FORESCOUT_DATA_DIR", "/data")
 os.makedirs(DATA_DIR, exist_ok=True)
 
+_DEPLOY_COUNT_PATH = os.path.join(DATA_DIR, "deploy_count.txt")
+
+
+def _read_deploy_count():
+    """Written by Deploy.sh on every real deploy (David's standing rule,
+    2026-09-14) -- read fresh each request rather than cached at import
+    time, since Deploy.sh writes it to the bind-mounted DATA_DIR from
+    outside this process. Missing file (a pre-existing deployment from
+    before this was added, or FORESCOUT_DATA_DIR pointed elsewhere) ->
+    "?" rather than a crash or a misleading "1"."""
+    try:
+        with open(_DEPLOY_COUNT_PATH) as f:
+            return f.read().strip()
+    except OSError:
+        return "?"
+
 
 # ---------------------------------------------------------------------
 # Login -- David's ask, 2026-08-26 (Phase D of the EM-hosted package):
@@ -1020,6 +1036,7 @@ def render(**kwargs):
     kwargs["app_version"] = APP_VERSION
     kwargs["app_author"] = APP_AUTHOR
     kwargs["deployed_at_display"] = DEPLOYED_AT.strftime("%Y-%m-%d %H:%M:%S UTC")
+    kwargs["deploy_count"] = _read_deploy_count()
     return render_template("index.html", **kwargs)
 
 

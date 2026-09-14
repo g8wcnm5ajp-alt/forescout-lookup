@@ -183,6 +183,17 @@ fi
 
 mkdir -p "$DATA_DIR"
 
+# Deploy counter -- David's standing rule (2026-09-14): every real deploy
+# increments this, independent of the hand-curated semantic APP_VERSION in
+# app.py, so it's always possible to tell at a glance whether a given
+# instance is actually running the latest deploy, not a stale one. Persists
+# across redeploys into the same DATA_DIR; resets only on a --purge'd
+# Remove.sh (which wipes DATA_DIR entirely, same as everything else in it).
+DEPLOY_COUNT_FILE="${DATA_DIR}/deploy_count.txt"
+DEPLOY_COUNT=$(( $(cat "$DEPLOY_COUNT_FILE" 2>/dev/null || echo 0) + 1 ))
+echo "$DEPLOY_COUNT" > "$DEPLOY_COUNT_FILE"
+echo "Deploy #${DEPLOY_COUNT}"
+
 docker run -d \
     --name "$CONTAINER_NAME" \
     --network "$NETWORK_NAME" \
