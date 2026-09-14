@@ -8,14 +8,14 @@
 </head>
 <body>
     <script>const CSRF_TOKEN = {{ csrf_token|tojson }};</script>
-    <div class="forescout-header">
+    <div class="forescout-header no-print">
         <img src="{{ url_for('static', filename='images/forescout-logo.png') }}" alt="Forescout">
         <div class="forescout-header-title">
             Forescout Tech Support Log Collection Tool
         </div>
     </div>
     <main>
-        <div style="display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:0.5rem;">
+        <div class="no-print" style="display:flex; justify-content:space-between; align-items:baseline; flex-wrap:wrap; gap:0.5rem;">
             <h1 style="margin:0;">Forescout Tech Support Log Collection Tool <span class="muted" style="font-size:0.55em; font-weight:normal;">v{{ app_version }}+{{ deploy_count }}</span></h1>
             <div class="hint">
                 <a href="{{ url_for('certs_route') }}">Certificates</a>
@@ -25,10 +25,10 @@
                 &middot; <form method="post" action="{{ url_for('logout_route') }}" style="display:inline;"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit" class="btn-small btn-secondary">Logout</button></form>
             </div>
         </div>
-        <p class="subtitle">Single or multi-IP lookup (comma-separated), routed through the EM's restricted query wrapper.</p>
+        <p class="subtitle no-print">Single or multi-IP lookup (comma-separated), routed through the EM's restricted query wrapper.</p>
 
         {% set active_page_tab = "techsupport" if action in ("techsupport", "debugset", "debugscheduled") else "lookup" %}
-        <div class="tabs page-tabs">
+        <div class="tabs page-tabs no-print">
             <button type="button" class="page-tab-btn{% if active_page_tab == "lookup" %} active{% endif %}" data-page-tab-target="lookup">IP Lookup</button>
             <button type="button" class="page-tab-btn" data-page-tab-target="appliances">Appliances{% if active_appliance_runs %} <span class="page-tab-badge">{{ active_appliance_runs|length }}</span>{% endif %}</button>
             <button type="button" class="page-tab-btn{% if active_page_tab == "techsupport" %} active{% endif %}" data-page-tab-target="techsupport">Tech Support Bundle Generator</button>
@@ -316,7 +316,7 @@
 
         <section class="page-tab-panel page-tab-panel-hidden" data-page-tab-panel="appliances">
         {% if active_appliance_runs %}
-        <div class="card">
+        <div class="card no-print">
             <h3>Run Show Errors in progress <span class="muted">(started by any session, not yet finished)</span></h3>
             <table>
                 <tr><th>Target</th><th>Duration</th><th>Started</th><th></th></tr>
@@ -341,6 +341,7 @@
         {% endif %}
 
         <div class="card actions" id="appliances-panel" data-active-runs="{{ active_appliance_runs|tojson|forceescape }}">
+            <div class="no-print">
             <h3>Appliances <span class="muted">(from the EM's own registry, live online status)</span>
                 <form method="post" action="/admin/clear_log/appliance_runs" class="inline-form" style="display:inline"
                     onsubmit="return confirm('Clear Run Show Errors job history? Currently running jobs are cleared too, not just finished ones.');">
@@ -361,9 +362,10 @@
                 <button type="button" id="appliances-run-btn">Run Show Errors</button>
             </div>
             <p class="hint">Runs <code>fstool tech-support -t &lt;duration&gt; --review --show-errors</code> on each checked appliance -- a real, unscoped snapshot that takes several minutes per appliance, not a quick check.</p>
+            </div>
 
             <div id="appliances-tabs-wrap" style="display:none; margin-top:1rem;">
-                <div class="tabs" id="appliances-tabbar">
+                <div class="tabs no-print" id="appliances-tabbar">
                     <button type="button" id="appliances-page-prev" class="tab-page-btn">-</button>
                     <span id="appliances-tabbar-buttons" class="appliances-tabbar-buttons"></span>
                     <button type="button" id="appliances-page-next" class="tab-page-btn">+</button>
@@ -1600,6 +1602,151 @@
                 )).join("");
             }
 
+            // Standalone tree layout/draw -- David's ask, 2026-09-14: include a
+            // policy flow graph in each Run Show Errors report. Deliberately a
+            // separate, simplified copy of the IP-lookup tab's layoutTree/
+            // renderGraphic (above, in the other <script> block) rather than
+            // reusing that code directly -- this one has no per-host matched-
+            // rule highlighting to do (an appliance-level error report isn't
+            // about one host's match history), and that existing renderer has
+            // a real documented bug history (see the Graphic View diagnostic
+            // beacon elsewhere in this file) -- safer not to touch it for an
+            // unrelated feature. Click-to-collapse and drag-to-pan are kept
+            // (genuinely useful for a large tree), matched-highlighting is not
+            // (nothing to highlight here).
+            const POLICY_GRAPH_NODE_W = 170, POLICY_GRAPH_NODE_H = 26, POLICY_GRAPH_H_GAP = 16, POLICY_GRAPH_V_GAP = 46;
+            let _cachedPolicyTree = null; // fetched once, reused across every report's graph -- same EM-wide tree every time
+            const svgNS2 = "http://www.w3.org/2000/svg";
+
+            function layoutStaticTree(root, collapsedIds) {
+                let leafX = 0;
+                function visit(node, depth) {
+                    const hasChildren = (node.children || []).length > 0;
+                    const collapsed = hasChildren && collapsedIds.has(node.id);
+                    const childPositions = collapsed ? [] : (node.children || []).map(c => visit(c, depth + 1));
+                    let x;
+                    if (childPositions.length === 0) {
+                        x = leafX * (POLICY_GRAPH_NODE_W + POLICY_GRAPH_H_GAP);
+                        leafX++;
+                    } else {
+                        const xs = childPositions.map(c => c.x);
+                        x = (Math.min(...xs) + Math.max(...xs)) / 2;
+                    }
+                    return { node, x, y: depth * (POLICY_GRAPH_NODE_H + POLICY_GRAPH_V_GAP), hasChildren, collapsed, children: childPositions };
+                }
+                return visit(root, 0);
+            }
+
+            function renderStaticPolicyTreeInto(container, tree, collapsedIds) {
+                container.textContent = "";
+                if (!tree) {
+                    container.textContent = "No policy tree available.";
+                    return;
+                }
+                const positioned = layoutStaticTree(tree, collapsedIds);
+                const flat = [];
+                (function flatten(pos) { flat.push(pos); pos.children.forEach(flatten); })(positioned);
+                const maxX = Math.max(...flat.map(p => p.x)) + POLICY_GRAPH_NODE_W;
+                const maxY = Math.max(...flat.map(p => p.y)) + POLICY_GRAPH_NODE_H;
+
+                const svg = document.createElementNS(svgNS2, "svg");
+                svg.setAttribute("width", maxX + 20);
+                svg.setAttribute("height", maxY + 20);
+                svg.setAttribute("viewBox", "-10 -10 " + (maxX + 20) + " " + (maxY + 20));
+
+                (function drawEdges(pos) {
+                    pos.children.forEach(c => {
+                        const x1 = pos.x + POLICY_GRAPH_NODE_W / 2, y1 = pos.y + POLICY_GRAPH_NODE_H;
+                        const x2 = c.x + POLICY_GRAPH_NODE_W / 2, y2 = c.y;
+                        const midY = (y1 + y2) / 2;
+                        const path = document.createElementNS(svgNS2, "path");
+                        path.setAttribute("class", "tree-graphic-edge");
+                        path.setAttribute("d", `M${x1},${y1} C${x1},${midY} ${x2},${midY} ${x2},${y2}`);
+                        svg.appendChild(path);
+                        drawEdges(c);
+                    });
+                })(positioned);
+
+                (function drawNode(pos) {
+                    const node = pos.node;
+                    const classes = ["tree-graphic-node", "tree-graphic-" + node.type];
+                    if (node.type === "rule" && !node.enabled) classes.push("tree-graphic-disabled");
+                    if (pos.collapsed) classes.push("tree-graphic-collapsed");
+
+                    const g = document.createElementNS(svgNS2, "g");
+                    g.setAttribute("class", classes.join(" "));
+                    g.setAttribute("transform", "translate(" + pos.x + "," + pos.y + ")");
+
+                    const rect = document.createElementNS(svgNS2, "rect");
+                    rect.setAttribute("width", POLICY_GRAPH_NODE_W);
+                    rect.setAttribute("height", POLICY_GRAPH_NODE_H);
+                    rect.setAttribute("rx", 5);
+                    g.appendChild(rect);
+
+                    let label = node.name || "";
+                    if (node.type === "inner_rule" && node.action_enabled) label += " ●";
+                    if (label.length > 26) label = label.slice(0, 25) + "…";
+                    const text = document.createElementNS(svgNS2, "text");
+                    text.setAttribute("x", 6);
+                    text.setAttribute("y", POLICY_GRAPH_NODE_H / 2 + 4);
+                    text.textContent = label;
+                    g.appendChild(text);
+
+                    if (pos.hasChildren) {
+                        const marker = document.createElementNS(svgNS2, "text");
+                        marker.setAttribute("x", POLICY_GRAPH_NODE_W - 16);
+                        marker.setAttribute("y", POLICY_GRAPH_NODE_H / 2 + 4);
+                        marker.setAttribute("class", "tree-graphic-collapse-marker");
+                        marker.textContent = pos.collapsed ? "[+]" : "[-]";
+                        g.appendChild(marker);
+                        g.addEventListener("click", () => {
+                            if (collapsedIds.has(node.id)) collapsedIds.delete(node.id); else collapsedIds.add(node.id);
+                            renderStaticPolicyTreeInto(container, tree, collapsedIds);
+                        });
+                    }
+
+                    svg.appendChild(g);
+                    pos.children.forEach(drawNode);
+                })(positioned);
+
+                container.appendChild(svg);
+            }
+
+            // Default-collapsed rather than fully expanded -- the real tree is
+            // genuinely huge (3870+ nodes as of 2026-09-13), so starting fully
+            // open would make the graph unreadable on screen and unusable in a
+            // printed report. Collapses everything below DEFAULT_COLLAPSE_DEPTH
+            // (i.e. shows the root plus its immediate named folders, each with
+            // a [+] to expand) -- same click-to-expand mechanism as the rest of
+            // this tree, just starting compact instead of wide open.
+            const DEFAULT_COLLAPSE_DEPTH = 1;
+            function collectDefaultCollapsed(node, depth, set) {
+                const children = node.children || [];
+                if (depth >= DEFAULT_COLLAPSE_DEPTH && children.length) {
+                    set.add(node.id);
+                    return;
+                }
+                children.forEach(c => collectDefaultCollapsed(c, depth + 1, set));
+            }
+
+            function loadPolicyGraphInto(container) {
+                container.textContent = "Loading policy flow graph…";
+                const show = (tree) => {
+                    const defaultCollapsed = new Set();
+                    collectDefaultCollapsed(tree, 0, defaultCollapsed);
+                    renderStaticPolicyTreeInto(container, tree, defaultCollapsed);
+                };
+                if (_cachedPolicyTree !== null) { show(_cachedPolicyTree); return; }
+                fetch("/api/policytree")
+                    .then(r => r.json())
+                    .then(tree => {
+                        if (tree.error) { container.textContent = "Error loading policy tree: " + tree.error; return; }
+                        _cachedPolicyTree = tree;
+                        show(tree);
+                    })
+                    .catch(err => { container.textContent = "Failed to load policy tree: " + err; });
+            }
+
             function pollRun(run) {
                 fetch("/api/appliance_run/" + run.run_id)
                     .then(r => r.json())
@@ -1616,11 +1763,17 @@
                         }
                         const result = d.result || {};
                         panelEl.innerHTML = (
+                            "<div class=\"no-print\"><button type=\"button\" class=\"btn-small btn-gold appliance-report-export-btn\">Export to PDF</button></div>" +
                             "<p class=\"hint\">Snapshot: " + escapeHtml(result.snapshot_dir || "—") +
                             " (deleted after reading -- this panel is a live review, not a retained bundle)</p>" +
                             renderCategories(result.categories) +
-                            renderDiagFiles(result.diag_files)
+                            renderDiagFiles(result.diag_files) +
+                            "<h4 class=\"diag-section-heading\">Policy Flow Graph</h4>" +
+                            "<p class=\"hint\">This EM's full policy tree, collapsed by default (it's large) -- click a folder to expand it.</p>" +
+                            "<div class=\"card\"><div class=\"tree-graphic-container policy-graph-container\"></div></div>"
                         );
+                        panelEl.querySelector(".appliance-report-export-btn").addEventListener("click", () => window.print());
+                        loadPolicyGraphInto(panelEl.querySelector(".policy-graph-container"));
                     })
                     .catch(() => { setTimeout(() => pollRun(run), 5000); });
             }
