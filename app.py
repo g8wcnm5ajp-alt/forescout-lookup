@@ -44,7 +44,7 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.2.7"
+APP_VERSION = "1.2.8"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
