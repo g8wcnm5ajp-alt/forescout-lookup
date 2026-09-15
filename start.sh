@@ -59,4 +59,4 @@ docker run -d \
     -v "${DATA_DIR}:/data" \
     "$IMAGE_NAME"
 
-echo "Done. Forescout lookup running at http://<host>:${HTTP_PORT}/"
+echo "Done. Forescout Technical Support App running at http://<host>:${HTTP_PORT}/"
