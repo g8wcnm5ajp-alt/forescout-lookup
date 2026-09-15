@@ -780,6 +780,15 @@ def get_active_appliance_runs():
 # request on. "key" is the bundle path when analyzing a bundle, else the
 # target -- used for both display and the duplicate-run guard.
 # ---------------------------------------------------------------------
+
+# A bundle-mode analyze run never contacts any live target at all (the
+# bundle is unpacked and read directly on the EM) -- target is purely a
+# display label there. Needs to merely satisfy valid_target's IP-or-
+# hostname shape check, not name a real box; a bare word like "EM" has
+# no dot and fails that check before the request even reaches the EM
+# (confirmed live -- the exact bug this constant fixes).
+BUNDLE_ANALYZE_PLACEHOLDER_TARGET = "bundle.local"
+
 ANALYZE_RUNS_PATH = os.path.join(DATA_DIR, "analyze_runs.json")
 _analyze_runs_lock = threading.Lock()
 
@@ -2352,11 +2361,13 @@ def techsupport_analyze_route():
     if not path:
         return jsonify({"error": "No bundle path given."}), 400
     _log_activity("techsupport_bundle_analyze", username=session.get("username"), path=path)
-    # target is informational only once bundle_path is set (see
-    # analyze_admission/do_analyzeadm) -- "EM" names where the bundle
-    # lives, not where the analysis actually runs from a caller's
-    # perspective, which is always this same EM.
-    run_id = start_analyze_run("EM", path, "1h", None, 10, 5, 7)
+    # target is completely ignored once bundle_path is set (see
+    # analyze_admission/do_analyzeadm -- the bundle is unpacked and read
+    # directly, no live target is ever contacted) -- a fixed placeholder
+    # that merely satisfies valid_target's shape check, not a real box.
+    # Bare "EM" isn't hostname-shaped (no dot) and was failing that check
+    # before the request could even reach the EM -- confirmed live.
+    run_id = start_analyze_run(BUNDLE_ANALYZE_PLACEHOLDER_TARGET, path, "1h", None, 10, 5, 7)
     if run_id is None:
         return jsonify({"error": "An analysis is already running for this bundle."}), 409
     return jsonify({"run_id": run_id})
@@ -2390,7 +2401,7 @@ def bundle_upload_route():
     _log_activity(
         "bundle_uploaded", username=session.get("username"), filename=filename, size=result.get("size"),
     )
-    run_id = start_analyze_run("EM", result["path"], "1h", None, 10, 5, 7)
+    run_id = start_analyze_run(BUNDLE_ANALYZE_PLACEHOLDER_TARGET, result["path"], "1h", None, 10, 5, 7)
     if run_id is None:
         return jsonify({"error": "An analysis is already running for this bundle."}), 409
     return jsonify({"path": result["path"], "size": result.get("size"), "run_id": run_id})
