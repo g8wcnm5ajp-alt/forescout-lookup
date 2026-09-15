@@ -2069,7 +2069,11 @@ def do_techsupport_cleanup(path):
 # reasoning as every other path whitelist here, a narrow fixed shape is
 # what keeps this from being an arbitrary-file-write primitive.
 # ---------------------------------------------------------------------
-UPLOAD_DIR = "/root/scripts/webapp-query/uploads"
+# /tmp, not a directory under this wrapper's own scripts/ tree -- an
+# uploaded bundle is transient scratch data (same reasoning as
+# analyze's own /tmp/hat-unpack.XXXXXX extraction dirs), never meant to
+# persist across a reboot or accumulate on this EM long-term.
+UPLOAD_DIR = "/tmp/hat-uploads"
 UPLOAD_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,120}\.(?:tgz|tar\.gz)$")
 UPLOAD_PATH_RE = re.compile(rf"^{re.escape(UPLOAD_DIR)}/{UPLOAD_FILENAME_RE.pattern[1:-1]}$")
 

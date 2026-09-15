@@ -115,7 +115,7 @@
 #
 set -euo pipefail
 
-VERSION="1.3.0"
+VERSION="1.3.1"
 
 # Overridden below when -b points analyze at a bundle instead of this
 # live appliance -- everything else in the script reads through these
@@ -380,6 +380,11 @@ if [ -n "$BUNDLE" ]; then
     elif [ -f "$BUNDLE" ]; then
         BUNDLE_ROOT=$(mktemp -d /tmp/hat-unpack.XXXXXX)
         echo "=== Unpacking $BUNDLE to $BUNDLE_ROOT ==="
+        # Always clean this up on exit, success or failure -- confirmed
+        # live this leaked multiple GB per run otherwise (an 867MB real
+        # bundle expands to ~8GB unpacked), compounding across repeated
+        # runs into real disk pressure.
+        trap 'rm -rf "$BUNDLE_ROOT"' EXIT
         tar -xzf "$BUNDLE" -C "$BUNDLE_ROOT"
     else
         echo "Error: -b '$BUNDLE' is not a file or directory." >&2

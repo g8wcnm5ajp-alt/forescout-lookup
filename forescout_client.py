@@ -609,17 +609,23 @@ def analyze_admission(
     """
     Runs high-admission-trace.sh's `analyze` mode. Give bundle_path to
     analyze a bundle already centralized on the EM (same path shape as
-    download_techsupport_bundle/delete_techsupport_bundle) instead of the
-    live target -- target is still required either way (informational
-    only when bundle_path is given, naming where the bundle came from).
-    A generous default timeout: a real bundle analysis measured ~110s
-    against an 867MB real bundle; this leaves headroom for a much bigger
-    one. The caller runs this in a background thread and polls, same
-    pattern as run_show_errors/tech-support builds.
+    download_techsupport_bundle/delete_techsupport_bundle) OR one
+    uploaded through the Upload & Review Bundle tab (UPLOAD_PATH_RE --
+    do_analyzeadm's own EM-side check already accepts either; this
+    mirrors it client-side too, confirmed live this was the actual gap:
+    a real uploaded bundle's path was rejected instantly, before the
+    request ever reached the EM, because this check only knew about the
+    centralized-bundle shape) instead of the live target -- target is
+    still required either way (informational only when bundle_path is
+    given, naming where the bundle came from). A generous default
+    timeout: a real bundle analysis measured ~110s against an 867MB real
+    bundle; this leaves headroom for a much bigger one. The caller runs
+    this in a background thread and polls, same pattern as
+    run_show_errors/tech-support builds.
     """
     if not valid_target(target):
         raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
-    if bundle_path is not None and not BUNDLE_PATH_RE.match(bundle_path):
+    if bundle_path is not None and not (BUNDLE_PATH_RE.match(bundle_path) or UPLOAD_PATH_RE.match(bundle_path)):
         raise ForescoutClientError(f"'{bundle_path}' is not a recognized tech-support bundle path.")
     if not ANALYZE_WINDOW_RE.match(window or ""):
         raise ForescoutClientError(f"'{window}' is not a valid window (expected e.g. 30m, 2h, 1d).")
@@ -682,7 +688,7 @@ def download_plugin_logs_zip(target, plugins, start_epoch, end_epoch, timeout=30
 # uploads directory on the EM, entirely separate from the real
 # centralized-bundle tree BUNDLE_PATH_RE addresses.
 UPLOAD_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,120}\.(?:tgz|tar\.gz)$")
-UPLOAD_PATH_RE = re.compile(r"^/root/scripts/webapp-query/uploads/[A-Za-z0-9_.\-]{1,120}\.(?:tgz|tar\.gz)$")
+UPLOAD_PATH_RE = re.compile(r"^/tmp/hat-uploads/[A-Za-z0-9_.\-]{1,120}\.(?:tgz|tar\.gz)$")
 
 # Sanity cap, not confirmed with David as the right number -- same
 # reasoning as MAX_LOOKUP_IPS in app.py. Real bundles seen so far (up to

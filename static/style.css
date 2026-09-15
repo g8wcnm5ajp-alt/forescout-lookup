@@ -174,6 +174,9 @@ table.params td { word-break: break-all; max-width: 380px; }
     margin-top: 0.5rem;
 }
 .analyze-disabled-link { pointer-events: none; opacity: 0.4; }
+.analyze-progress { margin-top: 0.5rem; }
+.analyze-steps { margin: 0.4rem 0 0.4rem 1.2rem; padding: 0; }
+.analyze-steps li { margin-bottom: 0.15rem; }
 #analyze-plugins-list { max-height: 12rem; overflow-y: auto; display: block; }
 #analyze-plugins-list label { display: block; margin-bottom: 0.2rem; }
 

@@ -472,7 +472,7 @@
                     </label>
                 </div>
             </details>
-            <p class="hint" id="analyze-run-status"></p>
+            <div class="hint" id="analyze-run-status"></div>
             <pre id="analyze-output" class="analyze-output" style="display:none;"></pre>
         </div>
         </section>
@@ -487,7 +487,7 @@
                 <input type="file" id="upload-bundle-file" accept=".tgz,.tar.gz">
                 <button type="button" id="upload-bundle-btn">Upload &amp; Analyze</button>
             </div>
-            <p class="hint" id="upload-bundle-status"></p>
+            <div class="hint" id="upload-bundle-status"></div>
             <pre id="upload-bundle-output" class="analyze-output" style="display:none;"></pre>
             <div id="upload-bundle-cleanup-wrap" style="display:none;">
                 <button type="button" id="upload-bundle-cleanup-btn" class="btn-small btn-secondary">Clean up (delete off the EM)</button>
@@ -2127,12 +2127,39 @@
                     });
             });
 
+            // Shared by every analyze-run poller (this tab, the Tech
+            // Support tab's Analyze button, Upload & Review Bundle) --
+            // there's no true per-step progress to report (the script
+            // runs as one pass over SSH; webapp-query.py only gets its
+            // output back once the whole thing finishes), so this shows
+            // a spinner, a live elapsed-time counter, and the real list
+            // of what that one pass actually does, rather than faking a
+            // precise ETA or per-step state we don't have.
+            window.renderAnalyzeProgress = function (d) {
+                const elapsed = Math.max(0, Math.round((Date.now() - d.started_at * 1000) / 1000));
+                const steps = d.bundle
+                    ? ["Unpack the bundle", "Admission source breakdown (today.log)",
+                       "Peak-window write-activity outliers", "Switch/port/MAC ranking (sw_mac_track.log, if present)",
+                       "Repeated re-admission + switch poll-cycle checks (sw.log, if present)"]
+                    : ["Admission source breakdown (today.log)", "Peak-window write-activity outliers",
+                       "Switch/port/MAC ranking (sw_mac_track.log)",
+                       "Repeated re-admission + switch poll-cycle checks (sw.log)"];
+                return "<div class=\"analyze-progress\"><span class=\"spinner\"></span>Running… (" + elapsed + "s elapsed)" +
+                    "<ul class=\"analyze-steps hint\">" + steps.map(s => "<li>" + s + "</li>").join("") + "</ul>" +
+                    "<p class=\"hint\">These run as one pass, so there's no per-step progress to show -- real bundles have" +
+                    " taken anywhere from a few seconds (a live target) to 2+ minutes (a large multi-hundred-MB bundle).</p></div>";
+            };
+
             function pollAnalyzeRun(runId) {
                 fetch("/api/analyze_run/" + runId)
                     .then(r => r.json())
                     .then(d => {
                         if (d.error) { runStatus.textContent = "error: " + d.error; return; }
-                        if (d.status === "running") { setTimeout(() => pollAnalyzeRun(runId), 3000); return; }
+                        if (d.status === "running") {
+                            runStatus.innerHTML = window.renderAnalyzeProgress(d);
+                            setTimeout(() => pollAnalyzeRun(runId), 3000);
+                            return;
+                        }
                         runBtn.disabled = false;
                         runBtn.textContent = "Run analyze";
                         if (d.status === "failed") {
@@ -2202,7 +2229,11 @@
                     .then(r => r.json())
                     .then(d => {
                         if (d.error) { statusEl.textContent = "error: " + d.error; return; }
-                        if (d.status === "running") { setTimeout(() => pollUploadAnalyze(runId), 3000); return; }
+                        if (d.status === "running") {
+                            statusEl.innerHTML = window.renderAnalyzeProgress(d);
+                            setTimeout(() => pollUploadAnalyze(runId), 3000);
+                            return;
+                        }
                         uploadBtn.disabled = false;
                         uploadBtn.textContent = "Upload & Analyze";
                         if (d.status === "failed") {
@@ -2365,7 +2396,11 @@
                     .then(r => r.json())
                     .then(d => {
                         if (d.error) { resultEl.textContent = "error: " + d.error; return; }
-                        if (d.status === "running") { setTimeout(() => pollTsAnalyze(runId, resultEl), 3000); return; }
+                        if (d.status === "running") {
+                            resultEl.innerHTML = window.renderAnalyzeProgress(d);
+                            setTimeout(() => pollTsAnalyze(runId, resultEl), 3000);
+                            return;
+                        }
                         if (d.status === "failed") { resultEl.textContent = "Failed: " + (d.error || "unknown error"); return; }
                         resultEl.textContent = (d.result && d.result.output) || "(no output)";
                     })
