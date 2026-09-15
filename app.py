@@ -24,11 +24,12 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from forescout_client import (
     CASE_REF_RE, COMPANY_NAME_RE, LEVEL_RE, ForescoutClientError, analyze_admission, arp_list,
     build_techsupport_em, build_techsupport_window_appliance, clear_lookup_debug_log, clear_techsupport_log,
-    collect_techsupport, debug_set_appliance, delete_techsupport_bundle, download_plugin_logs_zip,
-    download_techsupport_bundle, get_admin_cidr, last_checked, list_appliances, list_plugins, lookup,
-    matched_rules, policy_history, policy_tree, preview_techsupport, preview_techsupport_em, raw_fields,
-    run_show_errors, set_admin_cidr, tail_lookup_debug_log, tail_techsupport_log, trace_defaults, trace_list,
-    trace_set, valid_cidr, valid_ip, valid_target,
+    collect_techsupport, debug_set_appliance, delete_techsupport_bundle, delete_uploaded_bundle,
+    download_plugin_logs_zip, download_techsupport_bundle, get_admin_cidr, last_checked, list_appliances,
+    list_plugins, lookup, matched_rules, policy_history, policy_tree, preview_techsupport,
+    preview_techsupport_em, raw_fields, run_show_errors, set_admin_cidr, tail_lookup_debug_log,
+    tail_techsupport_log, trace_defaults, trace_list, trace_set, upload_bundle, valid_cidr, valid_ip,
+    valid_target,
 )
 
 app = Flask(__name__)
@@ -44,7 +45,7 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.2.8"
+APP_VERSION = "1.2.9"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
@@ -2359,6 +2360,55 @@ def techsupport_analyze_route():
     if run_id is None:
         return jsonify({"error": "An analysis is already running for this bundle."}), 409
     return jsonify({"run_id": run_id})
+
+
+@app.route("/bundle/upload", methods=["POST"])
+def bundle_upload_route():
+    """
+    Upload & Review Bundle tab -- David's ask: review a tech-support
+    bundle this app never built itself (a customer's own, sent in some
+    other way), not just one already sitting on the EM's own
+    /shared/shared/case tree. Uploads the raw bytes straight through to
+    the EM (upload_bundle), then starts the same background analyze run
+    as the Tech Support tab's own Analyze button, scoped to the freshly-
+    uploaded path -- the panel's JS polls /api/analyze_run/<id> the same
+    way as everywhere else.
+    """
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    f = request.files.get("bundle")
+    if f is None or not f.filename:
+        return jsonify({"error": "Choose a bundle file first."}), 400
+    # basename only -- strips any path component a crafted filename might
+    # carry, before it ever reaches upload_bundle's own shape check.
+    filename = os.path.basename(f.filename)
+    data = f.read()
+    try:
+        result = upload_bundle(filename, data)
+    except ForescoutClientError as e:
+        return jsonify({"error": str(e)}), 400
+    _log_activity(
+        "bundle_uploaded", username=session.get("username"), filename=filename, size=result.get("size"),
+    )
+    run_id = start_analyze_run("EM", result["path"], "1h", None, 10, 5, 7)
+    if run_id is None:
+        return jsonify({"error": "An analysis is already running for this bundle."}), 409
+    return jsonify({"path": result["path"], "size": result.get("size"), "run_id": run_id})
+
+
+@app.route("/bundle/upload/cleanup", methods=["POST"])
+def bundle_upload_cleanup_route():
+    """Deletes an uploaded bundle off the EM once it's been reviewed -- same reasoning as
+    /techsupport/cleanup, scoped to the uploads directory."""
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    path = request.form.get("path", "")
+    try:
+        delete_uploaded_bundle(path)
+    except ForescoutClientError as e:
+        return jsonify({"error": str(e)}), 400
+    _log_activity("bundle_upload_cleanup", username=session.get("username"), path=path)
+    return jsonify({"ok": True})
 
 
 # ---------------------------------------------------------------------

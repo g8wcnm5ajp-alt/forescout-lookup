@@ -677,6 +677,66 @@ def download_plugin_logs_zip(target, plugins, start_epoch, end_epoch, timeout=30
     return proc
 
 
+# Upload & Review Bundle tab -- a tech-support bundle this app never
+# built itself (e.g. one a customer sent in). Lands under its own fixed
+# uploads directory on the EM, entirely separate from the real
+# centralized-bundle tree BUNDLE_PATH_RE addresses.
+UPLOAD_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,120}\.(?:tgz|tar\.gz)$")
+UPLOAD_PATH_RE = re.compile(r"^/root/scripts/webapp-query/uploads/[A-Za-z0-9_.\-]{1,120}\.(?:tgz|tar\.gz)$")
+
+# Sanity cap, not confirmed with David as the right number -- same
+# reasoning as MAX_LOOKUP_IPS in app.py. Real bundles seen so far (up to
+# 867MB) are comfortably under this.
+MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+
+
+def upload_bundle(filename, data, timeout=900):
+    """
+    Streams `data` (the uploaded bundle's raw bytes) to the EM via
+    `bundleupload <filename>` and returns {"path": ..., "size": ...} --
+    the EM-side path, ready to hand straight to
+    analyze_admission(bundle_path=...). Unlike every other verb call
+    here, this can't go through _run_verb (that helper runs in text
+    mode; a bundle's bytes are binary), so it builds its own subprocess
+    call the same way download_plugin_logs_zip/download_techsupport_bundle
+    do for the opposite (EM-to-browser) direction.
+    """
+    if not UPLOAD_FILENAME_RE.match(filename or ""):
+        raise ForescoutClientError("Bundle filename must end in .tgz or .tar.gz (letters/digits/./-/_ only).")
+    if len(data) > MAX_UPLOAD_BYTES:
+        raise ForescoutClientError(f"Bundle is over the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB upload limit.")
+    if not os.path.isfile(SSH_KEY_PATH):
+        raise ForescoutClientError(
+            f"SSH key not found at {SSH_KEY_PATH} -- the container's key volume isn't mounted correctly."
+        )
+    cmd = [
+        "ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10", "-i", SSH_KEY_PATH, f"root@{EM_HOST}", f"bundleupload {filename}",
+    ]
+    try:
+        p = subprocess.run(cmd, input=data, capture_output=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise ForescoutClientError(f"Upload to the EM timed out after {timeout}s.")
+    except FileNotFoundError:
+        raise ForescoutClientError("ssh is not available in this container.")
+    if not p.stdout.strip():
+        detail = p.stderr.decode(errors="replace").strip() or f"exit code {p.returncode}"
+        raise ForescoutClientError(f"No response from the EM ({detail}).")
+    try:
+        result = json.loads(p.stdout)
+    except json.JSONDecodeError:
+        raise ForescoutClientError(f"Unexpected (non-JSON) response from the EM: {p.stdout[:300]}")
+    if "error" in result:
+        raise ForescoutClientError(result["error"])
+    return result
+
+
+def delete_uploaded_bundle(path, timeout=30):
+    if not UPLOAD_PATH_RE.match(path or ""):
+        raise ForescoutClientError(f"'{path}' is not a recognized uploaded bundle path.")
+    return _run_verb(f"bundleuploadcleanup {path}", timeout=timeout)
+
+
 def last_checked(ip, timeout=20):
     if not valid_ip(ip):
         raise ForescoutClientError(f"'{ip}' is not a valid IPv4 address.")

@@ -227,6 +227,15 @@ Verbs (see the plan this was built from, forescout-lookup):
                             files modified in the given epoch window --
                             the Live Analyze tab's "download the raw logs
                             for the debug window just captured" button
+    bundleupload <filename> reads a bundle's raw bytes off stdin, writes
+                            it to a fixed uploads directory -- Upload &
+                            Review Bundle tab, for a bundle this app
+                            never built itself. filename must end
+                            .tgz/.tar.gz -- see UPLOAD_FILENAME_RE
+    bundleuploadcleanup <path>
+                            deletes one uploaded bundle -- same
+                            reasoning as techsupportcleanup, scoped to
+                            the uploads directory only
     getadmincidr            no args -- the source CIDR currently allowed
                             through this EM's firewall to the app's own
                             HTTPS port (from admin_cidr.state, written by
@@ -2051,6 +2060,57 @@ def do_techsupport_cleanup(path):
     print(json.dumps({"ok": True}))
 
 
+# ---------------------------------------------------------------------
+# Upload & Review Bundle tab -- David's ask: review a tech-support
+# bundle that wasn't built by this app at all (e.g. one a customer sent
+# in), not just one already sitting in this EM's own /shared/shared/case
+# tree. Uploaded bundles land in their own fixed directory, kept
+# entirely separate from the real centralized-bundle tree above -- same
+# reasoning as every other path whitelist here, a narrow fixed shape is
+# what keeps this from being an arbitrary-file-write primitive.
+# ---------------------------------------------------------------------
+UPLOAD_DIR = "/root/scripts/webapp-query/uploads"
+UPLOAD_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,120}\.(?:tgz|tar\.gz)$")
+UPLOAD_PATH_RE = re.compile(rf"^{re.escape(UPLOAD_DIR)}/{UPLOAD_FILENAME_RE.pattern[1:-1]}$")
+
+
+def _is_safe_analyze_bundle_path(path):
+    """analyzeadm accepts a bundle from either source -- a real centralized tech-support bundle, or one
+    uploaded through the Upload & Review Bundle tab -- unlike do_techsupport_download/_cleanup, which stay
+    scoped to the centralized tree only (an uploaded bundle was never built or reviewed there)."""
+    return bool(BUNDLE_PATH_RE.match(path or "")) or bool(UPLOAD_PATH_RE.match(path or ""))
+
+
+def do_bundle_upload(filename):
+    """
+    Reads a bundle's raw bytes off stdin (the caller already validated
+    filename against UPLOAD_FILENAME_RE before this is ever reached --
+    re-checked here regardless, same defense-in-depth pattern as every
+    other verb) and writes it to UPLOAD_DIR, creating that directory on
+    first use. No size cap here -- forescout_client.py's own upload_bundle
+    already bounds it client-side before spending the transfer.
+    """
+    if not UPLOAD_FILENAME_RE.match(filename or ""):
+        fail(f"'{filename}' is not a valid bundle filename.")
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    path = os.path.join(UPLOAD_DIR, filename)
+    data = sys.stdin.buffer.read()
+    with open(path, "wb") as f:
+        f.write(data)
+    print(json.dumps({"path": path, "size": len(data)}))
+
+
+def do_bundle_upload_cleanup(path):
+    """Deletes a single uploaded bundle -- same reasoning as do_techsupport_cleanup, scoped to UPLOAD_DIR
+    only via UPLOAD_PATH_RE, not the centralized bundle tree."""
+    if not UPLOAD_PATH_RE.match(path or ""):
+        print(json.dumps({"error": f"'{path}' is not a known uploaded bundle path."}))
+        return
+    if os.path.isfile(path):
+        os.remove(path)
+    print(json.dumps({"ok": True}))
+
+
 def _case_dir_name(case_ref):
     """Timestamped fallback when no case reference was given, so ad-hoc builds still land somewhere distinct
     rather than colliding in one shared "adhoc" folder."""
@@ -3232,7 +3292,7 @@ def do_analyzeadm(target, bundle_path, window, switch_filter, top_n, spike_n, st
     script_text = _read_hat_script()
 
     if bundle_path:
-        if not _is_safe_bundle_path(bundle_path):
+        if not _is_safe_analyze_bundle_path(bundle_path):
             fail(f"'{bundle_path}' is not a known tech-support bundle path.")
         if not os.path.isfile(bundle_path):
             fail(f"'{bundle_path}' does not exist on this EM.")
@@ -3508,7 +3568,7 @@ def main():
         return do_pluginlist(m.group(1))
 
     m = re.fullmatch(
-        rf"analyzeadm ({TARGET_RE}) (-|/shared/shared/case/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+) "
+        rf"analyzeadm ({TARGET_RE}) (-|/shared/shared/case/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+|{UPLOAD_PATH_RE.pattern[1:-1]}) "
         rf"({ANALYZE_WINDOW_RE}) (-|{IP_RE}(?:,{IP_RE})*) (\d{{1,3}}) (\d{{1,3}}) (\d{{1,4}})",
         original.strip(),
     )
@@ -3524,6 +3584,14 @@ def main():
     )
     if m:
         return do_pluginlogszip(m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+
+    m = re.fullmatch(rf"bundleupload ({UPLOAD_FILENAME_RE.pattern[1:-1]})", original.strip())
+    if m:
+        return do_bundle_upload(m.group(1))
+
+    m = re.fullmatch(rf"bundleuploadcleanup ({UPLOAD_PATH_RE.pattern[1:-1]})", original.strip())
+    if m:
+        return do_bundle_upload_cleanup(m.group(1))
 
     if original.strip() == "techsupportlogtail":
         return do_techsupport_log_tail()
@@ -3661,6 +3729,7 @@ def main():
         "pluginlist <target> | "
         "analyzeadm <target> <bundle|-> <window> <switch_filter|-> <top_n> <spike_n> <stale_days> | "
         "pluginlogszip <target> <plugin,...> <start>:<end> | "
+        "bundleupload <filename> | bundleuploadcleanup <path> | "
         "getadmincidr | setadmincidr <cidr>)",
         code=2,
     )

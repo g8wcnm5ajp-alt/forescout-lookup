@@ -34,6 +34,7 @@
             <button type="button" class="page-tab-btn" data-page-tab-target="appliances">Appliances{% if active_appliance_runs %} <span class="page-tab-badge">{{ active_appliance_runs|length }}</span>{% endif %}</button>
             <button type="button" class="page-tab-btn{% if active_page_tab == "techsupport" %} active{% endif %}" data-page-tab-target="techsupport">Tech Support Bundle Generator</button>
             <button type="button" class="page-tab-btn" data-page-tab-target="analyze">Live Analyze{% if active_analyze_runs %} <span class="page-tab-badge">{{ active_analyze_runs|length }}</span>{% endif %}</button>
+            <button type="button" class="page-tab-btn" data-page-tab-target="upload">Upload &amp; Review Bundle</button>
             <button type="button" class="page-tab-btn" data-page-tab-target="templates">Templates</button>
             <button type="button" class="page-tab-btn" data-page-tab-target="help">Help</button>
         </div>
@@ -473,6 +474,24 @@
             </details>
             <p class="hint" id="analyze-run-status"></p>
             <pre id="analyze-output" class="analyze-output" style="display:none;"></pre>
+        </div>
+        </section>
+
+        <section class="page-tab-panel page-tab-panel-hidden" data-page-tab-panel="upload">
+        <div class="card no-print">
+            <h3>Upload &amp; Review Bundle</h3>
+            <p class="hint">Review a tech-support bundle this app never built itself -- a customer's own
+                <code>.tgz</code>/<code>.tar.gz</code>, sent in some other way. Uploaded straight to this EM,
+                then run through the same admission-analysis as the Tech Support tab's own Analyze button.</p>
+            <div class="tree-filter-row">
+                <input type="file" id="upload-bundle-file" accept=".tgz,.tar.gz">
+                <button type="button" id="upload-bundle-btn">Upload &amp; Analyze</button>
+            </div>
+            <p class="hint" id="upload-bundle-status"></p>
+            <pre id="upload-bundle-output" class="analyze-output" style="display:none;"></pre>
+            <div id="upload-bundle-cleanup-wrap" style="display:none;">
+                <button type="button" id="upload-bundle-cleanup-btn" class="btn-small btn-secondary">Clean up (delete off the EM)</button>
+            </div>
         </div>
         </section>
 
@@ -2159,6 +2178,91 @@
                         runBtn.textContent = "Run analyze";
                         runStatus.textContent = "Failed to start: " + err;
                     });
+            });
+        })();
+    </script>
+
+    <script>
+        // Upload & Review Bundle tab -- uploads straight to the EM, then
+        // runs the same background analyze-run + poll as the Tech Support
+        // tab's own Analyze button (see /bundle/upload, /api/analyze_run).
+        (function () {
+            const fileInput = document.getElementById("upload-bundle-file");
+            const uploadBtn = document.getElementById("upload-bundle-btn");
+            const statusEl = document.getElementById("upload-bundle-status");
+            const outputEl = document.getElementById("upload-bundle-output");
+            const cleanupWrap = document.getElementById("upload-bundle-cleanup-wrap");
+            const cleanupBtn = document.getElementById("upload-bundle-cleanup-btn");
+            if (!fileInput) return; // panel not on this page
+
+            let uploadedPath = null;
+
+            function pollUploadAnalyze(runId) {
+                fetch("/api/analyze_run/" + runId)
+                    .then(r => r.json())
+                    .then(d => {
+                        if (d.error) { statusEl.textContent = "error: " + d.error; return; }
+                        if (d.status === "running") { setTimeout(() => pollUploadAnalyze(runId), 3000); return; }
+                        uploadBtn.disabled = false;
+                        uploadBtn.textContent = "Upload & Analyze";
+                        if (d.status === "failed") {
+                            statusEl.textContent = "Analysis failed: " + (d.error || "unknown error");
+                            return;
+                        }
+                        statusEl.textContent = "Done.";
+                        outputEl.style.display = "block";
+                        outputEl.textContent = (d.result && d.result.output) || "(no output)";
+                        cleanupWrap.style.display = "block";
+                    })
+                    .catch(() => { setTimeout(() => pollUploadAnalyze(runId), 3000); });
+            }
+
+            uploadBtn.addEventListener("click", () => {
+                const file = fileInput.files[0];
+                if (!file) { window.alert("Choose a bundle file first."); return; }
+                const formData = new FormData();
+                formData.set("csrf_token", CSRF_TOKEN);
+                formData.set("bundle", file);
+                uploadBtn.disabled = true;
+                uploadBtn.textContent = "Uploading…";
+                statusEl.textContent = "Uploading " + file.name + " (" + Math.round(file.size / 1048576) + "MB) to the EM…";
+                outputEl.style.display = "none";
+                cleanupWrap.style.display = "none";
+                uploadedPath = null;
+                fetch("/bundle/upload", { method: "POST", body: formData })
+                    .then(r => r.json())
+                    .then(d => {
+                        if (d.error) {
+                            uploadBtn.disabled = false;
+                            uploadBtn.textContent = "Upload & Analyze";
+                            statusEl.textContent = "Failed: " + d.error;
+                            return;
+                        }
+                        uploadedPath = d.path;
+                        uploadBtn.textContent = "Analyzing…";
+                        statusEl.textContent = "Uploaded -- running analyze…";
+                        pollUploadAnalyze(d.run_id);
+                    })
+                    .catch(err => {
+                        uploadBtn.disabled = false;
+                        uploadBtn.textContent = "Upload & Analyze";
+                        statusEl.textContent = "Failed: " + err;
+                    });
+            });
+
+            cleanupBtn.addEventListener("click", () => {
+                if (!uploadedPath) return;
+                if (!window.confirm("Delete this uploaded bundle off the EM? This cannot be undone.")) return;
+                cleanupBtn.disabled = true;
+                cleanupBtn.textContent = "Cleaning up…";
+                fetch("/bundle/upload/cleanup", { method: "POST", body: new URLSearchParams({ path: uploadedPath, csrf_token: CSRF_TOKEN }) })
+                    .then(r => r.json())
+                    .then(d => {
+                        if (d.error) { window.alert("Failed to clean up: " + d.error); cleanupBtn.disabled = false; cleanupBtn.textContent = "Clean up (delete off the EM)"; return; }
+                        cleanupWrap.innerHTML = "<span class=\"muted\">deleted</span>";
+                        uploadedPath = null;
+                    })
+                    .catch(err => { window.alert("Failed to clean up: " + err); cleanupBtn.disabled = false; cleanupBtn.textContent = "Clean up (delete off the EM)"; });
             });
         })();
     </script>
