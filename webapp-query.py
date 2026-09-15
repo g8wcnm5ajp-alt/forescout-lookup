@@ -2077,12 +2077,27 @@ UPLOAD_DIR = "/tmp/hat-uploads"
 UPLOAD_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,120}\.(?:tgz|tar\.gz)$")
 UPLOAD_PATH_RE = re.compile(rf"^{re.escape(UPLOAD_DIR)}/{UPLOAD_FILENAME_RE.pattern[1:-1]}$")
 
+# A third accepted source: real customer bundles staged by hand directly
+# on this EM (David's own established workflow -- scp'd or copied in for
+# offline/deep-dive analysis, not built or uploaded through this app at
+# all). Named for this site's own convention, not hardcoded to any one
+# customer's data inside it -- a fixed directory is what keeps this from
+# being a general arbitrary-file-read primitive off the back of a
+# crafted "path" form value, same reasoning as every whitelist here.
+MANUAL_STAGING_DIR = "/root/scripts/LSEG"
+MANUAL_STAGING_PATH_RE = re.compile(rf"^{re.escape(MANUAL_STAGING_DIR)}/{UPLOAD_FILENAME_RE.pattern[1:-1]}$")
+
 
 def _is_safe_analyze_bundle_path(path):
-    """analyzeadm accepts a bundle from either source -- a real centralized tech-support bundle, or one
-    uploaded through the Upload & Review Bundle tab -- unlike do_techsupport_download/_cleanup, which stay
-    scoped to the centralized tree only (an uploaded bundle was never built or reviewed there)."""
-    return bool(BUNDLE_PATH_RE.match(path or "")) or bool(UPLOAD_PATH_RE.match(path or ""))
+    """analyzeadm accepts a bundle from any of three sources -- a real centralized tech-support bundle, one
+    uploaded through the Upload & Review Bundle tab, or one staged by hand in MANUAL_STAGING_DIR -- unlike
+    do_techsupport_download/_cleanup, which stay scoped to the centralized tree only (a bundle from either
+    of the other two sources was never built or reviewed there)."""
+    return (
+        bool(BUNDLE_PATH_RE.match(path or ""))
+        or bool(UPLOAD_PATH_RE.match(path or ""))
+        or bool(MANUAL_STAGING_PATH_RE.match(path or ""))
+    )
 
 
 def do_bundle_upload(filename):
@@ -3572,7 +3587,8 @@ def main():
         return do_pluginlist(m.group(1))
 
     m = re.fullmatch(
-        rf"analyzeadm ({TARGET_RE}) (-|/shared/shared/case/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+|{UPLOAD_PATH_RE.pattern[1:-1]}) "
+        rf"analyzeadm ({TARGET_RE}) (-|/shared/shared/case/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+|"
+        rf"{UPLOAD_PATH_RE.pattern[1:-1]}|{MANUAL_STAGING_PATH_RE.pattern[1:-1]}) "
         rf"({ANALYZE_WINDOW_RE}) (-|{IP_RE}(?:,{IP_RE})*) (\d{{1,3}}) (\d{{1,3}}) (\d{{1,4}})",
         original.strip(),
     )

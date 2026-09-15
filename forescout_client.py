@@ -625,7 +625,11 @@ def analyze_admission(
     """
     if not valid_target(target):
         raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
-    if bundle_path is not None and not (BUNDLE_PATH_RE.match(bundle_path) or UPLOAD_PATH_RE.match(bundle_path)):
+    if bundle_path is not None and not (
+        BUNDLE_PATH_RE.match(bundle_path)
+        or UPLOAD_PATH_RE.match(bundle_path)
+        or MANUAL_STAGING_PATH_RE.match(bundle_path)
+    ):
         raise ForescoutClientError(f"'{bundle_path}' is not a recognized tech-support bundle path.")
     if not ANALYZE_WINDOW_RE.match(window or ""):
         raise ForescoutClientError(f"'{window}' is not a valid window (expected e.g. 30m, 2h, 1d).")
@@ -689,6 +693,13 @@ def download_plugin_logs_zip(target, plugins, start_epoch, end_epoch, timeout=30
 # centralized-bundle tree BUNDLE_PATH_RE addresses.
 UPLOAD_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,120}\.(?:tgz|tar\.gz)$")
 UPLOAD_PATH_RE = re.compile(r"^/tmp/hat-uploads/[A-Za-z0-9_.\-]{1,120}\.(?:tgz|tar\.gz)$")
+
+# A third accepted analyze_admission bundle source: real customer
+# bundles staged by hand directly on the EM (this site's own established
+# workflow), same reasoning/whitelisting approach as UPLOAD_PATH_RE --
+# see webapp-query.py's own MANUAL_STAGING_DIR/_PATH_RE, which this
+# mirrors on the client side.
+MANUAL_STAGING_PATH_RE = re.compile(r"^/root/scripts/LSEG/[A-Za-z0-9_.\-]{1,120}\.(?:tgz|tar\.gz)$")
 
 # Sanity cap, not confirmed with David as the right number -- same
 # reasoning as MAX_LOOKUP_IPS in app.py. Real bundles seen so far (up to
