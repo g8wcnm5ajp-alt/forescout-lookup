@@ -115,7 +115,7 @@
 #
 set -euo pipefail
 
-VERSION="1.3.1"
+VERSION="1.3.2"
 
 # Overridden below when -b points analyze at a bundle instead of this
 # live appliance -- everything else in the script reads through these
@@ -404,6 +404,17 @@ if [ -n "$BUNDLE" ]; then
     if [ -z "$TODAY_LOG" ]; then
         # Fall back to the natively-shipped copy under files/usr/local/forescout/stats/,
         # if this bundle happens to have one (not guaranteed -- see header comment).
+        TODAY_LOG=$(find "$BUNDLE_ROOT" -path "*/usr/local/forescout/stats/today.log" -print -quit 2>/dev/null || true)
+    fi
+    if [ -z "$TODAY_LOG" ] && [ -n "$BUNDLE_ROOT" ] && [ "$BUNDLE_ROOT" != "$BUNDLE" ]; then
+        # today.log is routinely the single largest file in a real bundle
+        # (500+MB seen live) -- confirmed live that a full `tar -xzf` can
+        # silently come back exit-0 with this one file missing under real
+        # memory pressure on the box doing the extracting, while every
+        # smaller file extracts fine. A single targeted re-extraction of
+        # just this one path is cheap to retry and has resolved it every
+        # time this was hit live.
+        tar -xzf "$BUNDLE" -C "$BUNDLE_ROOT" --wildcards '*/usr/local/forescout/stats/today.log' 2>/dev/null || true
         TODAY_LOG=$(find "$BUNDLE_ROOT" -path "*/usr/local/forescout/stats/today.log" -print -quit 2>/dev/null || true)
     fi
     if [ -z "$MAC_TRACK_LOG" ]; then
