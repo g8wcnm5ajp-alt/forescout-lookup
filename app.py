@@ -22,12 +22,13 @@ from flask import Flask, Response, jsonify, redirect, render_template, request, 
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from forescout_client import (
-    CASE_REF_RE, COMPANY_NAME_RE, LEVEL_RE, ForescoutClientError, arp_list, build_techsupport_em,
-    build_techsupport_window_appliance, clear_lookup_debug_log, clear_techsupport_log, collect_techsupport,
-    debug_set_appliance, delete_techsupport_bundle, download_techsupport_bundle, get_admin_cidr, last_checked,
-    list_appliances, lookup, matched_rules, policy_history, policy_tree, preview_techsupport,
-    preview_techsupport_em, raw_fields, run_show_errors, set_admin_cidr, tail_lookup_debug_log,
-    tail_techsupport_log, trace_defaults, trace_list, trace_set, valid_cidr,
+    CASE_REF_RE, COMPANY_NAME_RE, LEVEL_RE, ForescoutClientError, analyze_admission, arp_list,
+    build_techsupport_em, build_techsupport_window_appliance, clear_lookup_debug_log, clear_techsupport_log,
+    collect_techsupport, debug_set_appliance, delete_techsupport_bundle, download_plugin_logs_zip,
+    download_techsupport_bundle, get_admin_cidr, last_checked, list_appliances, list_plugins, lookup,
+    matched_rules, policy_history, policy_tree, preview_techsupport, preview_techsupport_em, raw_fields,
+    run_show_errors, set_admin_cidr, tail_lookup_debug_log, tail_techsupport_log, trace_defaults, trace_list,
+    trace_set, valid_cidr, valid_ip, valid_target,
 )
 
 app = Flask(__name__)
@@ -769,6 +770,93 @@ def get_active_appliance_runs():
 
 
 # ---------------------------------------------------------------------
+# Live Analyze tab (High Admission Root-Cause Tracing) -- runs
+# high-admission-trace.sh's `analyze` mode, either live against a target
+# or against a tech-support bundle already built in the Tech Support tab
+# (bundle_path set). Same background-thread + JSON-file tracking pattern
+# as the appliance "Run Show Errors" runs above -- a real bundle analysis
+# measured ~110s against an 867MB real bundle, too long to block a
+# request on. "key" is the bundle path when analyzing a bundle, else the
+# target -- used for both display and the duplicate-run guard.
+# ---------------------------------------------------------------------
+ANALYZE_RUNS_PATH = os.path.join(DATA_DIR, "analyze_runs.json")
+_analyze_runs_lock = threading.Lock()
+
+
+def _load_analyze_runs():
+    if not os.path.isfile(ANALYZE_RUNS_PATH):
+        return []
+    try:
+        with open(ANALYZE_RUNS_PATH) as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def _save_analyze_runs(runs):
+    tmp = ANALYZE_RUNS_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(runs, f)
+    os.replace(tmp, ANALYZE_RUNS_PATH)
+
+
+def _update_analyze_run(run_id, **fields):
+    with _analyze_runs_lock:
+        runs = _load_analyze_runs()
+        for r in runs:
+            if r["id"] == run_id:
+                r.update(fields)
+                break
+        _save_analyze_runs(runs)
+
+
+def start_analyze_run(target, bundle_path, window, switch_filter, top_n, spike_n, stale_days):
+    key = bundle_path or target
+    run_id = f"{int(time.time() * 1000)}-{os.urandom(3).hex()}"
+    with _analyze_runs_lock:
+        runs = _load_analyze_runs()
+        if any(r["key"] == key and r["status"] == "running" for r in runs):
+            return None
+        runs.append({
+            "id": run_id, "key": key, "target": target, "bundle": bundle_path, "status": "running",
+            "started_at": int(time.time()), "finished_at": None, "result": None, "error": None,
+        })
+        _save_analyze_runs(runs)
+
+    def _worker():
+        try:
+            result = analyze_admission(
+                target, bundle_path=bundle_path, window=window, switch_filter=switch_filter,
+                top_n=top_n, spike_n=spike_n, stale_days=stale_days,
+            )
+            _update_analyze_run(run_id, status="complete", finished_at=int(time.time()), result=result)
+        except ForescoutClientError as e:
+            _update_analyze_run(run_id, status="failed", finished_at=int(time.time()), error=str(e))
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return run_id
+
+
+def get_analyze_run(run_id):
+    with _analyze_runs_lock:
+        runs = _load_analyze_runs()
+    for r in runs:
+        if r["id"] == run_id:
+            return r
+    return None
+
+
+def get_active_analyze_runs():
+    with _analyze_runs_lock:
+        runs = _load_analyze_runs()
+    active = [r for r in runs if r["status"] == "running"]
+    for r in active:
+        r["started_display"] = _fmt_utc(r["started_at"])
+    active.sort(key=lambda r: r["started_at"])
+    return active
+
+
+# ---------------------------------------------------------------------
 # Tech-support bundle building -- same background-thread + JSON-file
 # tracking pattern as the appliance runs above (a build is a real
 # `fstool tech-support --pack`, several minutes per plugin, so this never
@@ -1092,6 +1180,7 @@ def render(**kwargs):
     kwargs["pending_trace_reverts"] = get_pending_trace_reverts()
     kwargs["active_appliance_runs"] = get_active_appliance_runs()
     kwargs["active_techsupport_runs"] = get_active_techsupport_runs()
+    kwargs["active_analyze_runs"] = get_active_analyze_runs()
     kwargs["case_history"] = get_case_history()
     kwargs["recent_activity"] = get_recent_activity()
     kwargs["app_version"] = APP_VERSION
@@ -1296,6 +1385,19 @@ def do_appliances_kill():
     return redirect(url_for("index"))
 
 
+@app.route("/analyze/kill", methods=["POST"])
+def do_analyze_kill():
+    """Plain-form-POST + redirect version of /api/analyze_run/<id>/kill, for the static "Analysis in
+    progress" table's Kill button -- same reasoning as /appliances/kill."""
+    if not _check_csrf():
+        return redirect(url_for("index"))
+    run_id = request.form.get("run_id", "").strip()
+    run = get_analyze_run(run_id)
+    if run is not None and run["status"] == "running":
+        _update_analyze_run(run_id, status="failed", finished_at=int(time.time()), error="Manually killed (was stuck).")
+    return redirect(url_for("index"))
+
+
 @app.route("/api/policytree", methods=["GET"])
 def api_policy_tree():
     """
@@ -1452,6 +1554,46 @@ def api_arp_list(ip):
         return jsonify({"error": str(e)}), 502
 
 
+@app.route("/hostlog/download/<ip>", methods=["GET"])
+def hostlog_download_route(ip):
+    """
+    Collect Host Log -- David's ask: specify a host IP, get back a zip of
+    this app's own already-live data about it (raw fields, matched
+    rules, policy history, ARP/MAC-IP decode), no debug elevation or
+    fstool bundle involved, distinct from the Tech Support Bundle
+    Generator. Same inline BytesIO-zip-then-send_file pattern as the
+    Apache cert export above -- fast enough (a handful of SSH round
+    trips through the EM) to build and stream in one request, no
+    background run needed.
+    """
+    if not valid_ip(ip):
+        return "Not a valid IPv4 address.", 400
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("info.txt", f"Host log collected for {ip}\nGenerated: {datetime.now(timezone.utc).isoformat()}\n")
+        for name, fn, args in (
+            ("lookup.json", lookup, (ip,)),
+            ("raw_fields.json", raw_fields, (ip,)),
+            ("matched_rules.json", matched_rules, (ip, "24h")),
+            ("policy_history.json", policy_history, (ip, "24h")),
+            ("arp_list.json", arp_list, (ip,)),
+        ):
+            # Best-effort per section -- one EM-side hiccup (or a plugin
+            # this host has nothing relevant in) shouldn't block getting
+            # the rest of the zip back, same reasoning as the Support Log
+            # bundle's own per-section try/except above.
+            try:
+                zf.writestr(name, json.dumps(fn(*args), indent=2))
+            except ForescoutClientError as e:
+                zf.writestr(name, json.dumps({"error": str(e)}))
+    buf.seek(0)
+    _log_activity("host_log_collected", username=session.get("username"), ip=ip)
+    return send_file(
+        buf, mimetype="application/zip", as_attachment=True,
+        download_name=f"host-log-{ip.replace('.', '-')}.zip",
+    )
+
+
 @app.route("/api/appliances", methods=["GET"])
 def api_appliances():
     """Every known appliance + live online/offline status -- fetched once by the Appliances panel's JS on load."""
@@ -1532,6 +1674,160 @@ def api_appliance_run_kill(run_id):
         return jsonify({"error": "run is not currently running"}), 400
     _update_run(run_id, status="failed", finished_at=int(time.time()), error="Manually killed (was stuck).")
     return jsonify({"ok": True})
+
+
+@app.route("/api/plugins/<target>", methods=["GET"])
+def api_plugins(target):
+    """Installed plugins on target alone -- drives the Live Analyze tab's plugin checklist/debug
+    controls when a target is picked, independent of any host lookup."""
+    try:
+        return jsonify(list_plugins(target))
+    except ForescoutClientError as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/analyze/debug", methods=["POST"])
+def do_analyze_debug():
+    """
+    Start/Stop Debug for the Live Analyze tab's own compact controls --
+    a target-only debug toggle (not driven by a host lookup's own
+    per-target/plugin rows, the existing Debug panel's own shape). "Stop"
+    reuses debug_set_appliance's existing immediate-disable convention:
+    the same checked plugins at level=0/minutes=1. Returns the epoch this
+    actually fired at, so the tab's own JS can record the debug window's
+    real start/end for the plugin-logs zip download link.
+    """
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    target = request.form.get("target", "").strip()
+    plugins = [p for p in request.form.get("plugins", "").split(",") if p]
+    action = request.form.get("action", "")
+    if action not in ("start", "stop"):
+        return jsonify({"error": "Invalid action."}), 400
+    if not target or not plugins:
+        return jsonify({"error": "Select a target and at least one plugin."}), 400
+    if action == "start":
+        try:
+            level = int(request.form.get("level", ""))
+            minutes = int(request.form.get("minutes", ""))
+        except ValueError:
+            return jsonify({"error": "Invalid level or duration."}), 400
+        spec = ",".join(f"{p}:{level}:{minutes}" for p in plugins)
+    else:
+        spec = ",".join(f"{p}:0:1" for p in plugins)
+    try:
+        debug_set_appliance(target, spec, case_ref="live-analyze")
+    except ForescoutClientError as e:
+        return jsonify({"error": str(e)}), 502
+    _log_activity(
+        "analyze_debug", username=session.get("username"), target=target, plugins=plugins, action=action,
+    )
+    return jsonify({"ok": True, "epoch": int(time.time())})
+
+
+def _int_form(name, default, lo, hi):
+    raw = request.form.get(name, "").strip()
+    if not raw:
+        return default
+    if not raw.isdigit() or not (lo <= int(raw) <= hi):
+        raise ValueError(name)
+    return int(raw)
+
+
+@app.route("/analyze/run", methods=["POST"])
+def do_analyze_run():
+    """
+    Starts a background high-admission-trace.sh `analyze` run, live
+    against a target or (bundle_path given) against a tech-support bundle
+    already built in the Tech Support tab -- the panel's JS polls
+    /api/analyze_run/<id>. Never blocks the request that starts it: a
+    real bundle analysis can take well past a minute.
+    """
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    target = request.form.get("target", "").strip()
+    bundle_path = request.form.get("bundle_path", "").strip() or None
+    window = request.form.get("window", "1h").strip() or "1h"
+    switch_filter = request.form.get("switch_filter", "").strip() or None
+    try:
+        top_n = _int_form("top_n", 10, 1, 200)
+        spike_n = _int_form("spike_n", 5, 0, 50)
+        stale_days = _int_form("stale_days", 7, 0, 365)
+    except ValueError as e:
+        return jsonify({"error": f"Invalid value for {e}."}), 400
+    if not target:
+        return jsonify({"error": "Select a target to analyze."}), 400
+    _log_activity(
+        "analyze_run", username=session.get("username"), target=target, bundle=bundle_path, window=window,
+    )
+    run_id = start_analyze_run(target, bundle_path, window, switch_filter, top_n, spike_n, stale_days)
+    if run_id is None:
+        return jsonify({"error": "An analysis is already running for this target/bundle."}), 409
+    return jsonify({"run_id": run_id})
+
+
+@app.route("/api/analyze_run/<run_id>", methods=["GET"])
+def api_analyze_run(run_id):
+    run = get_analyze_run(run_id)
+    if run is None:
+        return jsonify({"error": "unknown run id"}), 404
+    return jsonify(run)
+
+
+@app.route("/api/analyze_run/<run_id>/kill", methods=["POST"])
+def api_analyze_run_kill(run_id):
+    """Same reasoning as /api/appliance_run/<id>/kill -- clears a stuck "running" state rather than
+    reaching into a live background thread."""
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    run = get_analyze_run(run_id)
+    if run is None:
+        return jsonify({"error": "unknown run id"}), 404
+    if run["status"] != "running":
+        return jsonify({"error": "run is not currently running"}), 400
+    _update_analyze_run(run_id, status="failed", finished_at=int(time.time()), error="Manually killed (was stuck).")
+    return jsonify({"ok": True})
+
+
+@app.route("/pluginlogs/download", methods=["GET"])
+def pluginlogs_download_route():
+    """
+    Streams a .zip of the checked plugin(s)' raw log files for the
+    debug window just captured on the Live Analyze tab (target/plugins/
+    start/end all come from the JS's own record of what it just told
+    /debug/set to run, not free text -- re-validated against the EM's
+    real installed-plugin set regardless, same defense-in-depth pattern
+    as every other verb here).
+    """
+    target = request.args.get("target", "")
+    plugins = [p for p in request.args.get("plugins", "").split(",") if p]
+    try:
+        start_epoch = int(request.args.get("start", ""))
+        end_epoch = int(request.args.get("end", ""))
+    except ValueError:
+        return "Invalid time window.", 400
+    try:
+        proc = download_plugin_logs_zip(target, plugins, start_epoch, end_epoch)
+    except ForescoutClientError as e:
+        return str(e), 400
+
+    def generate():
+        try:
+            while True:
+                chunk = proc.stdout.read(262144)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            proc.stdout.close()
+            proc.wait()
+
+    filename = f"{target}-plugin-logs-{start_epoch}-{end_epoch}.zip".replace("/", "_")
+    return Response(
+        generate(),
+        mimetype="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 CASE_REF_ERROR = "Case reference may only contain letters, numbers, '-' and '_' (max 40 chars)."
@@ -2037,6 +2333,32 @@ def techsupport_cleanup_route():
         return jsonify({"error": str(e)}), 400
     _log_activity("techsupport_bundle_cleanup", username=session.get("username"), path=path)
     return jsonify({"ok": True})
+
+
+@app.route("/techsupport/analyze", methods=["POST"])
+def techsupport_analyze_route():
+    """
+    Analyze button next to a built bundle's Download/Clean up row --
+    David's ask: tech-support log analysis after the logs have been
+    created, right there in the Tech Support tab. Starts the same
+    background analyze run as the Live Analyze tab (start_analyze_run),
+    scoped to this one bundle (-b) instead of a live target; the row's
+    own JS polls /api/analyze_run/<id> the same way.
+    """
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    path = request.form.get("path", "")
+    if not path:
+        return jsonify({"error": "No bundle path given."}), 400
+    _log_activity("techsupport_bundle_analyze", username=session.get("username"), path=path)
+    # target is informational only once bundle_path is set (see
+    # analyze_admission/do_analyzeadm) -- "EM" names where the bundle
+    # lives, not where the analysis actually runs from a caller's
+    # perspective, which is always this same EM.
+    run_id = start_analyze_run("EM", path, "1h", None, 10, 5, 7)
+    if run_id is None:
+        return jsonify({"error": "An analysis is already running for this bundle."}), 409
+    return jsonify({"run_id": run_id})
 
 
 # ---------------------------------------------------------------------

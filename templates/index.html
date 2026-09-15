@@ -33,6 +33,7 @@
             <button type="button" class="page-tab-btn{% if active_page_tab == "lookup" %} active{% endif %}" data-page-tab-target="lookup">IP Lookup</button>
             <button type="button" class="page-tab-btn" data-page-tab-target="appliances">Appliances{% if active_appliance_runs %} <span class="page-tab-badge">{{ active_appliance_runs|length }}</span>{% endif %}</button>
             <button type="button" class="page-tab-btn{% if active_page_tab == "techsupport" %} active{% endif %}" data-page-tab-target="techsupport">Tech Support Bundle Generator</button>
+            <button type="button" class="page-tab-btn" data-page-tab-target="analyze">Live Analyze{% if active_analyze_runs %} <span class="page-tab-badge">{{ active_analyze_runs|length }}</span>{% endif %}</button>
             <button type="button" class="page-tab-btn" data-page-tab-target="templates">Templates</button>
             <button type="button" class="page-tab-btn" data-page-tab-target="help">Help</button>
         </div>
@@ -162,6 +163,7 @@
                         <button type="submit" class="btn-small">&#8635; Refresh</button>
                     </form>
                     <button type="button" class="btn-small btn-gold ip-report-export-btn" onclick="window.print()">Export to PDF</button>
+                    <a class="btn-small" href="/hostlog/download/{{ result.ip }}">Download host log (.zip)</a>
                     </span>
                 </h2>
                 <p class="hint no-print">Printed report includes this IP's identity, location, and policy data below -- other open IP tabs and the search controls above are left out.</p>
@@ -382,6 +384,98 @@
         </div>
         </section>
 
+        <section class="page-tab-panel page-tab-panel-hidden" data-page-tab-panel="analyze">
+        {% if active_analyze_runs %}
+        <div class="card no-print">
+            <h3>Analysis in progress <span class="muted">(started by any session, not yet finished)</span></h3>
+            <table>
+                <tr><th>Target / bundle</th><th>Started</th><th></th></tr>
+                {% for run in active_analyze_runs %}
+                <tr>
+                    <td>{{ run.bundle or run.target }}</td><td>{{ run.started_display }}</td>
+                    <td>
+                        <form method="post" action="/analyze/kill" class="inline-form">
+                            <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                            <input type="hidden" name="run_id" value="{{ run.id }}">
+                            <button type="submit" class="btn-small btn-secondary">Kill</button>
+                        </form>
+                    </td>
+                </tr>
+                {% endfor %}
+            </table>
+        </div>
+        {% endif %}
+
+        <div class="card no-print">
+            <h3>Live Analyze <span class="muted">(High Admission Root-Cause Tracing)</span></h3>
+            <p class="hint">Pinpoints what's driving a high-admission appliance back to a switch/port/MAC (or
+                wireless), live against a target below -- see the Tech Support tab for analyzing an
+                already-built bundle instead.</p>
+
+            <div class="analyze-columns">
+                <div class="analyze-col">
+                    <h4>1. Target</h4>
+                    <p class="hint" id="analyze-target-status">Loading appliances…</p>
+                    <select id="analyze-target-select" style="width:100%;"></select>
+                </div>
+                <div class="analyze-col">
+                    <h4>2. Discovered plugins</h4>
+                    <p class="hint" id="analyze-plugins-status">Pick a target first.</p>
+                    <div id="analyze-plugins-list" class="tree-filter-row"></div>
+                </div>
+                <div class="analyze-col">
+                    <h4>3. Debug</h4>
+                    <div class="tree-filter-row">
+                        <label class="tree-filter-toggle">Level
+                            <input type="number" id="analyze-debug-level" value="1" min="0" max="12" step="1" style="width:4em">
+                        </label>
+                        <label class="tree-filter-toggle">Minutes
+                            <input type="number" id="analyze-debug-minutes" value="15" min="1" max="1440" step="1" style="width:5em">
+                        </label>
+                    </div>
+                    <div class="tree-filter-row">
+                        <button type="button" id="analyze-debug-start-btn" class="btn-small">Start debug</button>
+                        <button type="button" id="analyze-debug-stop-btn" class="btn-small btn-secondary">Stop debug now</button>
+                    </div>
+                    <p class="hint" id="analyze-debug-status">No debug window captured yet.</p>
+                </div>
+                <div class="analyze-col">
+                    <h4>4. Plugin logs</h4>
+                    <p class="hint">Raw log files for the checked plugin(s), covering the debug window above.</p>
+                    <a id="analyze-pluginlogs-download" href="#" class="btn-small btn-gold analyze-disabled-link" download>Download plugin logs (.zip)</a>
+                </div>
+            </div>
+
+            <hr class="analyze-hr">
+
+            <div class="tree-filter-row">
+                <label class="tree-filter-toggle">Window
+                    <input type="text" id="analyze-window" value="1h" style="width:5em">
+                </label>
+                <label class="tree-filter-toggle">Switch filter <span class="muted">(optional, comma-separated IPs)</span>
+                    <input type="text" id="analyze-switch-filter" style="width:16em">
+                </label>
+                <button type="button" id="analyze-run-btn">Run analyze</button>
+            </div>
+            <details style="margin-top:0.5rem;">
+                <summary class="hint" style="cursor:pointer;">Advanced (top-N / spike-N / stale-days)</summary>
+                <div class="tree-filter-row" style="margin-top:0.5rem;">
+                    <label class="tree-filter-toggle">Top-N switch/port/MAC rows
+                        <input type="number" id="analyze-top-n" value="10" min="1" max="200" step="1" style="width:5em">
+                    </label>
+                    <label class="tree-filter-toggle">Spike windows to inspect
+                        <input type="number" id="analyze-spike-n" value="5" min="0" max="50" step="1" style="width:5em">
+                    </label>
+                    <label class="tree-filter-toggle">Stale MAC→IP threshold (days)
+                        <input type="number" id="analyze-stale-days" value="7" min="0" max="365" step="1" style="width:5em">
+                    </label>
+                </div>
+            </details>
+            <p class="hint" id="analyze-run-status"></p>
+            <pre id="analyze-output" class="analyze-output" style="display:none;"></pre>
+        </div>
+        </section>
+
         <section class="page-tab-panel{% if active_page_tab != "techsupport" %} page-tab-panel-hidden{% endif %}" data-page-tab-panel="techsupport">
         <div style="display:flex; justify-content:flex-end; margin-bottom:0.75rem; gap:1.25rem; align-items:center;">
             <label class="tree-filter-toggle">Enhance Trace
@@ -583,8 +677,11 @@
                         <td>
                             {% if b.chunks %}
                                 {% for c in b.chunks %}{{ download_row(c, "part " ~ loop.index) }}{% endfor %}
+                                <p class="hint">Split into parts -- Analyze needs one whole bundle, not chunked.</p>
                             {% elif b.path %}
                                 {{ download_row(b.path, "bundle") }}
+                                <button type="button" class="btn-small ts-analyze-btn" data-path="{{ b.path }}" data-result-id="ts-analyze-{{ loop.index }}">Analyze</button>
+                                <div id="ts-analyze-{{ loop.index }}" class="analyze-output" style="display:none;"></div>
                             {% else %}—{% endif %}
                             {% if b.commands_log %}{{ download_row(b.commands_log, "commands log") }}{% endif %}
                         </td></tr>
@@ -1875,6 +1972,198 @@
     </script>
 
     <script>
+        // Live Analyze tab -- see webapp-query.py's pluginlist/analyzeadm/
+        // pluginlogszip verbs for what each control below actually runs.
+        (function () {
+            const targetSelect = document.getElementById("analyze-target-select");
+            const targetStatus = document.getElementById("analyze-target-status");
+            const pluginsList = document.getElementById("analyze-plugins-list");
+            const pluginsStatus = document.getElementById("analyze-plugins-status");
+            const debugStartBtn = document.getElementById("analyze-debug-start-btn");
+            const debugStopBtn = document.getElementById("analyze-debug-stop-btn");
+            const debugLevel = document.getElementById("analyze-debug-level");
+            const debugMinutes = document.getElementById("analyze-debug-minutes");
+            const debugStatus = document.getElementById("analyze-debug-status");
+            const pluginLogsLink = document.getElementById("analyze-pluginlogs-download");
+            const windowInput = document.getElementById("analyze-window");
+            const switchFilterInput = document.getElementById("analyze-switch-filter");
+            const topNInput = document.getElementById("analyze-top-n");
+            const spikeNInput = document.getElementById("analyze-spike-n");
+            const staleDaysInput = document.getElementById("analyze-stale-days");
+            const runBtn = document.getElementById("analyze-run-btn");
+            const runStatus = document.getElementById("analyze-run-status");
+            const outputEl = document.getElementById("analyze-output");
+            if (!targetSelect) return; // panel not on this page
+
+            function escapeHtml(s) {
+                return (s || "").toString().replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+            }
+
+            // The debug window this tab itself just captured -- the
+            // plugin-logs download link stays disabled until Start then
+            // Stop have both run, so the zip's own [start, end) always
+            // matches a real capture rather than an arbitrary guess.
+            let debugWindow = null;
+
+            function loadPlugins() {
+                const target = targetSelect.value;
+                pluginsList.innerHTML = "";
+                if (!target) return;
+                pluginsStatus.textContent = "Loading plugins…";
+                fetch("/api/plugins/" + encodeURIComponent(target))
+                    .then(r => r.json())
+                    .then(d => {
+                        if (d.error) { pluginsStatus.textContent = "error: " + d.error; return; }
+                        const plugins = d.plugins || [];
+                        pluginsStatus.textContent = plugins.length + " installed plugin(s).";
+                        pluginsList.innerHTML = plugins.map(p => (
+                            "<label class=\"tree-filter-toggle\"><input type=\"checkbox\" class=\"analyze-plugin-checkbox\" value=\"" +
+                            escapeHtml(p) + "\"> " + escapeHtml(p) + "</label>"
+                        )).join("");
+                    })
+                    .catch(err => { pluginsStatus.textContent = "failed to load: " + err; });
+            }
+
+            fetch("/api/appliances")
+                .then(r => r.json())
+                .then(d => {
+                    if (d.error) { targetStatus.textContent = "error: " + d.error; return; }
+                    const appliances = d.appliances || [];
+                    targetStatus.textContent = appliances.length + " known target(s).";
+                    targetSelect.innerHTML = appliances.map(a => (
+                        "<option value=\"" + escapeHtml(a.address) + "\">" + escapeHtml(a.address) +
+                        (a.is_em ? " (EM)" : "") + (a.online ? "" : " (offline)") + "</option>"
+                    )).join("");
+                    loadPlugins();
+                })
+                .catch(err => { targetStatus.textContent = "failed to load: " + err; });
+            targetSelect.addEventListener("change", loadPlugins);
+
+            function checkedPlugins() {
+                return Array.from(document.querySelectorAll(".analyze-plugin-checkbox:checked")).map(cb => cb.value);
+            }
+
+            debugStartBtn.addEventListener("click", () => {
+                const plugins = checkedPlugins();
+                if (!plugins.length) { window.alert("Check at least one plugin."); return; }
+                const formData = new URLSearchParams();
+                formData.set("csrf_token", CSRF_TOKEN);
+                formData.set("target", targetSelect.value);
+                formData.set("plugins", plugins.join(","));
+                formData.set("action", "start");
+                formData.set("level", debugLevel.value);
+                formData.set("minutes", debugMinutes.value);
+                debugStartBtn.disabled = true;
+                debugStopBtn.disabled = true;
+                debugStatus.textContent = "Starting debug…";
+                fetch("/analyze/debug", { method: "POST", body: formData })
+                    .then(r => r.json())
+                    .then(d => {
+                        debugStartBtn.disabled = false;
+                        debugStopBtn.disabled = false;
+                        if (d.error) { window.alert("Failed to start debug: " + d.error); return; }
+                        debugWindow = { start: d.epoch, end: null, target: targetSelect.value, plugins: plugins.slice() };
+                        pluginLogsLink.classList.add("analyze-disabled-link");
+                        debugStatus.textContent = "Debug running since " + new Date(d.epoch * 1000).toLocaleTimeString() +
+                            " -- click Stop debug now (or wait out the duration) before downloading logs.";
+                    })
+                    .catch(err => {
+                        debugStartBtn.disabled = false;
+                        debugStopBtn.disabled = false;
+                        window.alert("Failed to start debug: " + err);
+                    });
+            });
+
+            debugStopBtn.addEventListener("click", () => {
+                if (!debugWindow) { window.alert("No debug window was started from this tab."); return; }
+                const formData = new URLSearchParams();
+                formData.set("csrf_token", CSRF_TOKEN);
+                formData.set("target", debugWindow.target);
+                formData.set("plugins", debugWindow.plugins.join(","));
+                formData.set("action", "stop");
+                debugStartBtn.disabled = true;
+                debugStopBtn.disabled = true;
+                debugStatus.textContent = "Stopping debug…";
+                fetch("/analyze/debug", { method: "POST", body: formData })
+                    .then(r => r.json())
+                    .then(d => {
+                        debugStartBtn.disabled = false;
+                        debugStopBtn.disabled = false;
+                        if (d.error) { window.alert("Failed to stop debug: " + d.error); return; }
+                        debugWindow.end = d.epoch;
+                        debugStatus.textContent = "Debug window captured: " +
+                            new Date(debugWindow.start * 1000).toLocaleTimeString() + " – " +
+                            new Date(debugWindow.end * 1000).toLocaleTimeString() + ". Ready to download.";
+                        const params = new URLSearchParams({
+                            target: debugWindow.target, plugins: debugWindow.plugins.join(","),
+                            start: debugWindow.start, end: debugWindow.end,
+                        });
+                        pluginLogsLink.href = "/pluginlogs/download?" + params.toString();
+                        pluginLogsLink.classList.remove("analyze-disabled-link");
+                    })
+                    .catch(err => {
+                        debugStartBtn.disabled = false;
+                        debugStopBtn.disabled = false;
+                        window.alert("Failed to stop debug: " + err);
+                    });
+            });
+
+            function pollAnalyzeRun(runId) {
+                fetch("/api/analyze_run/" + runId)
+                    .then(r => r.json())
+                    .then(d => {
+                        if (d.error) { runStatus.textContent = "error: " + d.error; return; }
+                        if (d.status === "running") { setTimeout(() => pollAnalyzeRun(runId), 3000); return; }
+                        runBtn.disabled = false;
+                        runBtn.textContent = "Run analyze";
+                        if (d.status === "failed") {
+                            runStatus.textContent = "Failed: " + (d.error || "unknown error");
+                            return;
+                        }
+                        runStatus.textContent = "Done.";
+                        outputEl.style.display = "block";
+                        outputEl.textContent = (d.result && d.result.output) || "(no output)";
+                    })
+                    .catch(() => { setTimeout(() => pollAnalyzeRun(runId), 3000); });
+            }
+
+            runBtn.addEventListener("click", () => {
+                const target = targetSelect.value;
+                if (!target) { window.alert("Select a target."); return; }
+                const formData = new URLSearchParams();
+                formData.set("csrf_token", CSRF_TOKEN);
+                formData.set("target", target);
+                formData.set("window", windowInput.value || "1h");
+                formData.set("switch_filter", switchFilterInput.value || "");
+                formData.set("top_n", topNInput.value || "10");
+                formData.set("spike_n", spikeNInput.value || "5");
+                formData.set("stale_days", staleDaysInput.value || "7");
+                runBtn.disabled = true;
+                runBtn.textContent = "Starting…";
+                runStatus.textContent = "";
+                outputEl.style.display = "none";
+                fetch("/analyze/run", { method: "POST", body: formData })
+                    .then(r => r.json())
+                    .then(d => {
+                        if (d.error) {
+                            runBtn.disabled = false;
+                            runBtn.textContent = "Run analyze";
+                            runStatus.textContent = "Failed to start: " + d.error;
+                            return;
+                        }
+                        runStatus.textContent = "Running…";
+                        pollAnalyzeRun(d.run_id);
+                    })
+                    .catch(err => {
+                        runBtn.disabled = false;
+                        runBtn.textContent = "Run analyze";
+                        runStatus.textContent = "Failed to start: " + err;
+                    });
+            });
+        })();
+    </script>
+
+    <script>
         // Both Tech Support Bundle Generation panels (Appliance Host and
         // EM) share one factory -- each checked host, or the EM, becomes
         // its own background build job (mirrors the Appliances panel's
@@ -1948,6 +2237,61 @@
                     .catch(err => { window.alert("Failed to clean up: " + err); btn.disabled = false; btn.textContent = "Clean up"; });
             };
 
+            // Analyze button -- David's ask: tech-support log analysis
+            // right in this tab once a bundle's been built. Only offered
+            // for a whole (non-chunked) bundle -- high-admission-trace.sh's
+            // `analyze -b` needs one real .tgz, not a split .part-xx piece.
+            // Event-delegated (not addEventListener per-button) so it
+            // covers both this JS-rendered table and the server-rendered
+            // Jinja one (historical-window results) with one handler.
+            function analyzeId(path) {
+                return "ts-analyze-" + path.replace(/[^a-zA-Z0-9]/g, "_");
+            }
+
+            function analyzeCell(path) {
+                if (!path) return "";
+                const id = analyzeId(path);
+                return " <button type=\"button\" class=\"btn-small ts-analyze-btn\" data-path=\"" + escapeHtml(path) +
+                    "\" data-result-id=\"" + id + "\">Analyze</button>" +
+                    "<div id=\"" + id + "\" class=\"analyze-output\" style=\"display:none;\"></div>";
+            }
+
+            function pollTsAnalyze(runId, resultEl) {
+                fetch("/api/analyze_run/" + runId)
+                    .then(r => r.json())
+                    .then(d => {
+                        if (d.error) { resultEl.textContent = "error: " + d.error; return; }
+                        if (d.status === "running") { setTimeout(() => pollTsAnalyze(runId, resultEl), 3000); return; }
+                        if (d.status === "failed") { resultEl.textContent = "Failed: " + (d.error || "unknown error"); return; }
+                        resultEl.textContent = (d.result && d.result.output) || "(no output)";
+                    })
+                    .catch(() => { setTimeout(() => pollTsAnalyze(runId, resultEl), 3000); });
+            }
+
+            window.tsAnalyze = function (path, btn) {
+                const resultEl = document.getElementById(btn.dataset.resultId);
+                btn.disabled = true;
+                btn.textContent = "Starting…";
+                fetch("/techsupport/analyze", { method: "POST", body: new URLSearchParams({ path, csrf_token: CSRF_TOKEN }) })
+                    .then(r => r.json())
+                    .then(d => {
+                        btn.disabled = false;
+                        btn.textContent = "Analyze";
+                        if (d.error) { window.alert("Failed to start analysis: " + d.error); return; }
+                        if (resultEl) {
+                            resultEl.style.display = "block";
+                            resultEl.textContent = "Running…";
+                            pollTsAnalyze(d.run_id, resultEl);
+                        }
+                    })
+                    .catch(err => { btn.disabled = false; btn.textContent = "Analyze"; window.alert("Failed to start analysis: " + err); });
+            };
+
+            document.addEventListener("click", (e) => {
+                const btn = e.target.closest(".ts-analyze-btn");
+                if (btn) window.tsAnalyze(btn.dataset.path, btn);
+            });
+
             function renderBundles(bundles) {
                 if (!bundles || !bundles.length) return "<p class=\"hint\">No bundles reported.</p>";
                 let rows = "<tr><th>Plugins</th><th>Hosts</th><th>Target</th><th>Result</th><th>Path</th><th>Size</th><th>Commands log</th><th>Download</th></tr>";
@@ -1958,7 +2302,7 @@
                         : escapeHtml(b.path || "—");
                     const downloadCell = (b.chunks && b.chunks.length)
                         ? b.chunks.map((c, i) => downloadLink(c, "part " + (i + 1))).join("")
-                        : (downloadLink(b.path, "bundle") || "—");
+                        : ((downloadLink(b.path, "bundle") || "—") + analyzeCell(b.path));
                     rows += "<tr><td>" + escapeHtml((b.plugins || []).join(", ")) + "</td><td>" +
                         escapeHtml((b.hosts || []).join(", ") || "—") + "</td><td>" + escapeHtml(b.target) + "</td><td>" +
                         (b.ok ? "ok" : "failed") + "</td><td>" + pathCell + "</td>" +

@@ -591,6 +591,92 @@ def run_show_errors(target, duration, timeout=1200):
     return _run_verb(f"runshowerrors {target} {duration}", timeout=timeout)
 
 
+# Live Analyze tab (High Admission Root-Cause Tracing) -- see
+# webapp-query.py's own pluginlist/analyzeadm/pluginlogszip docstrings
+# for what each actually runs on the EM side.
+ANALYZE_WINDOW_RE = re.compile(r"^\d{1,5}[smhd]$")
+
+
+def list_plugins(target, timeout=20):
+    if not valid_target(target):
+        raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
+    return _run_verb(f"pluginlist {target}", timeout=timeout)
+
+
+def analyze_admission(
+    target, bundle_path=None, window="1h", switch_filter=None, top_n=10, spike_n=5, stale_days=7, timeout=1250,
+):
+    """
+    Runs high-admission-trace.sh's `analyze` mode. Give bundle_path to
+    analyze a bundle already centralized on the EM (same path shape as
+    download_techsupport_bundle/delete_techsupport_bundle) instead of the
+    live target -- target is still required either way (informational
+    only when bundle_path is given, naming where the bundle came from).
+    A generous default timeout: a real bundle analysis measured ~110s
+    against an 867MB real bundle; this leaves headroom for a much bigger
+    one. The caller runs this in a background thread and polls, same
+    pattern as run_show_errors/tech-support builds.
+    """
+    if not valid_target(target):
+        raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
+    if bundle_path is not None and not BUNDLE_PATH_RE.match(bundle_path):
+        raise ForescoutClientError(f"'{bundle_path}' is not a recognized tech-support bundle path.")
+    if not ANALYZE_WINDOW_RE.match(window or ""):
+        raise ForescoutClientError(f"'{window}' is not a valid window (expected e.g. 30m, 2h, 1d).")
+    switches = [s.strip() for s in (switch_filter or "").split(",") if s.strip()]
+    if switches and not all(valid_ip(s) for s in switches):
+        raise ForescoutClientError("Switch filter must be a comma-separated list of IPv4 addresses.")
+    for name, value in (("top_n", top_n), ("spike_n", spike_n), ("stale_days", stale_days)):
+        if not (isinstance(value, int) and 0 <= value <= 9999):
+            raise ForescoutClientError(f"'{name}' must be a non-negative number.")
+    return _run_verb(
+        f"analyzeadm {target} {bundle_path or '-'} {window} {','.join(switches) or '-'} "
+        f"{top_n} {spike_n} {stale_days}",
+        timeout=timeout,
+    )
+
+
+def download_plugin_logs_zip(target, plugins, start_epoch, end_epoch, timeout=300):
+    """
+    Streams a tar.gz of the named plugin(s)' raw log files, modified in
+    [start_epoch, end_epoch], off `target` -- the Live Analyze tab's
+    "download the raw logs for the debug window just captured" button.
+    Same raw-bytes/BEGIN-BINARY streaming handshake and Popen-return
+    convention as download_techsupport_bundle -- see its own docstring.
+    """
+    if not valid_target(target):
+        raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
+    if not plugins or not all(PLUGIN_NAME_RE.match(p) for p in plugins):
+        raise ForescoutClientError("Invalid plugin selection.")
+    if not (isinstance(start_epoch, int) and isinstance(end_epoch, int) and 0 < start_epoch < end_epoch):
+        raise ForescoutClientError("Invalid time window.")
+    if not os.path.isfile(SSH_KEY_PATH):
+        raise ForescoutClientError(
+            f"SSH key not found at {SSH_KEY_PATH} -- the container's key volume isn't mounted correctly."
+        )
+    cmd = [
+        "ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=10", "-i", SSH_KEY_PATH, f"root@{EM_HOST}",
+        f"pluginlogszip {target} {','.join(plugins)} {start_epoch}:{end_epoch}",
+    ]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    except FileNotFoundError:
+        raise ForescoutClientError("ssh is not available in this container.")
+
+    marker = proc.stdout.readline()
+    if marker.strip() != b"BEGIN-BINARY":
+        rest = proc.stdout.read()
+        proc.wait()
+        raw = marker + rest
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            raise ForescoutClientError(f"Unexpected response from the EM: {raw[:300]!r}")
+        raise ForescoutClientError(data.get("error", "Unknown error building the plugin logs zip."))
+    return proc
+
+
 def last_checked(ip, timeout=20):
     if not valid_ip(ip):
         raise ForescoutClientError(f"'{ip}' is not a valid IPv4 address.")

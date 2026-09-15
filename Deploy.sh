@@ -49,6 +49,13 @@ APACHE_KEY="/usr/local/forescout/etc/net_portal_ssl/private.key"
 AUTHORIZED_KEYS="/root/.ssh/authorized_keys"
 WEBAPP_QUERY_WRAPPER="/root/scripts/webapp-query/webapp-query.py"
 BUNDLED_WEBAPP_QUERY="${DIR}/webapp-query.py"
+# high-admission-trace.sh (the High Admission Root-Cause Tracing tool) --
+# webapp-query.py reads this sibling file fresh on every analyzeadm/
+# pluginlogszip call and pipes it into `bash -s` on whichever target is
+# being analyzed, so a redeploy of this one file is all it takes to pick
+# up a newer version, no per-appliance deployment needed.
+HAT_SCRIPT="/root/scripts/webapp-query/high-admission-trace.sh"
+BUNDLED_HAT_SCRIPT="${DIR}/high-admission-trace.sh"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "Must be run as root." >&2
@@ -85,12 +92,19 @@ if [ ! -f "$BUNDLED_WEBAPP_QUERY" ]; then
     echo "Error: ${BUNDLED_WEBAPP_QUERY} not found -- run this from inside the unpacked package." >&2
     exit 1
 fi
+if [ ! -f "$BUNDLED_HAT_SCRIPT" ]; then
+    echo "Error: ${BUNDLED_HAT_SCRIPT} not found -- run this from inside the unpacked package." >&2
+    exit 1
+fi
 
 echo "=== 1. SSH key for this app's own EM->appliance/EM calls ==="
 mkdir -p "$(dirname "$WEBAPP_QUERY_WRAPPER")"
 cp "$BUNDLED_WEBAPP_QUERY" "$WEBAPP_QUERY_WRAPPER"
 chmod 755 "$WEBAPP_QUERY_WRAPPER"
+cp "$BUNDLED_HAT_SCRIPT" "$HAT_SCRIPT"
+chmod 755 "$HAT_SCRIPT"
 echo "Installed webapp-query.py at $WEBAPP_QUERY_WRAPPER"
+echo "Installed high-admission-trace.sh at $HAT_SCRIPT"
 
 mkdir -p "$KEY_DIR"
 if [ ! -f "$KEY_FILE" ]; then

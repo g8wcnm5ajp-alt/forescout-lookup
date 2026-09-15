@@ -164,6 +164,19 @@ table.params td { word-break: break-all; max-width: 380px; }
 }
 .hint { color: var(--muted); font-size: 0.85rem; margin-top: 0.75rem; }
 
+.analyze-columns { display: flex; gap: 1.5rem; flex-wrap: wrap; }
+.analyze-col { flex: 1 1 220px; min-width: 200px; }
+.analyze-col h4 { margin: 0 0 0.4rem 0; color: var(--accent); font-size: 0.95rem; }
+.analyze-hr { margin: 1.25rem 0; border: none; border-top: 1px solid var(--border); }
+.analyze-output {
+    white-space: pre-wrap; font-size: 0.82rem; background: rgba(255, 255, 255, 0.03);
+    padding: 0.75rem; border-radius: 6px; font-family: inherit; max-height: 32rem; overflow-y: auto;
+    margin-top: 0.5rem;
+}
+.analyze-disabled-link { pointer-events: none; opacity: 0.4; }
+#analyze-plugins-list { max-height: 12rem; overflow-y: auto; display: block; }
+#analyze-plugins-list label { display: block; margin-bottom: 0.2rem; }
+
 .conn-badge { font-size: 0.72em; text-transform: uppercase; padding: 0.15em 0.55em; border-radius: 999px; }
 .conn-current { background: rgba(79, 180, 119, 0.18); color: var(--wired); }
 .conn-prior { background: rgba(139, 149, 171, 0.18); color: var(--muted); }

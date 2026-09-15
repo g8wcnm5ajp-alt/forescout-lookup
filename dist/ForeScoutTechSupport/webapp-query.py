@@ -210,6 +210,23 @@ Verbs (see the plan this was built from, forescout-lookup):
                             errors/<category>/summary.txt tree -- a real,
                             unscoped snapshot that runs several minutes,
                             not a quick check; duration is <N>m or <N>h
+    pluginlist <target>     installed plugins on target alone, no host
+                            lookup involved -- drives the Live Analyze
+                            tab's own plugin checklist/debug controls
+    analyzeadm <target> <bundle|-> <window> <switch_filter|-> <top_n>
+    <spike_n> <stale_days>  runs high-admission-trace.sh's `analyze`
+                            mode live against target, or against a
+                            bundle already centralized on this EM
+                            (bundle path, same shape as
+                            techsupportdownload/_cleanup) -- the script's
+                            own text is piped in over stdin, not
+                            deployed per-appliance
+    pluginlogszip <target> <plugin,...> <start>:<end>
+                            tar.gz (raw bytes, BEGIN-BINARY) of the named
+                            plugin(s)' own log directory, filtered to
+                            files modified in the given epoch window --
+                            the Live Analyze tab's "download the raw logs
+                            for the debug window just captured" button
     getadmincidr            no args -- the source CIDR currently allowed
                             through this EM's firewall to the app's own
                             HTTPS port (from admin_cidr.state, written by
@@ -233,6 +250,7 @@ import html
 import json
 import os
 import re
+import shlex
 import shutil
 import socket
 import subprocess
@@ -3160,6 +3178,152 @@ def do_appliances():
     print(json.dumps({"appliances": appliances}))
 
 
+# ---------------------------------------------------------------------
+# Live Analyze tab (High Admission Root-Cause Tracing) -- runs
+# high-admission-trace.sh against a live target (or a bundle already
+# centralized on this EM), lists a target's installed plugins for the
+# tab's own compact debug controls, and zips up a plugin's raw log files
+# for a given start:end window once a debug capture is done.
+# ---------------------------------------------------------------------
+HAT_SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "high-admission-trace.sh")
+PLUGIN_LOG_DIR = "/usr/local/forescout/log/plugin"
+
+
+def _read_hat_script():
+    """Read fresh on every call, not cached -- a Deploy.sh redeploy that ships a newer
+    high-admission-trace.sh takes effect immediately, no restart needed (this whole script
+    re-execs from scratch on every SSH invocation anyway)."""
+    if not os.path.isfile(HAT_SCRIPT_PATH):
+        fail(f"{HAT_SCRIPT_PATH} not found on this EM -- redeploy this app to install it.")
+    with open(HAT_SCRIPT_PATH) as f:
+        return f.read()
+
+
+def do_pluginlist(target):
+    """Installed plugins for `target` alone, no host lookup involved -- drives the Live Analyze
+    tab's own plugin checklist/debug controls, which are addressed by target the same way the
+    Debug panel already is (see get_installed_plugins/do_debugsetappliance)."""
+    mode, appliance = resolve_target(target)
+    if mode is None:
+        fail(f"'{target}' is not a known EM or managed appliance")
+    print(json.dumps({"target": target, "plugins": sorted(get_installed_plugins(mode, appliance))}))
+
+
+ANALYZE_WINDOW_RE = r"\d{1,5}[smhd]"
+
+
+def do_analyzeadm(target, bundle_path, window, switch_filter, top_n, spike_n, stale_days):
+    """
+    Runs high-admission-trace.sh's `analyze` mode. Two shapes: live
+    against `target` (the EM or a managed appliance -- resolve_target),
+    or against a bundle already centralized on this EM's own
+    /shared/shared/case tree (bundle_path, same whitelist as
+    do_techsupport_download/_cleanup -- a bundle only ever lives on the
+    EM that built it, so `target` there is informational only, naming
+    where it came from, not where to run the analysis).
+
+    The script's own text is piped in over stdin as `bash -s -- analyze
+    ...` rather than deployed onto every managed appliance individually
+    -- ssh_appliance forwards stdin straight through to the remote
+    command (see its docstring), so one canonical file (installed by
+    Deploy.sh next to this wrapper) serves every target with nothing to
+    maintain per-appliance.
+    """
+    script_text = _read_hat_script()
+
+    if bundle_path:
+        if not _is_safe_bundle_path(bundle_path):
+            fail(f"'{bundle_path}' is not a known tech-support bundle path.")
+        if not os.path.isfile(bundle_path):
+            fail(f"'{bundle_path}' does not exist on this EM.")
+        mode, appliance = "em", None
+    else:
+        mode, appliance = resolve_target(target)
+        if mode is None:
+            fail(f"'{target}' is not a known EM or managed appliance")
+
+    args = ["analyze"]
+    if bundle_path:
+        args += ["-b", bundle_path]
+    args += ["-w", window]
+    if switch_filter:
+        args += ["-k", switch_filter]
+    args += ["-n", str(top_n), "-s", str(spike_n), "-a", str(stale_days)]
+
+    # A real bundle analysis (unpack + every awk pass) measured ~110s
+    # against a real 867MB LSEG bundle -- 1200s leaves generous headroom
+    # for a much bigger one; app.py's caller runs this in a background
+    # thread and polls, never blocking a request on it, same pattern as
+    # run_show_errors/tech-support builds.
+    if mode == "em":
+        out, err, rc = run(["bash", "-s", "--", *args], timeout=1200, input=script_text)
+    else:
+        remote_cmd = "bash -s -- " + " ".join(shlex.quote(a) for a in args)
+        out, err, rc = ssh_appliance(appliance, remote_cmd, timeout=1200, input=script_text)
+
+    if rc != 0:
+        fail((err or out or f"analyze exited {rc}").strip()[-4000:])
+    print(json.dumps({"target": target, "bundle": bundle_path, "output": out}))
+
+
+PLUGIN_NAME_ONLY_RE = r"[a-z][a-z0-9_]{1,40}"
+
+
+def do_pluginlogszip(target, plugins_csv, start_epoch, end_epoch):
+    """
+    Streams a tar.gz (raw bytes, same BEGIN-BINARY convention as
+    do_techsupport_download) of every file under each named plugin's own
+    /usr/local/forescout/log/plugin/<plugin>/ directory modified within
+    [start_epoch, end_epoch] -- the Live Analyze tab's "download the raw
+    logs for the debug window just captured" button. Every plugin name is
+    checked against this target's own real installed set first (same
+    defense-in-depth pattern as do_debugsetappliance), and built/streamed
+    entirely on the target side (`find | tar --null -T - -czf -`, piped
+    straight through ssh_appliance's stdout for an appliance target) so a
+    multi-hundred-MB log directory never has to be pulled into this
+    process's own memory first.
+    """
+    mode, appliance = resolve_target(target)
+    if mode is None:
+        fail(f"'{target}' is not a known EM or managed appliance")
+    plugins = [p for p in plugins_csv.split(",") if p]
+    if not plugins:
+        fail("no plugins given")
+    installed = get_installed_plugins(mode, appliance)
+    for p in plugins:
+        if p not in installed:
+            fail(f"'{p}' is not an installed plugin on {target}")
+    if not (isinstance(start_epoch, int) and isinstance(end_epoch, int) and 0 < start_epoch < end_epoch):
+        fail("invalid time window")
+
+    # A real .zip, not a .tar.gz -- David's ask was specifically "a zip
+    # file", and it opens natively on Windows without needing 7-zip.
+    # zip's own `-@` reads one filename per line from stdin and streams
+    # the archive to stdout via `-` as the destination -- no temp file on
+    # either end. Plain newline-delimited (not find -print0/xargs -0)
+    # since zip's `-@` has no null-delimited mode; acceptable here, real
+    # Forescout plugin log filenames don't contain spaces or newlines.
+    dirs = " ".join(shlex.quote(f"{PLUGIN_LOG_DIR}/{p}") for p in plugins)
+    cmd = (
+        f"find {dirs} -type f -newermt @{start_epoch} ! -newermt @{end_epoch} 2>/dev/null "
+        f"| zip -q -@ - 2>/dev/null"
+    )
+    if mode == "em":
+        proc = subprocess.Popen(["bash", "-c", cmd], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    else:
+        resolved = _resolve_target_host(appliance)
+        proc = subprocess.Popen(
+            ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
+             "-o", "ConnectTimeout=10", f"root@{resolved}", cmd],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+    sys.stdout.write("BEGIN-BINARY\n")
+    sys.stdout.flush()
+    shutil.copyfileobj(proc.stdout, sys.stdout.buffer)
+    sys.stdout.buffer.flush()
+    proc.wait()
+
+
 def _latest_snapshot_dir(mode, appliance):
     cmd = "ls -dt /tmp/snapshot.*/ 2>/dev/null | head -1"
     out, err, rc = (run(["bash", "-c", cmd], timeout=15) if mode == "em"
@@ -3339,6 +3503,28 @@ def main():
     if m:
         return do_run_show_errors(m.group(1), m.group(2))
 
+    m = re.fullmatch(rf"pluginlist ({TARGET_RE})", original.strip())
+    if m:
+        return do_pluginlist(m.group(1))
+
+    m = re.fullmatch(
+        rf"analyzeadm ({TARGET_RE}) (-|/shared/shared/case/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+) "
+        rf"({ANALYZE_WINDOW_RE}) (-|{IP_RE}(?:,{IP_RE})*) (\d{{1,3}}) (\d{{1,3}}) (\d{{1,4}})",
+        original.strip(),
+    )
+    if m:
+        return do_analyzeadm(
+            m.group(1), None if m.group(2) == "-" else m.group(2), m.group(3),
+            None if m.group(4) == "-" else m.group(4), int(m.group(5)), int(m.group(6)), int(m.group(7)),
+        )
+
+    m = re.fullmatch(
+        rf"pluginlogszip ({TARGET_RE}) ({PLUGIN_NAME_ONLY_RE}(?:,{PLUGIN_NAME_ONLY_RE})*) (\d{{1,10}}):(\d{{1,10}})",
+        original.strip(),
+    )
+    if m:
+        return do_pluginlogszip(m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+
     if original.strip() == "techsupportlogtail":
         return do_techsupport_log_tail()
 
@@ -3472,6 +3658,9 @@ def main():
         "policytree | "
         "lastchecked <ip> | matched <ip> <N>h|d|w | history <ip> <N>h|d|w | rawfields <ip> | "
         "arplist <ip> | appliances | runshowerrors <target> <N>m|h | "
+        "pluginlist <target> | "
+        "analyzeadm <target> <bundle|-> <window> <switch_filter|-> <top_n> <spike_n> <stale_days> | "
+        "pluginlogszip <target> <plugin,...> <start>:<end> | "
         "getadmincidr | setadmincidr <cidr>)",
         code=2,
     )
