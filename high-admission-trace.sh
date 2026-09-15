@@ -115,7 +115,7 @@
 #
 set -euo pipefail
 
-VERSION="1.3.2"
+VERSION="1.3.3"
 
 # Overridden below when -b points analyze at a bundle instead of this
 # live appliance -- everything else in the script reads through these
@@ -386,6 +386,36 @@ if [ -n "$BUNDLE" ]; then
         # runs into real disk pressure.
         trap 'rm -rf "$BUNDLE_ROOT"' EXIT
         tar -xzf "$BUNDLE" -C "$BUNDLE_ROOT"
+
+        # Confirmed live, twice, two different parts of the archive:
+        # under real memory pressure on the box doing the extraction,
+        # `tar -xzf` can exit 0 while silently dropping an arbitrary
+        # subset of the archive -- today.log alone the first time this
+        # was caught, the ENTIRE plugin/sw/ log tree (116 files) the
+        # second. A disk-only check can't tell "genuinely not in this
+        # bundle" (common and legitimate -- a standard bundle often has
+        # no sw.log trace data at all) from "silently dropped by this
+        # extraction", so this checks the archive's own listing instead.
+        # If either of the two things this script actually needs is
+        # listed in the archive but didn't land on disk, redo the whole
+        # extraction once -- tar just fills in what's missing and leaves
+        # anything already-correct untouched. Cheap insurance (tar -tzf
+        # only decompresses to list, it doesn't write the ~8GB back out
+        # to disk), and resolved every case seen so far.
+        ARCHIVE_LIST=$(tar -tzf "$BUNDLE" 2>/dev/null || true)
+        EXTRACTION_INCOMPLETE=0
+        if echo "$ARCHIVE_LIST" | grep -q '/usr/local/forescout/stats/today\.log$' \
+            && [ -z "$(find "$BUNDLE_ROOT" -path "*/usr/local/forescout/stats/today.log" -print -quit 2>/dev/null)" ]; then
+            EXTRACTION_INCOMPLETE=1
+        fi
+        if echo "$ARCHIVE_LIST" | grep -q '/usr/local/forescout/log/plugin/sw/sw.*\.log$' \
+            && [ -z "$(find "$BUNDLE_ROOT" -path "*/usr/local/forescout/log/plugin/sw/sw*.log" -print -quit 2>/dev/null)" ]; then
+            EXTRACTION_INCOMPLETE=1
+        fi
+        if [ "$EXTRACTION_INCOMPLETE" -eq 1 ]; then
+            echo "=== Extraction looked incomplete against the archive's own listing -- retrying once ===" >&2
+            tar -xzf "$BUNDLE" -C "$BUNDLE_ROOT"
+        fi
     else
         echo "Error: -b '$BUNDLE' is not a file or directory." >&2
         exit 1
@@ -404,17 +434,6 @@ if [ -n "$BUNDLE" ]; then
     if [ -z "$TODAY_LOG" ]; then
         # Fall back to the natively-shipped copy under files/usr/local/forescout/stats/,
         # if this bundle happens to have one (not guaranteed -- see header comment).
-        TODAY_LOG=$(find "$BUNDLE_ROOT" -path "*/usr/local/forescout/stats/today.log" -print -quit 2>/dev/null || true)
-    fi
-    if [ -z "$TODAY_LOG" ] && [ -n "$BUNDLE_ROOT" ] && [ "$BUNDLE_ROOT" != "$BUNDLE" ]; then
-        # today.log is routinely the single largest file in a real bundle
-        # (500+MB seen live) -- confirmed live that a full `tar -xzf` can
-        # silently come back exit-0 with this one file missing under real
-        # memory pressure on the box doing the extracting, while every
-        # smaller file extracts fine. A single targeted re-extraction of
-        # just this one path is cheap to retry and has resolved it every
-        # time this was hit live.
-        tar -xzf "$BUNDLE" -C "$BUNDLE_ROOT" --wildcards '*/usr/local/forescout/stats/today.log' 2>/dev/null || true
         TODAY_LOG=$(find "$BUNDLE_ROOT" -path "*/usr/local/forescout/stats/today.log" -print -quit 2>/dev/null || true)
     fi
     if [ -z "$MAC_TRACK_LOG" ]; then
