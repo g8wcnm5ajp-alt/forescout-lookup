@@ -1720,7 +1720,7 @@ def do_analyze_debug():
     except ForescoutClientError as e:
         return jsonify({"error": str(e)}), 502
     _log_activity(
-        "analyze_debug", username=session.get("username"), target=target, plugins=plugins, action=action,
+        "analyze_debug", username=session.get("username"), target=target, plugins=plugins, debug_action=action,
     )
     return jsonify({"ok": True, "epoch": int(time.time())})
 
