@@ -2558,7 +2558,7 @@ def _group_plugins_by_target(ips_csv, selected_plugins=None, case_ref=None):
     return ips, plugins_by_target, hostinfo_by_target, verdict_by_ip, unresolved
 
 
-TARGET_PLUGIN_PAIR_RE = rf"{IP_RE}:{DEBUGSET_PLUGIN_RE}"
+TARGET_PLUGIN_PAIR_RE = rf"{TARGET_RE}:{DEBUGSET_PLUGIN_RE}"
 SELECTED_PLUGINS_RE = rf"(?:{TARGET_PLUGIN_PAIR_RE}(?:,{TARGET_PLUGIN_PAIR_RE})*|-|0)"
 
 
@@ -2587,7 +2587,7 @@ def _parse_selected_plugins(selected_plugins_token):
     return selected
 
 
-TARGET_DBTABLE_PAIR_RE = rf"{IP_RE}:{DATABASE_NAME_RE.pattern[1:-1]}"
+TARGET_DBTABLE_PAIR_RE = rf"{TARGET_RE}:{DATABASE_NAME_RE.pattern[1:-1]}"
 SELECTED_DBTABLES_RE = rf"(?:{TARGET_DBTABLE_PAIR_RE}(?:,{TARGET_DBTABLE_PAIR_RE})*|-)"
 
 
