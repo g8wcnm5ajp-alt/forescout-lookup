@@ -115,7 +115,7 @@
 #
 set -euo pipefail
 
-VERSION="1.3.3"
+VERSION="1.3.4"
 
 # Overridden below when -b points analyze at a bundle instead of this
 # live appliance -- everything else in the script reads through these
@@ -387,34 +387,34 @@ if [ -n "$BUNDLE" ]; then
         trap 'rm -rf "$BUNDLE_ROOT"' EXIT
         tar -xzf "$BUNDLE" -C "$BUNDLE_ROOT"
 
-        # Confirmed live, twice, two different parts of the archive:
-        # under real memory pressure on the box doing the extraction,
-        # `tar -xzf` can exit 0 while silently dropping an arbitrary
-        # subset of the archive -- today.log alone the first time this
-        # was caught, the ENTIRE plugin/sw/ log tree (116 files) the
-        # second. A disk-only check can't tell "genuinely not in this
-        # bundle" (common and legitimate -- a standard bundle often has
-        # no sw.log trace data at all) from "silently dropped by this
-        # extraction", so this checks the archive's own listing instead.
-        # If either of the two things this script actually needs is
-        # listed in the archive but didn't land on disk, redo the whole
-        # extraction once -- tar just fills in what's missing and leaves
-        # anything already-correct untouched. Cheap insurance (tar -tzf
-        # only decompresses to list, it doesn't write the ~8GB back out
-        # to disk), and resolved every case seen so far.
+        # Confirmed live, repeatedly, on one specific real bundle: a full
+        # `tar -xzf` of the whole archive can exit 0 while silently
+        # dropping an entire subtree (the plugin/sw/ log directory, 116
+        # files) even from a byte-verified, checksum-correct archive --
+        # reproduced 3 times in a row against the same bundle, so this
+        # isn't just occasional memory-pressure flakiness on one random
+        # file. What DID prove reliable, twice: a SECOND, TARGETED
+        # extraction of just the missing subtree via `tar --wildcards`,
+        # scoped narrowly rather than a second full-archive pass (which
+        # shares whatever the first pass's problem was, and re-proved
+        # unreliable when tried).
+        #
+        # A disk-only check can't tell "genuinely not in this bundle"
+        # (common and legitimate -- a standard bundle often has no sw.log
+        # trace data at all) from "silently dropped by extraction", so
+        # this checks the archive's own listing (tar -tzf, decompress-
+        # and-list only, no second ~8GB disk write) before deciding
+        # anything is actually missing.
         ARCHIVE_LIST=$(tar -tzf "$BUNDLE" 2>/dev/null || true)
-        EXTRACTION_INCOMPLETE=0
         if echo "$ARCHIVE_LIST" | grep -q '/usr/local/forescout/stats/today\.log$' \
             && [ -z "$(find "$BUNDLE_ROOT" -path "*/usr/local/forescout/stats/today.log" -print -quit 2>/dev/null)" ]; then
-            EXTRACTION_INCOMPLETE=1
+            echo "=== today.log listed in the archive but missing after extraction -- retrying that path ===" >&2
+            tar -xzf "$BUNDLE" -C "$BUNDLE_ROOT" --wildcards '*/usr/local/forescout/stats/today.log' 2>/dev/null || true
         fi
         if echo "$ARCHIVE_LIST" | grep -q '/usr/local/forescout/log/plugin/sw/sw.*\.log$' \
             && [ -z "$(find "$BUNDLE_ROOT" -path "*/usr/local/forescout/log/plugin/sw/sw*.log" -print -quit 2>/dev/null)" ]; then
-            EXTRACTION_INCOMPLETE=1
-        fi
-        if [ "$EXTRACTION_INCOMPLETE" -eq 1 ]; then
-            echo "=== Extraction looked incomplete against the archive's own listing -- retrying once ===" >&2
-            tar -xzf "$BUNDLE" -C "$BUNDLE_ROOT"
+            echo "=== sw plugin logs listed in the archive but missing after extraction -- retrying that subtree ===" >&2
+            tar -xzf "$BUNDLE" -C "$BUNDLE_ROOT" --wildcards '*/usr/local/forescout/log/plugin/sw/*' 2>/dev/null || true
         fi
     else
         echo "Error: -b '$BUNDLE' is not a file or directory." >&2
