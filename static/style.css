@@ -113,6 +113,27 @@ table { width: 100%; border-collapse: collapse; font-size: 0.92rem; }
 th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--border); }
 th { color: var(--muted); font-weight: 600; white-space: nowrap; }
 
+/* Raw fields table -- David's ask, 2026-09-15: on export/print, Appliance
+   and Time (the two rightmost columns) were getting cut off the page.
+   Root cause: the default table-layout:auto sizes every column to its
+   widest cell across ALL rows -- confirmed live a real host's 2229 raw
+   fields include long unbroken values (IPv6 addresses, long service
+   names, "source" strings like "va@8565155208648015208 [va]"), which
+   pushed the table wider than the printable page, past where Appliance/
+   Time could still fit. Fixed sizing (percentages reflect real content:
+   Time is a fixed-format timestamp, Appliance a bounded hostname/IP,
+   Field/Value/Source are the ones that actually vary) plus forced
+   wrapping instead of overflow -- applies on screen too, not just print,
+   since the same overflow risk exists there (the table-wrap container
+   only ever scrolled vertically, never horizontally). */
+.rawfields-table { table-layout: fixed; }
+.rawfields-table th:nth-child(1), .rawfields-table td:nth-child(1) { width: 13%; }
+.rawfields-table th:nth-child(2), .rawfields-table td:nth-child(2) { width: 37%; }
+.rawfields-table th:nth-child(3), .rawfields-table td:nth-child(3) { width: 20%; }
+.rawfields-table th:nth-child(4), .rawfields-table td:nth-child(4) { width: 15%; }
+.rawfields-table th:nth-child(5), .rawfields-table td:nth-child(5) { width: 15%; }
+.rawfields-table td { overflow-wrap: anywhere; }
+
 .verdict {
     font-size: 0.65em;
     text-transform: uppercase;
@@ -178,9 +199,14 @@ tr.row-prior-connection { opacity: 0.55; }
 .page-tab-panel-hidden { display: none; }
 .page-tab-badge { background: var(--err); color: #fff; font-size: 0.7em; font-weight: 700; padding: 0.1em 0.5em; border-radius: 999px; margin-left: 0.35em; }
 
-.appliances-tabbar-buttons { display: flex; gap: 0.4rem; flex-wrap: nowrap; }
-.tab-page-btn { background: var(--panel); color: var(--text); border: 1px solid var(--border); font-weight: 700; padding: 0.4rem 0.75rem; }
-.tab-page-btn:disabled { opacity: 0.35; cursor: default; }
+/* Fill the available width and wrap to as many rows as needed -- David's
+   ask, 2026-09-15: with 40+ appliances checked, the old fixed
+   PAGE_SIZE=3 + prev/next pagination meant repeatedly clicking +/- to
+   reach a specific run's tab. flex-wrap already advances to a new row
+   the moment one fills, same effect he wanted from the +/- but with no
+   click needed at all -- removed the pagination entirely rather than
+   just raising the page size. */
+.appliances-tabbar-buttons { display: flex; gap: 0.4rem; flex-wrap: wrap; width: 100%; }
 
 .spinner {
     display: inline-block;

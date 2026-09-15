@@ -308,7 +308,7 @@
                         <span class="muted" id="rawfields-status-{{ slug }}"></span>
                     </div>
                     <div id="rawfields-table-wrap-{{ slug }}" class="rawfields-table-wrap" style="max-height: 480px; overflow-y: auto; margin-top: 0.5rem;">
-                        <table id="rawfields-table-{{ slug }}"><tr><th>Field</th><th>Value</th><th>Source</th><th>Appliance</th><th>Time</th></tr></table>
+                        <table id="rawfields-table-{{ slug }}" class="rawfields-table"><tr><th>Field</th><th>Value</th><th>Source</th><th>Appliance</th><th>Time</th></tr></table>
                     </div>
                     <p class="hint" id="rawfields-refresh-status-{{ slug }}"></p>
                 </div>
@@ -355,6 +355,10 @@
                 </form>
             </h3>
             <p class="hint" id="appliances-status">Loading appliances…</p>
+            <div class="tree-filter-row" style="margin-bottom:0.5rem;">
+                <button type="button" id="appliances-select-online-btn" class="btn-small btn-secondary">Select all online</button>
+                <button type="button" id="appliances-deselect-all-btn" class="btn-small btn-secondary">Deselect all</button>
+            </div>
             <div class="tree-filter-row" id="appliances-checkbox-row"></div>
             <div class="tree-filter-row">
                 <label class="tree-filter-toggle">Duration
@@ -371,9 +375,7 @@
 
             <div id="appliances-tabs-wrap" style="display:none; margin-top:1rem;">
                 <div class="tabs no-print" id="appliances-tabbar">
-                    <button type="button" id="appliances-page-prev" class="tab-page-btn">-</button>
                     <span id="appliances-tabbar-buttons" class="appliances-tabbar-buttons"></span>
-                    <button type="button" id="appliances-page-next" class="tab-page-btn">+</button>
                 </div>
                 <div id="appliances-tab-panels"></div>
             </div>
@@ -1522,18 +1524,16 @@
 
             const status = document.getElementById("appliances-status");
             const checkboxRow = document.getElementById("appliances-checkbox-row");
+            const selectOnlineBtn = document.getElementById("appliances-select-online-btn");
+            const deselectAllBtn = document.getElementById("appliances-deselect-all-btn");
             const runBtn = document.getElementById("appliances-run-btn");
             const durationValue = document.getElementById("appliances-duration-value");
             const durationUnit = document.getElementById("appliances-duration-unit");
             const tabsWrap = document.getElementById("appliances-tabs-wrap");
             const tabbarButtons = document.getElementById("appliances-tabbar-buttons");
             const tabPanels = document.getElementById("appliances-tab-panels");
-            const pagePrev = document.getElementById("appliances-page-prev");
-            const pageNext = document.getElementById("appliances-page-next");
 
-            const PAGE_SIZE = 3;
             let runs = [];
-            let pageStart = 0;
 
             function escapeHtml(s) {
                 return (s || "").toString().replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -1556,14 +1556,27 @@
                 })
                 .catch(err => { status.textContent = "failed to load: " + err; });
 
+            // David's ask, 2026-09-15: every appliance is checked by
+            // default (58 seen live in one real environment), so running
+            // against just one or a few meant unchecking dozens by hand.
+            selectOnlineBtn.addEventListener("click", () => {
+                checkboxRow.querySelectorAll(".appliance-checkbox:not(:disabled)").forEach(cb => { cb.checked = true; });
+            });
+            deselectAllBtn.addEventListener("click", () => {
+                checkboxRow.querySelectorAll(".appliance-checkbox").forEach(cb => { cb.checked = false; });
+            });
+
+            // Every run gets a tab, all at once -- David's ask, 2026-09-15:
+            // the old fixed-page-of-3 + prev/next pagination meant
+            // repeatedly clicking +/- to reach a given appliance's tab
+            // with 40+ checked. flex-wrap (style.css) fills the row and
+            // wraps to a new one as needed, so this never needs to scroll
+            // or paginate regardless of how many runs are showing.
             function renderTabbar() {
-                const visible = runs.slice(pageStart, pageStart + PAGE_SIZE);
-                tabbarButtons.innerHTML = visible.map(r => (
+                tabbarButtons.innerHTML = runs.map(r => (
                     "<button type=\"button\" class=\"tab-btn appliance-tab-btn" + (r.active ? " active" : "") + "\" data-run-id=\"" + r.run_id + "\">" +
                     escapeHtml(r.target) + "</button>"
                 )).join("");
-                pagePrev.disabled = pageStart === 0;
-                pageNext.disabled = pageStart + PAGE_SIZE >= runs.length;
 
                 tabbarButtons.querySelectorAll(".appliance-tab-btn").forEach(btn => {
                     btn.addEventListener("click", () => {
@@ -1580,9 +1593,6 @@
                     if (p) p.classList.toggle("tab-panel-hidden", !r.active);
                 });
             }
-
-            pagePrev.addEventListener("click", () => { pageStart = Math.max(0, pageStart - 1); renderTabbar(); });
-            pageNext.addEventListener("click", () => { pageStart = Math.min(Math.max(0, runs.length - PAGE_SIZE), pageStart + 1); renderTabbar(); });
 
             // Collapsible by default (David's ask, 2026-09-14) -- a real run
             // can report several error categories plus 30+ diag files
@@ -1850,7 +1860,6 @@
                         runBtn.disabled = false;
                         runBtn.textContent = "Run Show Errors";
                         if (d.error) { window.alert("Failed to start: " + d.error); return; }
-                        pageStart = 0;
                         addRunningPanels(d.runs || []);
                         if (d.skipped && d.skipped.length) {
                             window.alert("Already running, not started again: " + d.skipped.join(", "));
