@@ -473,6 +473,9 @@
                 </div>
             </details>
             <div class="hint" id="analyze-run-status"></div>
+            <div id="analyze-output-tools" style="display:none; margin:0.5rem 0;">
+                <button type="button" id="analyze-output-clear" class="btn-small btn-secondary">Clear results</button>
+            </div>
             <pre id="analyze-output" class="analyze-output" style="display:none;"></pre>
         </div>
         </section>
@@ -515,6 +518,7 @@
             <div class="hint" id="upload-run-status"></div>
             <div id="upload-output-tools" style="display:none; margin:0.5rem 0;">
                 <a href="#" id="upload-output-download" class="btn-small btn-secondary">Download report (.txt)</a>
+                <button type="button" id="upload-output-clear" class="btn-small btn-secondary">Clear results</button>
             </div>
             <pre id="upload-bundle-output" class="analyze-output analyze-output-mono" style="display:none;"></pre>
         </div>
@@ -2182,6 +2186,14 @@
                     " taken anywhere from a few seconds (a live target) to 2+ minutes (a large multi-hundred-MB bundle).</p></div>";
             };
 
+            const analyzeToolsEl = document.getElementById("analyze-output-tools");
+            document.getElementById("analyze-output-clear").addEventListener("click", () => {
+                outputEl.textContent = "";
+                outputEl.style.display = "none";
+                analyzeToolsEl.style.display = "none";
+                runStatus.textContent = "";
+            });
+
             function pollAnalyzeRun(runId) {
                 fetch("/api/analyze_run/" + runId)
                     .then(r => r.json())
@@ -2201,6 +2213,7 @@
                         runStatus.textContent = "Done.";
                         outputEl.style.display = "block";
                         outputEl.textContent = (d.result && d.result.output) || "(no output)";
+                        analyzeToolsEl.style.display = "block";
                     })
                     .catch(() => { setTimeout(() => pollAnalyzeRun(runId), 3000); });
             }
@@ -2220,6 +2233,7 @@
                 runBtn.textContent = "Starting…";
                 runStatus.textContent = "";
                 outputEl.style.display = "none";
+                analyzeToolsEl.style.display = "none";
                 fetch("/analyze/run", { method: "POST", body: formData })
                     .then(r => r.json())
                     .then(d => {
@@ -2330,6 +2344,13 @@
                 a.click();
                 a.remove();
                 setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+            });
+
+            document.getElementById("upload-output-clear").addEventListener("click", () => {
+                outputEl.textContent = "";
+                outputEl.style.display = "none";
+                toolsEl.style.display = "none";
+                runStatusEl.textContent = "";
             });
 
             function pollRun(runId, reportName) {
