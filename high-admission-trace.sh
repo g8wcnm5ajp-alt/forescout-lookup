@@ -5,7 +5,7 @@
 # Traces what's actually causing an appliance's high admission (adm)
 # event volume back to a switch/port/MAC (and, where known, an IP).
 # Built and verified live 2026-09-15 against a real Cisco 3560
-# (192.168.22.221) via controlled port-bounce tests -- see
+# (a lab switch) via controlled port-bounce tests -- see
 # "High Admission Root-Cause Tracing" in the vault for the full method
 # and the real log-line examples this was built from.
 #
@@ -50,7 +50,7 @@
 #   100+MB on a live box. Hand the resulting .tgz to `analyze -b`
 #   anywhere, no live appliance access needed.
 #
-# Two checks added 2026-09-15 after applying this to a real LSEG
+# Two checks added 2026-09-15 after applying this to a real customer
 # production incident where no switch-plugin trace data existed at all
 # (debug wasn't active when it happened) -- both work from today.log
 # alone, so they still say something useful even in that situation:
@@ -59,7 +59,7 @@
 #     admission-volume reporting windows, ranks every connected device's
 #     <ip>.write.count/.write.bytes -- a device with dramatically more
 #     writes than its peers during a spike is a possible contributing/
-#     symptomatic device. Confirmed live against the real LSEG bundle:
+#     symptomatic device. Confirmed live against the real customer bundle:
 #     surfaced one device at 30-50x every peer's write volume, consistent
 #     across 5 separate spike windows.
 #   - Stale MAC->IP flag: flags any MAC->IP mapping whose "known as of"
@@ -71,7 +71,7 @@
 #     shape this flag is built to catch, regardless of the exact cause.
 #
 # Two more checks added 2026-09-15 (second pass) after a second real
-# LSEG bundle turned up actual sw.log trace lines (33 sw_send_adm_by_mac
+# customer bundle turned up actual sw.log trace lines (33 sw_send_adm_by_mac
 # lines, despite conf.debug.level=0 -- confirmed some debug had been left
 # on). Both read sw.log directly, so unlike the two checks above they
 # need trace data to exist -- not guaranteed, same caveat as the
@@ -128,7 +128,7 @@ MAC_IP_CSV=""   # only set in bundle mode -- live mode queries psql directly ins
 
 # analyze mode's sw.log source list. Live: the single file above, if
 # present. Bundle: sw.log rotates (a real bundle can carry 100+ rotated
-# sw.<epoch>.<pid>.log files, confirmed against a real LSEG bundle), so
+# sw.<epoch>.<pid>.log files, confirmed against a real customer bundle), so
 # this is every rotation found, fed to awk as multiple files at once.
 SW_PLUGIN_LOG_FILES=()
 

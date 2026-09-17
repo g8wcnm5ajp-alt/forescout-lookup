@@ -94,7 +94,7 @@ def _format_still_active(data):
 def lookup(ip, timeout=90):
     # Was 45s: do_lookup queries every known appliance for its installed/
     # enabled plugins and databases, and confirmed live 2026-09-11 that two
-    # appliances (172.16.1.129/.130 -- previously assumed dead, no longer
+    # appliances (two in the lab -- previously assumed dead, no longer
     # filtered out) each take ~11.5s just for the enabled-plugins check,
     # pushing a single lookup's total time to ~34s even after parallelizing
     # those per-target queries server-side (webapp-query.py's
@@ -699,7 +699,7 @@ UPLOAD_PATH_RE = re.compile(r"^/tmp/hat-uploads/[A-Za-z0-9_.\-]{1,120}\.(?:tgz|t
 # workflow), same reasoning/whitelisting approach as UPLOAD_PATH_RE --
 # see webapp-query.py's own MANUAL_STAGING_DIR/_PATH_RE, which this
 # mirrors on the client side.
-MANUAL_STAGING_PATH_RE = re.compile(r"^/root/scripts/LSEG/[A-Za-z0-9_.\-]{1,120}\.(?:tgz|tar\.gz)$")
+MANUAL_STAGING_PATH_RE = re.compile(r"^/root/scripts/staged-bundles/[A-Za-z0-9_.\-]{1,120}\.(?:tgz|tar\.gz)$")
 
 # Sanity cap, not confirmed with David as the right number -- same
 # reasoning as MAX_LOOKUP_IPS in app.py. Real bundles seen so far (up to
@@ -707,21 +707,23 @@ MANUAL_STAGING_PATH_RE = re.compile(r"^/root/scripts/LSEG/[A-Za-z0-9_.\-]{1,120}
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
 
 
-def upload_bundle(filename, data, timeout=900):
+def upload_bundle(filename, stream, timeout=900):
     """
-    Streams `data` (the uploaded bundle's raw bytes) to the EM via
-    `bundleupload <filename>` and returns {"path": ..., "size": ...} --
-    the EM-side path, ready to hand straight to
-    analyze_admission(bundle_path=...). Unlike every other verb call
-    here, this can't go through _run_verb (that helper runs in text
-    mode; a bundle's bytes are binary), so it builds its own subprocess
-    call the same way download_plugin_logs_zip/download_techsupport_bundle
-    do for the opposite (EM-to-browser) direction.
+    Streams an uploaded bundle (`stream`: a binary file-like object --
+    Flask's own spooled upload) to the EM via `bundleupload <filename>`
+    and returns {"path": ..., "size": ...} -- the EM-side path, ready to
+    hand straight to analyze_admission(bundle_path=...) or
+    correlate_bundles(). Copied through in 1MB pieces rather than read
+    whole: the Correlate feature means several 800MB bundles uploaded
+    back to back, and holding each one in this container's RAM is what
+    the old f.read() version did. Unlike every other verb call here, this
+    can't go through _run_verb (that helper runs in text mode; a bundle's
+    bytes are binary), so it builds its own subprocess call the same way
+    download_plugin_logs_zip/download_techsupport_bundle do for the
+    opposite (EM-to-browser) direction.
     """
     if not UPLOAD_FILENAME_RE.match(filename or ""):
         raise ForescoutClientError("Bundle filename must end in .tgz or .tar.gz (letters/digits/./-/_ only).")
-    if len(data) > MAX_UPLOAD_BYTES:
-        raise ForescoutClientError(f"Bundle is over the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB upload limit.")
     if not os.path.isfile(SSH_KEY_PATH):
         raise ForescoutClientError(
             f"SSH key not found at {SSH_KEY_PATH} -- the container's key volume isn't mounted correctly."
@@ -731,18 +733,38 @@ def upload_bundle(filename, data, timeout=900):
         "-o", "ConnectTimeout=10", "-i", SSH_KEY_PATH, f"root@{EM_HOST}", f"bundleupload {filename}",
     ]
     try:
-        p = subprocess.run(cmd, input=data, capture_output=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        raise ForescoutClientError(f"Upload to the EM timed out after {timeout}s.")
+        proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     except FileNotFoundError:
         raise ForescoutClientError("ssh is not available in this container.")
-    if not p.stdout.strip():
-        detail = p.stderr.decode(errors="replace").strip() or f"exit code {p.returncode}"
+    sent = 0
+    try:
+        while True:
+            block = stream.read(1024 * 1024)
+            if not block:
+                break
+            sent += len(block)
+            if sent > MAX_UPLOAD_BYTES:
+                proc.kill()
+                proc.communicate()
+                raise ForescoutClientError(f"Bundle is over the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB upload limit.")
+            proc.stdin.write(block)
+        proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass  # the EM side hung up early -- its own error (stdout/stderr below) says why
+    try:
+        stdout = proc.stdout.read()
+        stderr = proc.stderr.read()
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        raise ForescoutClientError(f"Upload to the EM timed out after {timeout}s.")
+    if not stdout.strip():
+        detail = stderr.decode(errors="replace").strip() or f"exit code {proc.returncode}"
         raise ForescoutClientError(f"No response from the EM ({detail}).")
     try:
-        result = json.loads(p.stdout)
+        result = json.loads(stdout)
     except json.JSONDecodeError:
-        raise ForescoutClientError(f"Unexpected (non-JSON) response from the EM: {p.stdout[:300]}")
+        raise ForescoutClientError(f"Unexpected (non-JSON) response from the EM: {stdout[:300]}")
     if "error" in result:
         raise ForescoutClientError(result["error"])
     return result
@@ -752,6 +774,33 @@ def delete_uploaded_bundle(path, timeout=30):
     if not UPLOAD_PATH_RE.match(path or ""):
         raise ForescoutClientError(f"'{path}' is not a recognized uploaded bundle path.")
     return _run_verb(f"bundleuploadcleanup {path}", timeout=timeout)
+
+
+def list_uploaded_bundles(timeout=20):
+    return _run_verb("bundleuploadlist", timeout=timeout)
+
+
+MAX_CORRELATE_BUNDLES = 8
+
+
+def correlate_bundles(paths, gap=150, context=120, top_n=10, timeout=3700):
+    """
+    Runs bundle-correlate.py on the EM over 1-8 bundles together (an EM
+    bundle plus its appliance bundle(s)) -- see webapp-query.py's
+    do_bundlecorrelate. Same three accepted path shapes as
+    analyze_admission. Returns {"bundles": [identity...], "output": text}.
+    The caller runs this in a background thread and polls.
+    """
+    paths = list(paths or [])
+    if not 1 <= len(paths) <= MAX_CORRELATE_BUNDLES or len(set(paths)) != len(paths):
+        raise ForescoutClientError(f"Select 1 to {MAX_CORRELATE_BUNDLES} different bundles.")
+    for path in paths:
+        if not (BUNDLE_PATH_RE.match(path) or UPLOAD_PATH_RE.match(path) or MANUAL_STAGING_PATH_RE.match(path)):
+            raise ForescoutClientError(f"'{path}' is not a recognized tech-support bundle path.")
+    for name, value, top in (("gap", gap, 99999), ("context", context, 99999), ("top_n", top_n, 999)):
+        if not (isinstance(value, int) and 1 <= value <= top):
+            raise ForescoutClientError(f"'{name}' must be a positive number.")
+    return _run_verb(f"bundlecorrelate {','.join(paths)} {gap} {context} {top_n}", timeout=timeout)
 
 
 def last_checked(ip, timeout=20):

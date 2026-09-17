@@ -44,4 +44,6 @@ Leaves `./data`, `./keys`, and `./certs` in place by default (so a later re-`Dep
 - `Deploy.sh` / `Remove.sh` — install/uninstall scripts.
 - `image.tar` — the pre-built Docker image (`docker load`'d by `Deploy.sh`, nothing built at install time).
 - `webapp-query.py` — the SSH forced-command wrapper Deploy.sh installs onto the EM's host OS.
+- `high-admission-trace.sh` — admission analysis (Live Analyze tab, bundle Analyze buttons); installed next to the wrapper.
+- `bundle-correlate.py` — multi-bundle offline correlation (Upload & Review Bundle tab's Correlate: an EM bundle plus its appliance bundle(s), clocks aligned, EM-to-appliance disconnect timeline, error/performance sweep); installed next to the wrapper, runs on the EM's own python3.
 - `keys/`, `certs/`, `data/` — created by `Deploy.sh` on first install; not shipped in the package.

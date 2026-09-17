@@ -236,7 +236,17 @@ Verbs (see the plan this was built from, forescout-lookup):
                             deletes one uploaded bundle -- same
                             reasoning as techsupportcleanup, scoped to
                             the uploads directory only
-    getadmincidr            no args -- the source CIDR currently allowed
+    bundleuploadlist        no args -- every bundle currently in the
+                            uploads directory (name, size, mtime)
+    bundlecorrelate <path>[,<path>...] <gap_s> <context_s> <top_n>
+                            runs bundle-correlate.py over 1-8 bundles
+                            together (EM + appliance): clock alignment,
+                            EM<->appliance disconnect timeline from both
+                            sides' Trace_cu, then an error/performance
+                            sweep of every log. Same path whitelist as
+                            analyzeadm; streams the archives, never
+                            unpacks to disk
+    getadmincidr           no args -- the source CIDR currently allowed
                             through this EM's firewall to the app's own
                             HTTPS port (from admin_cidr.state, written by
                             this same verb and by Deploy.sh)
@@ -275,7 +285,7 @@ IP_RE = rf"{IP_OCTET}(?:\.{IP_OCTET}){{3}}"
 # IP or, on some deployments, by DNS hostname -- the EM's own reg table
 # (get_node_map) can hold either. Confirmed live 2026-09-14: every
 # target-taking verb's dispatch pattern below required IP_RE, rejecting
-# a real, working hostname target (e.g. farncaapp1.yubique.com) before
+# a real, working hostname target (e.g. appliance1.example.com) before
 # resolve_target ever got a chance to match it against the reg table's
 # own (hostname-shaped) address value -- not a DNS problem, this
 # dispatcher's own shape check was just IP-only. Distinct from IP_RE,
@@ -527,7 +537,7 @@ def get_assigned_to(ip):
     # same bug class as APPLIANCE_ONLINE_RE and ssh_appliance's own DNS-resolution fix
     # (2026-08-28), but more fundamental: this is the very first step of nearly every
     # lookup/history/matched/rawfields call, so on a DNS-named-appliance environment
-    # (confirmed live, HSC Belfast) this alone would return (None, None) -- "couldn't
+    # (confirmed live in a customer environment) this alone would return (None, None) -- "couldn't
     # determine" -- for every single host, before ssh_appliance ever gets a chance to
     # resolve anything. Now matches a hostname or an IP either way.
     m = re.search(r"assigned-to,\s*(?:this\s*)?\(?IP:\s*([^\s),]+)", text)
@@ -1076,7 +1086,7 @@ def _do_lookup_inner(ip):
     result = {
         "ip": ip,
         "mac": get_field(fields, "mac"),
-        # Raw source (e.g. "snow@8565155208648015208 []") kept alongside its
+        # Raw source (e.g. "snow@<node id> []") kept alongside its
         # decoded appliance, same convention as arp_list/policy_history/
         # rawfields -- David's ask: show the MAC's source the same way the
         # ARP decode table already shows its appliance/arp_source.
@@ -1249,7 +1259,7 @@ def get_enabled_plugins(mode, appliance):
             enabled[name] = val.strip().lower() == "true"
     # Logged unconditionally, not just on slow/failed calls -- confirmed live
     # 2026-09-11 that this exact call is what silently took ~11.5s on two
-    # appliances (172.16.1.129/.130) versus ~1.5s everywhere else, with
+    # appliances versus ~1.5s everywhere else, with
     # nothing anywhere surfacing that it had happened.
     _log_lookup(f"get_enabled_plugins({key}): rc={rc} elapsed={time.time()-t0:.2f}s count={len(enabled)}"
                 + (f" err={err.strip()[:200]!r}" if rc != 0 else ""))
@@ -1326,7 +1336,7 @@ def get_all_targets():
     appliance the EM's own reg table knows about (same source
     do_appliances uses), restricted to ones that actually answer `fstool
     oneach` so a genuinely dead appliance never stalls a lookup on a
-    timeout. This lab's 172.16.1.129/.130 were originally assumed dead
+    timeout. Two lab appliances were originally assumed dead
     when this was written -- confirmed live 2026-09-11 they actually DO
     answer `fstool oneach` (and plain SSH) now, so they pass this filter
     and get queried like any other appliance; they turned out to be slow
@@ -1354,7 +1364,7 @@ def _parallel_target_map(targets, fn):
     one at a time -- same technique already used by do_techsupportcollect's
     _build_one bundling (subprocess.run releases the GIL while the child
     process runs, so a plain thread per target genuinely overlaps wall-clock
-    time). Added 2026-09-11: 172.16.1.129/172.16.1.130 -- previously assumed
+    time). Added 2026-09-11: two lab appliances -- previously assumed
     dead and filtered out by get_all_targets's online check -- now answer
     that check (both plain SSH and `fstool oneach`), but `fstool plugin ...
     list` takes ~11.5s on each of them versus ~1.5s on every other box.
@@ -2078,13 +2088,13 @@ UPLOAD_FILENAME_RE = re.compile(r"^[A-Za-z0-9_.\-]{1,120}\.(?:tgz|tar\.gz)$")
 UPLOAD_PATH_RE = re.compile(rf"^{re.escape(UPLOAD_DIR)}/{UPLOAD_FILENAME_RE.pattern[1:-1]}$")
 
 # A third accepted source: real customer bundles staged by hand directly
-# on this EM (David's own established workflow -- scp'd or copied in for
+# on this EM (an established support workflow -- scp'd or copied in for
 # offline/deep-dive analysis, not built or uploaded through this app at
 # all). Named for this site's own convention, not hardcoded to any one
 # customer's data inside it -- a fixed directory is what keeps this from
 # being a general arbitrary-file-read primitive off the back of a
 # crafted "path" form value, same reasoning as every whitelist here.
-MANUAL_STAGING_DIR = "/root/scripts/LSEG"
+MANUAL_STAGING_DIR = "/root/scripts/staged-bundles"
 MANUAL_STAGING_PATH_RE = re.compile(rf"^{re.escape(MANUAL_STAGING_DIR)}/{UPLOAD_FILENAME_RE.pattern[1:-1]}$")
 
 
@@ -2113,10 +2123,38 @@ def do_bundle_upload(filename):
         fail(f"'{filename}' is not a valid bundle filename.")
     os.makedirs(UPLOAD_DIR, exist_ok=True)
     path = os.path.join(UPLOAD_DIR, filename)
-    data = sys.stdin.buffer.read()
-    with open(path, "wb") as f:
-        f.write(data)
-    print(json.dumps({"path": path, "size": len(data)}))
+    # Copied through in 1MB pieces, never held whole -- several 800MB
+    # bundles can now be uploaded back to back for a correlate run, and
+    # this EM has already fallen over once from memory pressure. Written
+    # to a .part name first so a half-finished upload is never mistaken
+    # for a bundle by bundleuploadlist/bundlecorrelate.
+    size = 0
+    part = path + ".part"
+    with open(part, "wb") as f:
+        while True:
+            block = sys.stdin.buffer.read(1024 * 1024)
+            if not block:
+                break
+            f.write(block)
+            size += len(block)
+    if size == 0:
+        os.remove(part)
+        fail("No data received for the upload.")
+    os.replace(part, path)
+    print(json.dumps({"path": path, "size": size}))
+
+
+def do_bundle_upload_list():
+    """Every bundle currently sitting in UPLOAD_DIR -- the Upload & Review tab lists these so bundles
+    uploaded earlier (or in another browser session) can still be picked for a correlate run."""
+    bundles = []
+    if os.path.isdir(UPLOAD_DIR):
+        for name in sorted(os.listdir(UPLOAD_DIR)):
+            path = os.path.join(UPLOAD_DIR, name)
+            if UPLOAD_PATH_RE.match(path) and os.path.isfile(path):
+                st = os.stat(path)
+                bundles.append({"path": path, "name": name, "size": st.st_size, "mtime": int(st.st_mtime)})
+    print(json.dumps({"bundles": bundles}))
 
 
 def do_bundle_upload_cleanup(path):
@@ -3147,7 +3185,7 @@ def do_matched(ip, window_str):
 
 def resolve_source_appliance(source, node_map):
     """
-    source looks like "dhclass@8565155208648015208 [dhclass]" or "sw@... [sw]"
+    source looks like "dhclass@<node id> [dhclass]" or "sw@... [sw]"
     -- the plugin short-name, an "@" node ID, and the plugin name again in
     brackets. Extracts the node ID and resolves it to the appliance IP via
     the same reg-table node_map used for arp_list -- David's ask: never
@@ -3224,7 +3262,7 @@ def do_arplist(ip):
 
 
 # Was IP-only (r"^([\d.]+): Done in") -- real bug found live, 2026-08-28, on a customer
-# environment (HSC Belfast) whose appliances are registered by DNS name, not IP: `fstool
+# environment whose appliances are registered by DNS name, not IP: `fstool
 # oneach` echoes back whatever identifier it targeted (a hostname like "belfscout01" there,
 # not an IP), so the old pattern silently matched none of them -- every DNS-named appliance
 # showed "offline" in the Appliances tab even though `fstool oneach` reached it fine, and
@@ -3243,7 +3281,7 @@ def do_appliances():
     appliances from `fstool oneach -c -t 10 echo ok` -- confirmed live:
     a reachable appliance reports "<ip>: Done in Ns", an unreachable one
     reports "<ip>: Timeout" then "<ip>: Skipped." (this environment
-    genuinely has two of the latter, 172.16.1.129/.130 -- confirmed not
+    genuinely has two of the latter -- confirmed not
     a bug, they just don't respond). `oneach` only ever targets the
     managed appliances, never the EM itself, so the EM is listed
     separately and always reported online -- if this code is running,
@@ -3330,7 +3368,7 @@ def do_analyzeadm(target, bundle_path, window, switch_filter, top_n, spike_n, st
     args += ["-n", str(top_n), "-s", str(spike_n), "-a", str(stale_days)]
 
     # A real bundle analysis (unpack + every awk pass) measured ~110s
-    # against a real 867MB LSEG bundle -- 1200s leaves generous headroom
+    # against a real 867MB customer bundle -- 1200s leaves generous headroom
     # for a much bigger one; app.py's caller runs this in a background
     # thread and polls, never blocking a request on it, same pattern as
     # run_show_errors/tech-support builds.
@@ -3343,6 +3381,48 @@ def do_analyzeadm(target, bundle_path, window, switch_filter, top_n, spike_n, st
     if rc != 0:
         fail((err or out or f"analyze exited {rc}").strip()[-4000:])
     print(json.dumps({"target": target, "bundle": bundle_path, "output": out}))
+
+
+CORRELATE_SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bundle-correlate.py")
+MAX_CORRELATE_BUNDLES = 8
+
+
+def do_bundlecorrelate(paths, gap, context, top_n):
+    """
+    Upload & Review Bundle tab's "Correlate" -- David's ask, 2026-09-17:
+    analyse several tech-support bundles together offline (an EM bundle
+    plus its appliance bundle(s)), clocks aligned, to pull out what ties
+    the systems together -- first target, an appliance that keeps
+    dropping off its EM. bundle-correlate.py does the work; it streams
+    each archive once and never unpacks to disk, so unlike analyzeadm
+    there is no /tmp extraction to clean up. Runs on this EM only (the
+    bundles live here), so it is executed as a file, not piped to a
+    managed appliance the way high-admission-trace.sh is. Same three-source
+    path whitelist as analyzeadm.
+    """
+    if not os.path.isfile(CORRELATE_SCRIPT_PATH):
+        fail(f"{CORRELATE_SCRIPT_PATH} not found on this EM -- redeploy this app to install it.")
+    if not 1 <= len(paths) <= MAX_CORRELATE_BUNDLES or len(set(paths)) != len(paths):
+        fail(f"Give 1 to {MAX_CORRELATE_BUNDLES} different bundles.")
+    for path in paths:
+        if not _is_safe_analyze_bundle_path(path):
+            fail(f"'{path}' is not a known tech-support bundle path.")
+        if not os.path.isfile(path):
+            fail(f"'{path}' does not exist on this EM.")
+    # Measured: ~25s for a 145MB EM+appliance pair of trace/stats data;
+    # 3600s leaves room for several full-size customer bundles. app.py's
+    # caller runs this in a background thread and polls.
+    out, err, rc = run(
+        [sys.executable, CORRELATE_SCRIPT_PATH, "--json", "-g", str(gap), "-c", str(context), "-n", str(top_n), *paths],
+        timeout=3600,
+    )
+    if rc != 0:
+        fail((err or out or f"bundle-correlate exited {rc}").strip()[-4000:])
+    try:
+        result = json.loads(out)
+    except json.JSONDecodeError:
+        fail(f"bundle-correlate returned something unexpected: {out[:300]}")
+    print(json.dumps(result))
 
 
 PLUGIN_NAME_ONLY_RE = r"[a-z][a-z0-9_]{1,40}"
@@ -3613,6 +3693,19 @@ def main():
     if m:
         return do_bundle_upload_cleanup(m.group(1))
 
+    if original.strip() == "bundleuploadlist":
+        return do_bundle_upload_list()
+
+    _any_bundle = (
+        rf"(?:/shared/shared/case/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+|"
+        rf"{UPLOAD_PATH_RE.pattern[1:-1]}|{MANUAL_STAGING_PATH_RE.pattern[1:-1]})"
+    )
+    m = re.fullmatch(
+        rf"bundlecorrelate ({_any_bundle}(?:,{_any_bundle})*) (\d{{1,5}}) (\d{{1,5}}) (\d{{1,3}})", original.strip(),
+    )
+    if m:
+        return do_bundlecorrelate(m.group(1).split(","), int(m.group(2)), int(m.group(3)), int(m.group(4)))
+
     if original.strip() == "techsupportlogtail":
         return do_techsupport_log_tail()
 
@@ -3749,7 +3842,8 @@ def main():
         "pluginlist <target> | "
         "analyzeadm <target> <bundle|-> <window> <switch_filter|-> <top_n> <spike_n> <stale_days> | "
         "pluginlogszip <target> <plugin,...> <start>:<end> | "
-        "bundleupload <filename> | bundleuploadcleanup <path> | "
+        "bundleupload <filename> | bundleuploadcleanup <path> | bundleuploadlist | "
+        "bundlecorrelate <path>[,<path>...] <gap_s> <context_s> <top_n> | "
         "getadmincidr | setadmincidr <cidr>)",
         code=2,
     )

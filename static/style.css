@@ -118,7 +118,7 @@ th { color: var(--muted); font-weight: 600; white-space: nowrap; }
    Root cause: the default table-layout:auto sizes every column to its
    widest cell across ALL rows -- confirmed live a real host's 2229 raw
    fields include long unbroken values (IPv6 addresses, long service
-   names, "source" strings like "va@8565155208648015208 [va]"), which
+   names, "source" strings like "va@<node id> [va]"), which
    pushed the table wider than the printable page, past where Appliance/
    Time could still fit. Fixed sizing (percentages reflect real content:
    Time is a fixed-format timestamp, Appliance a bounded hostname/IP,
@@ -173,6 +173,8 @@ table.params td { word-break: break-all; max-width: 380px; }
     padding: 0.75rem; border-radius: 6px; font-family: inherit; max-height: 32rem; overflow-y: auto;
     margin-top: 0.5rem;
 }
+/* Upload & Review reports are column-aligned tables -- need a fixed-width face and more room */
+.analyze-output-mono { font-family: Consolas, "Cascadia Mono", "Courier New", monospace; font-size: 0.78rem; max-height: 70vh; white-space: pre; overflow-x: auto; }
 .analyze-disabled-link { pointer-events: none; opacity: 0.4; }
 .analyze-progress { margin-top: 0.5rem; }
 .analyze-steps { margin: 0.4rem 0 0.4rem 1.2rem; padding: 0; }

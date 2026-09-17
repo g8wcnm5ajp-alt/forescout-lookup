@@ -56,6 +56,11 @@ BUNDLED_WEBAPP_QUERY="${DIR}/webapp-query.py"
 # up a newer version, no per-appliance deployment needed.
 HAT_SCRIPT="/root/scripts/webapp-query/high-admission-trace.sh"
 BUNDLED_HAT_SCRIPT="${DIR}/high-admission-trace.sh"
+# bundle-correlate.py (Upload & Review Bundle tab's multi-bundle Correlate)
+# -- webapp-query.py's bundlecorrelate verb runs this sibling file on this
+# EM's own python3. Same arrangement: redeploying the file is the upgrade.
+CORRELATE_SCRIPT="/root/scripts/webapp-query/bundle-correlate.py"
+BUNDLED_CORRELATE_SCRIPT="${DIR}/bundle-correlate.py"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "Must be run as root." >&2
@@ -96,6 +101,10 @@ if [ ! -f "$BUNDLED_HAT_SCRIPT" ]; then
     echo "Error: ${BUNDLED_HAT_SCRIPT} not found -- run this from inside the unpacked package." >&2
     exit 1
 fi
+if [ ! -f "$BUNDLED_CORRELATE_SCRIPT" ]; then
+    echo "Error: ${BUNDLED_CORRELATE_SCRIPT} not found -- run this from inside the unpacked package." >&2
+    exit 1
+fi
 
 echo "=== 1. SSH key for this app's own EM->appliance/EM calls ==="
 mkdir -p "$(dirname "$WEBAPP_QUERY_WRAPPER")"
@@ -103,8 +112,11 @@ cp "$BUNDLED_WEBAPP_QUERY" "$WEBAPP_QUERY_WRAPPER"
 chmod 755 "$WEBAPP_QUERY_WRAPPER"
 cp "$BUNDLED_HAT_SCRIPT" "$HAT_SCRIPT"
 chmod 755 "$HAT_SCRIPT"
+cp "$BUNDLED_CORRELATE_SCRIPT" "$CORRELATE_SCRIPT"
+chmod 755 "$CORRELATE_SCRIPT"
 echo "Installed webapp-query.py at $WEBAPP_QUERY_WRAPPER"
 echo "Installed high-admission-trace.sh at $HAT_SCRIPT"
+echo "Installed bundle-correlate.py at $CORRELATE_SCRIPT"
 
 mkdir -p "$KEY_DIR"
 if [ ! -f "$KEY_FILE" ]; then

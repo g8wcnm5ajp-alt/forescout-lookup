@@ -24,9 +24,9 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from forescout_client import (
     CASE_REF_RE, COMPANY_NAME_RE, LEVEL_RE, ForescoutClientError, analyze_admission, arp_list,
     build_techsupport_em, build_techsupport_window_appliance, clear_lookup_debug_log, clear_techsupport_log,
-    collect_techsupport, debug_set_appliance, delete_techsupport_bundle, delete_uploaded_bundle,
+    collect_techsupport, correlate_bundles, debug_set_appliance, delete_techsupport_bundle, delete_uploaded_bundle,
     download_plugin_logs_zip, download_techsupport_bundle, get_admin_cidr, last_checked, list_appliances,
-    list_plugins, lookup, matched_rules, policy_history, policy_tree, preview_techsupport,
+    list_plugins, list_uploaded_bundles, lookup, matched_rules, policy_history, policy_tree, preview_techsupport,
     preview_techsupport_em, raw_fields, run_show_errors, set_admin_cidr, tail_lookup_debug_log,
     tail_techsupport_log, trace_defaults, trace_list, trace_set, upload_bundle, valid_cidr, valid_ip,
     valid_target,
@@ -45,7 +45,7 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.2.11"
+APP_VERSION = "1.4.0"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
@@ -839,6 +839,39 @@ def start_analyze_run(target, bundle_path, window, switch_filter, top_n, spike_n
                 target, bundle_path=bundle_path, window=window, switch_filter=switch_filter,
                 top_n=top_n, spike_n=spike_n, stale_days=stale_days,
             )
+            _update_analyze_run(run_id, status="complete", finished_at=int(time.time()), result=result)
+        except ForescoutClientError as e:
+            _update_analyze_run(run_id, status="failed", finished_at=int(time.time()), error=str(e))
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return run_id
+
+
+def start_correlate_run(paths, gap, context, top_n):
+    """
+    Upload & Review Bundle tab's Correlate -- several bundles analysed
+    together by bundle-correlate.py on the EM. Rides the same
+    analyze_runs.json tracking and /api/analyze_run/<id> polling as a
+    single-bundle analyze; "kind" tells the progress UI which step list to
+    show. The duplicate-run guard keys on the sorted path set, so the same
+    selection can't be started twice while it's still running.
+    """
+    key = "correlate:" + ",".join(sorted(paths))
+    run_id = f"{int(time.time() * 1000)}-{os.urandom(3).hex()}"
+    with _analyze_runs_lock:
+        runs = _load_analyze_runs()
+        if any(r["key"] == key and r["status"] == "running" for r in runs):
+            return None
+        runs.append({
+            "id": run_id, "key": key, "kind": "correlate", "target": BUNDLE_ANALYZE_PLACEHOLDER_TARGET,
+            "bundle": ", ".join(os.path.basename(p) for p in paths), "status": "running",
+            "started_at": int(time.time()), "finished_at": None, "result": None, "error": None,
+        })
+        _save_analyze_runs(runs)
+
+    def _worker():
+        try:
+            result = correlate_bundles(paths, gap=gap, context=context, top_n=top_n)
             _update_analyze_run(run_id, status="complete", finished_at=int(time.time()), result=result)
         except ForescoutClientError as e:
             _update_analyze_run(run_id, status="failed", finished_at=int(time.time()), error=str(e))
@@ -2393,18 +2426,64 @@ def bundle_upload_route():
     # basename only -- strips any path component a crafted filename might
     # carry, before it ever reaches upload_bundle's own shape check.
     filename = os.path.basename(f.filename)
-    data = f.read()
     try:
-        result = upload_bundle(filename, data)
+        # f.stream, not f.read() -- werkzeug has already spooled the upload
+        # to disk; it goes on to the EM in 1MB pieces instead of being
+        # pulled whole into this container's RAM (see upload_bundle).
+        result = upload_bundle(filename, f.stream)
     except ForescoutClientError as e:
         return jsonify({"error": str(e)}), 400
     _log_activity(
         "bundle_uploaded", username=session.get("username"), filename=filename, size=result.get("size"),
     )
+    # analyze=0: the multi-bundle flow uploads first and picks what to
+    # run afterwards (Correlate, or a per-bundle admission analyze).
+    if request.form.get("analyze", "1") == "0":
+        return jsonify({"path": result["path"], "size": result.get("size")})
     run_id = start_analyze_run(BUNDLE_ANALYZE_PLACEHOLDER_TARGET, result["path"], "1h", None, 10, 5, 7)
     if run_id is None:
         return jsonify({"error": "An analysis is already running for this bundle."}), 409
     return jsonify({"path": result["path"], "size": result.get("size"), "run_id": run_id})
+
+
+@app.route("/bundle/uploads", methods=["GET"])
+def bundle_uploads_route():
+    """Bundles currently sitting in the EM's uploads directory -- the Upload & Review tab's list."""
+    try:
+        return jsonify(list_uploaded_bundles())
+    except ForescoutClientError as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/bundle/correlate", methods=["POST"])
+def bundle_correlate_route():
+    """
+    Upload & Review Bundle tab -- David's ask, 2026-09-17: analyse several
+    tech-support bundles together offline (an EM bundle plus its appliance
+    bundle(s)) to pull out what ties the systems together, first target
+    being an appliance that keeps disconnecting from its EM. Starts a
+    background run; the tab polls /api/analyze_run/<id> like every other
+    analyze.
+    """
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    paths = [p for p in request.form.getlist("path") if p]
+    if not paths:
+        return jsonify({"error": "Tick at least one bundle."}), 400
+    try:
+        gap = int(request.form.get("gap", "150") or 150)
+        context = int(request.form.get("context", "120") or 120)
+        top_n = int(request.form.get("top_n", "10") or 10)
+    except ValueError:
+        return jsonify({"error": "Gap, context and rows must be numbers."}), 400
+    _log_activity(
+        "bundle_correlate", username=session.get("username"), bundles=[os.path.basename(p) for p in paths],
+        gap=gap, context=context, top_n=top_n,
+    )
+    run_id = start_correlate_run(paths, gap, context, top_n)
+    if run_id is None:
+        return jsonify({"error": "A correlate run is already going for this selection."}), 409
+    return jsonify({"run_id": run_id})
 
 
 @app.route("/bundle/upload/cleanup", methods=["POST"])

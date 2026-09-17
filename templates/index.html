@@ -480,18 +480,43 @@
         <section class="page-tab-panel page-tab-panel-hidden" data-page-tab-panel="upload">
         <div class="card no-print">
             <h3>Upload &amp; Review Bundle</h3>
-            <p class="hint">Review a tech-support bundle this app never built itself -- a customer's own
-                <code>.tgz</code>/<code>.tar.gz</code>, sent in some other way. Uploaded straight to this EM,
-                then run through the same admission-analysis as the Tech Support tab's own Analyze button.</p>
+            <p class="hint">Review tech-support bundles this app never built itself -- a customer's own
+                <code>.tgz</code>/<code>.tar.gz</code>, sent in some other way. Pick one or several (an EM bundle
+                plus its appliance bundle(s) from the same incident); they are uploaded straight to this EM.
+                Then tick the ones that belong together and <strong>Correlate</strong>: clocks are lined up,
+                the EM&harr;appliance disconnect timeline is rebuilt from both sides' Trace logs, and every log,
+                stats and database-info file is swept for performance problems and system errors. The report
+                opens with ranked <strong>Findings</strong> -- runaway processes and JVM heap starvation, plugin
+                queue backlogs with when they started and what cleared them, hosts brought back online after a
+                switch link-down trap (and by which plugin on which appliance), plugins re-asserting online state,
+                learn-event forwarding loops, clock steps, tracing that was started too late. Works on a single
+                bundle too. Nothing is unpacked to disk. <strong>Analyze admissions</strong> on a single bundle is the same
+                admission analysis as the Tech Support tab's own Analyze button.</p>
             <div class="tree-filter-row">
-                <input type="file" id="upload-bundle-file" accept=".tgz,.tar.gz">
-                <button type="button" id="upload-bundle-btn">Upload &amp; Analyze</button>
+                <input type="file" id="upload-bundle-file" accept=".tgz,.tar.gz" multiple>
+                <button type="button" id="upload-bundle-btn">Upload</button>
             </div>
             <div class="hint" id="upload-bundle-status"></div>
-            <pre id="upload-bundle-output" class="analyze-output" style="display:none;"></pre>
-            <div id="upload-bundle-cleanup-wrap" style="display:none;">
-                <button type="button" id="upload-bundle-cleanup-btn" class="btn-small btn-secondary">Clean up (delete off the EM)</button>
+
+            <table id="upload-bundle-table" style="display:none; margin-top:0.75rem;">
+                <thead><tr>
+                    <th style="width:2rem;"><input type="checkbox" id="upload-bundle-all" title="Tick / untick all"></th>
+                    <th>Bundle on the EM</th><th>Size</th><th>Uploaded (UTC)</th><th>Role / node ID</th><th></th>
+                </tr></thead>
+                <tbody id="upload-bundle-rows"></tbody>
+            </table>
+
+            <div class="tree-filter-row" id="upload-correlate-controls" style="display:none; margin-top:0.75rem;">
+                <label>Gap &ge; <input type="number" id="correlate-gap" value="150" min="30" max="86400" style="width:5rem;"> s</label>
+                <label>Context &plusmn; <input type="number" id="correlate-context" value="120" min="10" max="3600" style="width:5rem;"> s</label>
+                <label>Rows <input type="number" id="correlate-top" value="10" min="1" max="200" style="width:4rem;"></label>
+                <button type="button" id="upload-correlate-btn">Correlate ticked bundles</button>
             </div>
+            <div class="hint" id="upload-run-status"></div>
+            <div id="upload-output-tools" style="display:none; margin:0.5rem 0;">
+                <a href="#" id="upload-output-download" class="btn-small btn-secondary">Download report (.txt)</a>
+            </div>
+            <pre id="upload-bundle-output" class="analyze-output analyze-output-mono" style="display:none;"></pre>
         </div>
         </section>
 
@@ -2137,7 +2162,14 @@
             // precise ETA or per-step state we don't have.
             window.renderAnalyzeProgress = function (d) {
                 const elapsed = Math.max(0, Math.round((Date.now() - d.started_at * 1000) / 1000));
-                const steps = d.bundle
+                const steps = d.kind === "correlate"
+                    ? ["Stream each bundle once (nothing is unpacked to disk): " + d.bundle,
+                       "Identify each bundle (EM / appliance, node ID) and line the clocks up",
+                       "Rebuild the EM-to-appliance disconnect timeline from both sides' Trace_cu logs",
+                       "Per-process CPU, JVM heap, thread dumps and plugin queues from today.log and the jstack samples",
+                       "Host online state: link-down traps, learn events, attached hostinfo dumps",
+                       "Sweep every other log for error and performance signatures"]
+                    : d.bundle
                     ? ["Unpack the bundle", "Admission source breakdown (today.log)",
                        "Peak-window write-activity outliers", "Switch/port/MAC ranking (sw_mac_track.log, if present)",
                        "Repeated re-admission + switch poll-cycle checks (sw.log, if present)"]
@@ -2210,91 +2242,216 @@
     </script>
 
     <script>
-        // Upload & Review Bundle tab -- uploads straight to the EM, then
-        // runs the same background analyze-run + poll as the Tech Support
-        // tab's own Analyze button (see /bundle/upload, /api/analyze_run).
+        // Upload & Review Bundle tab -- one or several bundles are uploaded
+        // straight to the EM (sequentially, /bundle/upload with analyze=0),
+        // listed from /bundle/uploads, then either correlated together
+        // (/bundle/correlate -> bundle-correlate.py on the EM) or run one at a
+        // time through the same admission analyze as the Tech Support tab's own
+        // Analyze button. Both ride the shared /api/analyze_run/<id> poller.
         (function () {
             const fileInput = document.getElementById("upload-bundle-file");
             const uploadBtn = document.getElementById("upload-bundle-btn");
             const statusEl = document.getElementById("upload-bundle-status");
+            const runStatusEl = document.getElementById("upload-run-status");
             const outputEl = document.getElementById("upload-bundle-output");
-            const cleanupWrap = document.getElementById("upload-bundle-cleanup-wrap");
-            const cleanupBtn = document.getElementById("upload-bundle-cleanup-btn");
+            const tableEl = document.getElementById("upload-bundle-table");
+            const rowsEl = document.getElementById("upload-bundle-rows");
+            const allBox = document.getElementById("upload-bundle-all");
+            const controlsEl = document.getElementById("upload-correlate-controls");
+            const correlateBtn = document.getElementById("upload-correlate-btn");
+            const toolsEl = document.getElementById("upload-output-tools");
+            const downloadLink = document.getElementById("upload-output-download");
             if (!fileInput) return; // panel not on this page
 
-            let uploadedPath = null;
+            const ticked = new Set();      // paths ticked for Correlate -- survives a list refresh
+            const identity = {};           // path -> {role, nodeid, version} learned from a finished correlate run
+            let busy = false;
+            let lastBundles = [];          // last list from the EM -- lets a finished run repaint the Role column at once
+            let lastReportName = "bundle-report.txt";
 
-            function pollUploadAnalyze(runId) {
+            function esc(s) {
+                return String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[c]));
+            }
+
+            function setBusy(state) {
+                busy = state;
+                correlateBtn.disabled = state;
+                rowsEl.querySelectorAll("button").forEach(b => { b.disabled = state; });
+            }
+
+            function renderRows(bundles) {
+                lastBundles = bundles;
+                const known = new Set(bundles.map(b => b.path));
+                Array.from(ticked).forEach(p => { if (!known.has(p)) ticked.delete(p); });
+                tableEl.style.display = bundles.length ? "" : "none";
+                controlsEl.style.display = bundles.length ? "" : "none";
+                rowsEl.innerHTML = bundles.map(b => {
+                    const id = identity[b.path];
+                    const who = id ? esc(id.role) + " " + esc(id.nodeid) + (id.version ? " (v" + esc(id.version) + ")" : "")
+                                   : "<span class=\"muted\">shown after a Correlate run</span>";
+                    const when = new Date(b.mtime * 1000).toISOString().replace("T", " ").slice(0, 16);
+                    return "<tr data-path=\"" + esc(b.path) + "\">" +
+                        "<td><input type=\"checkbox\" class=\"upload-bundle-tick\"" + (ticked.has(b.path) ? " checked" : "") + "></td>" +
+                        "<td><code>" + esc(b.name) + "</code></td>" +
+                        "<td>" + Math.max(1, Math.round(b.size / 1048576)) + " MB</td>" +
+                        "<td>" + when + "</td><td>" + who + "</td>" +
+                        "<td style=\"white-space:nowrap;\">" +
+                        "<button type=\"button\" class=\"btn-small btn-secondary upload-bundle-analyze\">Analyze admissions</button> " +
+                        "<button type=\"button\" class=\"btn-small btn-secondary upload-bundle-delete\">Delete</button></td></tr>";
+                }).join("");
+                allBox.checked = bundles.length > 0 && bundles.every(b => ticked.has(b.path));
+                if (busy) setBusy(true);
+            }
+
+            function refreshList() {
+                return fetch("/bundle/uploads")
+                    .then(r => r.json())
+                    .then(d => {
+                        if (d.error) { statusEl.textContent = "Could not list uploaded bundles: " + d.error; return; }
+                        renderRows(d.bundles || []);
+                    })
+                    .catch(err => { statusEl.textContent = "Could not list uploaded bundles: " + err; });
+            }
+
+            function showOutput(text, name) {
+                outputEl.style.display = "block";
+                outputEl.textContent = text || "(no output)";
+                toolsEl.style.display = "block";
+                lastReportName = name;
+            }
+
+            downloadLink.addEventListener("click", ev => {
+                ev.preventDefault();
+                const blob = new Blob([outputEl.textContent], { type: "text/plain" });
+                const a = document.createElement("a");
+                a.href = URL.createObjectURL(blob);
+                a.download = lastReportName;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+            });
+
+            function pollRun(runId, reportName) {
                 fetch("/api/analyze_run/" + runId)
                     .then(r => r.json())
                     .then(d => {
-                        if (d.error) { statusEl.textContent = "error: " + d.error; return; }
+                        if (d.error && !d.status) { runStatusEl.textContent = "error: " + d.error; setBusy(false); return; }
                         if (d.status === "running") {
-                            statusEl.innerHTML = window.renderAnalyzeProgress(d);
-                            setTimeout(() => pollUploadAnalyze(runId), 3000);
+                            runStatusEl.innerHTML = window.renderAnalyzeProgress(d);
+                            setTimeout(() => pollRun(runId, reportName), 3000);
                             return;
                         }
-                        uploadBtn.disabled = false;
-                        uploadBtn.textContent = "Upload & Analyze";
+                        setBusy(false);
                         if (d.status === "failed") {
-                            statusEl.textContent = "Analysis failed: " + (d.error || "unknown error");
+                            runStatusEl.textContent = "Failed: " + (d.error || "unknown error");
                             return;
                         }
-                        statusEl.textContent = "Done.";
-                        outputEl.style.display = "block";
-                        outputEl.textContent = (d.result && d.result.output) || "(no output)";
-                        cleanupWrap.style.display = "block";
+                        runStatusEl.textContent = "Done in " + Math.max(1, d.finished_at - d.started_at) + "s.";
+                        ((d.result && d.result.bundles) || []).forEach(b => { identity[b.path] = b; });
+                        showOutput(d.result && d.result.output, reportName);
+                        renderRows(lastBundles);
+                        refreshList();
                     })
-                    .catch(() => { setTimeout(() => pollUploadAnalyze(runId), 3000); });
+                    .catch(() => { setTimeout(() => pollRun(runId, reportName), 3000); });
             }
 
-            uploadBtn.addEventListener("click", () => {
-                const file = fileInput.files[0];
-                if (!file) { window.alert("Choose a bundle file first."); return; }
+            function startRun(url, formData, reportName) {
+                setBusy(true);
+                outputEl.style.display = "none";
+                toolsEl.style.display = "none";
+                runStatusEl.textContent = "Starting…";
+                fetch(url, { method: "POST", body: formData })
+                    .then(r => r.json())
+                    .then(d => {
+                        if (d.error) { setBusy(false); runStatusEl.textContent = "Failed to start: " + d.error; return; }
+                        pollRun(d.run_id, reportName);
+                    })
+                    .catch(err => { setBusy(false); runStatusEl.textContent = "Failed to start: " + err; });
+            }
+
+            // one file at a time -- each is hundreds of MB, and the EM end writes them serially anyway
+            function uploadNext(files, index, failures) {
+                if (index >= files.length) {
+                    uploadBtn.disabled = false;
+                    uploadBtn.textContent = "Upload";
+                    fileInput.value = "";
+                    statusEl.textContent = (files.length - failures.length) + " of " + files.length + " uploaded." +
+                        (failures.length ? " Failed: " + failures.join("; ") : "");
+                    refreshList();
+                    return;
+                }
+                const file = files[index];
+                statusEl.textContent = "Uploading " + (index + 1) + " of " + files.length + ": " + file.name +
+                    " (" + Math.round(file.size / 1048576) + "MB) to the EM…";
                 const formData = new FormData();
                 formData.set("csrf_token", CSRF_TOKEN);
+                formData.set("analyze", "0");
                 formData.set("bundle", file);
-                uploadBtn.disabled = true;
-                uploadBtn.textContent = "Uploading…";
-                statusEl.textContent = "Uploading " + file.name + " (" + Math.round(file.size / 1048576) + "MB) to the EM…";
-                outputEl.style.display = "none";
-                cleanupWrap.style.display = "none";
-                uploadedPath = null;
                 fetch("/bundle/upload", { method: "POST", body: formData })
                     .then(r => r.json())
                     .then(d => {
-                        if (d.error) {
-                            uploadBtn.disabled = false;
-                            uploadBtn.textContent = "Upload & Analyze";
-                            statusEl.textContent = "Failed: " + d.error;
-                            return;
-                        }
-                        uploadedPath = d.path;
-                        uploadBtn.textContent = "Analyzing…";
-                        statusEl.textContent = "Uploaded -- running analyze…";
-                        pollUploadAnalyze(d.run_id);
+                        if (d.error) failures.push(file.name + " -- " + d.error);
+                        else ticked.add(d.path);
+                        uploadNext(files, index + 1, failures);
                     })
-                    .catch(err => {
-                        uploadBtn.disabled = false;
-                        uploadBtn.textContent = "Upload & Analyze";
-                        statusEl.textContent = "Failed: " + err;
-                    });
+                    .catch(err => { failures.push(file.name + " -- " + err); uploadNext(files, index + 1, failures); });
+            }
+
+            uploadBtn.addEventListener("click", () => {
+                const files = Array.from(fileInput.files);
+                if (!files.length) { window.alert("Choose one or more bundle files first."); return; }
+                uploadBtn.disabled = true;
+                uploadBtn.textContent = "Uploading…";
+                uploadNext(files, 0, []);
             });
 
-            cleanupBtn.addEventListener("click", () => {
-                if (!uploadedPath) return;
-                if (!window.confirm("Delete this uploaded bundle off the EM? This cannot be undone.")) return;
-                cleanupBtn.disabled = true;
-                cleanupBtn.textContent = "Cleaning up…";
-                fetch("/bundle/upload/cleanup", { method: "POST", body: new URLSearchParams({ path: uploadedPath, csrf_token: CSRF_TOKEN }) })
-                    .then(r => r.json())
-                    .then(d => {
-                        if (d.error) { window.alert("Failed to clean up: " + d.error); cleanupBtn.disabled = false; cleanupBtn.textContent = "Clean up (delete off the EM)"; return; }
-                        cleanupWrap.innerHTML = "<span class=\"muted\">deleted</span>";
-                        uploadedPath = null;
-                    })
-                    .catch(err => { window.alert("Failed to clean up: " + err); cleanupBtn.disabled = false; cleanupBtn.textContent = "Clean up (delete off the EM)"; });
+            allBox.addEventListener("change", () => {
+                rowsEl.querySelectorAll("tr").forEach(tr => {
+                    if (allBox.checked) ticked.add(tr.dataset.path); else ticked.delete(tr.dataset.path);
+                    tr.querySelector(".upload-bundle-tick").checked = allBox.checked;
+                });
             });
+
+            rowsEl.addEventListener("change", ev => {
+                if (!ev.target.classList.contains("upload-bundle-tick")) return;
+                const path = ev.target.closest("tr").dataset.path;
+                if (ev.target.checked) ticked.add(path); else ticked.delete(path);
+            });
+
+            rowsEl.addEventListener("click", ev => {
+                const tr = ev.target.closest("tr");
+                if (!tr) return;
+                const path = tr.dataset.path;
+                const name = path.split("/").pop();
+                if (ev.target.classList.contains("upload-bundle-analyze")) {
+                    startRun("/techsupport/analyze", new URLSearchParams({ path: path, csrf_token: CSRF_TOKEN }),
+                        name.replace(/\.(tgz|tar\.gz)$/, "") + "-admissions.txt");
+                } else if (ev.target.classList.contains("upload-bundle-delete")) {
+                    if (!window.confirm("Delete " + name + " off the EM? This cannot be undone.")) return;
+                    fetch("/bundle/upload/cleanup", { method: "POST", body: new URLSearchParams({ path: path, csrf_token: CSRF_TOKEN }) })
+                        .then(r => r.json())
+                        .then(d => {
+                            if (d.error) { window.alert("Failed to delete: " + d.error); return; }
+                            ticked.delete(path);
+                            refreshList();
+                        })
+                        .catch(err => window.alert("Failed to delete: " + err));
+                }
+            });
+
+            correlateBtn.addEventListener("click", () => {
+                if (!ticked.size) { window.alert("Tick the bundles that belong together -- an EM bundle and its appliance bundle(s)."); return; }
+                const formData = new URLSearchParams();
+                formData.set("csrf_token", CSRF_TOKEN);
+                Array.from(ticked).forEach(p => formData.append("path", p));
+                formData.set("gap", document.getElementById("correlate-gap").value || "150");
+                formData.set("context", document.getElementById("correlate-context").value || "120");
+                formData.set("top_n", document.getElementById("correlate-top").value || "10");
+                startRun("/bundle/correlate", formData, "bundle-correlation-" + new Date().toISOString().slice(0, 16).replace(/[:T]/g, "") + ".txt");
+            });
+
+            refreshList();
         })();
     </script>
 
