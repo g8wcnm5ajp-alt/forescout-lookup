@@ -180,9 +180,19 @@ table.params td { word-break: break-all; max-width: 380px; }
 .roaming-graph { height: auto; max-height: 70vh; overflow: auto; }
 .roaming-svg text { fill: var(--text); }
 .roaming-table { width: 100%; margin-top: 0.5rem; }
+/* identity cross-check (2026-09-18): notes under the verdict, "Also known as", probable-match caveat */
+.location-notes { margin: 0.6rem 0 0 0; padding-left: 1.2rem; font-size: 0.85rem; color: var(--muted); }
+.location-notes li { margin-bottom: 0.25rem; }
+.alias-heading { margin: 0.9rem 0 0.2rem 0; font-size: 0.95rem; color: var(--accent); }
+.alias-heading .muted { display: block; font-size: 0.78rem; margin-top: 0.15rem; }
+.alias-scroll { overflow-x: auto; }
+.alias-table td, .alias-table th { white-space: nowrap; }
+.alias-current td { font-weight: 600; }
+.roaming-caveat { margin: 0.5rem 0 0 0; padding: 0.5rem 0.7rem; font-size: 0.85rem; border: 1px solid #e8a33d; border-radius: 6px; background: rgba(232, 163, 61, 0.1); }
+.roaming-warn { margin: 0.5rem 0 0 0; padding: 0.5rem 0.7rem; font-size: 0.85rem; border: 1px solid var(--err); border-radius: 6px; background: rgba(224, 95, 95, 0.12); color: var(--err); }
 .roaming-table th, .roaming-table td { font-size: 0.85rem; }
 /* IP Lookup cards are <details> now; keep the grid cards level with each other */
-details.ip-section { align-self: start; }
+details.ip-section { align-self: start; min-width: 0; }   /* min-width: 0 lets .alias-scroll clamp instead of the card growing */
 details.ip-section > summary { font-size: 1.05rem; }
 .analyze-progress { margin-top: 0.5rem; }
 .analyze-steps { margin: 0.4rem 0 0.4rem 1.2rem; padding: 0; }

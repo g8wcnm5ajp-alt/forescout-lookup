@@ -25,7 +25,7 @@ from forescout_client import (
     CASE_REF_RE, COMPANY_NAME_RE, LEVEL_RE, ForescoutClientError, analyze_admission, arp_list,
     build_techsupport_em, build_techsupport_window_appliance, clear_lookup_debug_log, clear_techsupport_log,
     bundle_roaming, collect_techsupport, correlate_bundles, debug_set_appliance, delete_techsupport_bundle, delete_uploaded_bundle,
-    download_plugin_logs_zip, download_techsupport_bundle, get_admin_cidr, last_checked, list_appliances,
+    download_plugin_logs_zip, download_techsupport_bundle, get_admin_cidr, hostinfo, last_checked, list_appliances,
     list_plugins, list_uploaded_bundles, lookup, matched_rules, policy_history, policy_tree, preview_techsupport,
     preview_techsupport_em, raw_fields, roaming, run_show_errors, set_admin_cidr, tail_lookup_debug_log,
     tail_techsupport_log, trace_defaults, trace_list, trace_set, upload_bundle, valid_cidr, valid_ip,
@@ -45,7 +45,7 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.5.3"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
@@ -1681,6 +1681,26 @@ def hostlog_download_route(ip):
     return send_file(
         buf, mimetype="application/zip", as_attachment=True,
         download_name=f"host-log-{ip.replace('.', '-')}.zip",
+    )
+
+
+@app.route("/hostinfo/download/<ip>", methods=["GET"])
+def hostinfo_download_route(ip):
+    """Live Analyze "Host info" -- David's ask 2026-09-18: type a host IP, get its raw
+    `fstool hostinfo` immediately as a .txt (the CLI output verbatim, two header lines on top).
+    Errors come back as JSON so the tab's JS can show them instead of a bare download failing."""
+    if not valid_ip(ip):
+        return jsonify({"error": "Not a valid IPv4 address."}), 400
+    try:
+        data = hostinfo(ip)
+    except ForescoutClientError as e:
+        return jsonify({"error": str(e)}), 502
+    header = (f"# fstool hostinfo {ip} -- managing appliance: {data.get('appliance')} -- "
+              f"{data.get('field_count')} fields -- generated {data.get('generated')}\n#\n")
+    _log_activity("hostinfo_downloaded", username=session.get("username"), ip=ip)
+    return send_file(
+        io.BytesIO((header + data.get("text", "")).encode("utf-8")), mimetype="text/plain",
+        as_attachment=True, download_name=f"hostinfo-{ip.replace('.', '-')}.txt",
     )
 
 

@@ -91,7 +91,7 @@ def _format_still_active(data):
     return "Debug still active on: " + ", ".join(parts) + ". Wait for it to finish before building a bundle."
 
 
-def lookup(ip, timeout=90):
+def lookup(ip, timeout=360):
     # Was 45s: do_lookup queries every known appliance for its installed/
     # enabled plugins and databases, and confirmed live 2026-09-11 that two
     # appliances (two in the lab -- previously assumed dead, no longer
@@ -439,6 +439,13 @@ def raw_fields(ip, timeout=45):
     if not valid_ip(ip):
         raise ForescoutClientError(f"'{ip}' is not a valid IPv4 address.")
     return _run_verb(f"rawfields {ip}", timeout=timeout)
+
+
+def hostinfo(ip, timeout=60):
+    """Raw `fstool hostinfo` text for the Live Analyze "Host info" download."""
+    if not valid_ip(ip):
+        raise ForescoutClientError(f"'{ip}' is not a valid IPv4 address.")
+    return _run_verb(f"hostinfo {ip}", timeout=timeout)
 
 
 def arp_list(ip, timeout=20):
@@ -834,7 +841,7 @@ def matched_rules(ip, window, timeout=30):
 ROAMING_WINDOW_RE = re.compile(r"^(?:[1-9]|1\d|2[0-8])d$")
 
 
-def roaming(ip, window, timeout=150):
+def roaming(ip, window, timeout=500):
     """Switches/ports and wireless APs the host was connected to inside the window (1d-28d), with
     counts -- see webapp-query.py's do_roaming (replays the managing appliance's source_log)."""
     if not valid_ip(ip):

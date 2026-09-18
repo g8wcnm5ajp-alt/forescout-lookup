@@ -184,6 +184,24 @@
                             <tr><th>Active</th><td>{{ result.active or '—' }}</td></tr>
                             <tr><th>Current connection since</th><td>{{ result.connection_since or 'unknown' }}</td></tr>
                         </table>
+                        {% if result.location_notes %}
+                        <ul class="location-notes">
+                            {% for n in result.location_notes %}<li>{{ n }}</li>{% endfor %}
+                        </ul>
+                        {% endif %}
+                        {% if result.identity_aliases and result.identity_aliases|length > 1 %}
+                        <h4 class="alias-heading">Also known as <span class="muted">(same DHCP/NetBIOS hostname in the last 90 days, every appliance -- a probable match, not proof: randomised MACs make one host hard to track)</span></h4>
+                        <div class="alias-scroll"><table class="roaming-table alias-table">
+                            <tr><th>MAC</th><th>IP</th><th>Hostname</th><th>Sightings</th><th>First seen (UTC)</th><th>Last seen (UTC)</th><th>Seen on</th></tr>
+                            {% for a in result.identity_aliases %}
+                            <tr{% if a.current %} class="alias-current"{% endif %}>
+                                <td>{{ a.mac or '—' }}{% if a.current %} <span class="muted">(this record)</span>{% endif %}</td>
+                                <td>{{ a.ip }}</td><td>{{ a.names }}</td><td>{{ a.count }}</td>
+                                <td>{{ a.first_display }}</td><td>{{ a.last_display }}</td><td>{{ a.boxes }}</td>
+                            </tr>
+                            {% endfor %}
+                        </table></div>
+                        {% endif %}
                     </details>
 
                     {% if result.location.wired %}
@@ -409,6 +427,17 @@
         </section>
 
         <section class="page-tab-panel page-tab-panel-hidden" data-page-tab-panel="analyze">
+        <div class="card no-print">
+            <h3>Host info <span class="muted">(raw <code>fstool hostinfo</code>, downloaded as .txt)</span></h3>
+            <form id="hostinfo-form" class="inline-form" style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
+                <input type="text" id="hostinfo-ip" placeholder="Host IP, e.g. 192.168.1.10" style="width:16em;"
+                       pattern="^(?:\d{1,3}\.){3}\d{1,3}$" required autocomplete="off">
+                <button type="submit" id="hostinfo-download-btn">Download hostinfo</button>
+                <span class="hint" id="hostinfo-status" style="margin-top:0;"></span>
+            </form>
+            <p class="hint">The full property dump for that host exactly as the CLI prints it, fetched live from its managing
+                appliance -- no debug, no bundle. For the parsed view use IP Lookup's Raw fields section.</p>
+        </div>
         {% if active_analyze_runs %}
         <div class="card no-print">
             <h3>Analysis in progress <span class="muted">(started by any session, not yet finished)</span></h3>
@@ -2058,6 +2087,36 @@
     </script>
 
     <script>
+        // Live Analyze "Host info" download (David, 2026-09-18): fetch first so an EM-side error
+        // shows on the page instead of a broken download, then hand the file to the browser.
+        (function () {
+            const form = document.getElementById("hostinfo-form");
+            if (!form) return;
+            const ipEl = document.getElementById("hostinfo-ip"), st = document.getElementById("hostinfo-status"), btn = document.getElementById("hostinfo-download-btn");
+            form.addEventListener("submit", async ev => {
+                ev.preventDefault();
+                const ip = ipEl.value.trim();
+                if (!/^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/.test(ip)) { st.textContent = "Enter a valid IPv4 address."; return; }
+                btn.disabled = true; st.textContent = "Fetching hostinfo for " + ip + " …";
+                try {
+                    const r = await fetch("/hostinfo/download/" + ip, { credentials: "same-origin" });
+                    if (!r.ok) {
+                        let msg = "HTTP " + r.status;
+                        try { msg = (await r.json()).error || msg; } catch (e) { /* not JSON */ }
+                        st.textContent = "Failed: " + msg; return;
+                    }
+                    const blob = await r.blob();
+                    const a = document.createElement("a");
+                    a.href = URL.createObjectURL(blob); a.download = "hostinfo-" + ip.replace(/\./g, "-") + ".txt";
+                    document.body.appendChild(a); a.click(); a.remove();
+                    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+                    st.textContent = "Downloaded hostinfo-" + ip.replace(/\./g, "-") + ".txt (" + Math.round(blob.size / 1024) + " KB).";
+                } catch (e) {
+                    st.textContent = "Failed: " + e.message;
+                } finally { btn.disabled = false; }
+            });
+        })();
+
         // Live Analyze tab -- see webapp-query.py's pluginlist/analyzeadm/
         // pluginlogszip verbs for what each control below actually runs.
         (function () {
@@ -2366,12 +2425,32 @@
             const fmtDur = s => { s = Math.round(s || 0); if (s < 60) return s + "s"; if (s < 3600) return Math.floor(s / 60) + "m"; if (s < 86400) return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m"; return Math.floor(s / 86400) + "d " + Math.floor((s % 86400) / 3600) + "h"; };
             const nodes = data.nodes || [];
             graphEl.innerHTML = "";
+            // identity cross-check (live roaming only): best effort by hostname -- David, 2026-09-18:
+            // "the MAC is random, tracking the actual host roaming is very difficult, so must be
+            // taken as a probable match" -- say so on the report itself
+            let identHtml = "";
+            if (data.incomplete && data.incomplete.length) {
+                identHtml += "<p class=\"roaming-warn\">Did not answer within the time limit: " + esc(data.incomplete.join(", ")) + " -- this result may be incomplete.</p>";
+            }
+            if (data.identities && data.identities.length) {
+                const merged = data.identities.filter(a => a.merged), skipped = data.identities.filter(a => !a.merged);
+                identHtml += "<p class=\"roaming-caveat\"><strong>Best effort -- probable match.</strong> " +
+                    (merged.length > 1
+                        ? "This graph merges " + merged.length + " identities (MAC + IP) that carried the same DHCP/NetBIOS hostname; with randomised MAC addresses there is no certain way to follow one host, so treat the merge as probable, not proven. Each row and timeline event names the identity it came from."
+                        : "Only this host's own MAC + IP is on the graph" + (data.identities.length > 1 ? "; the other identities that shared its hostname were too weak to merge (see below)." : ".")) + "</p>";
+                identHtml += "<details class=\"data-section\" style=\"margin-top:0.4rem;\"><summary>Identities considered (" + data.identities.length + ")</summary><div class=\"alias-scroll\"><table class=\"roaming-table alias-table\"><tr><th>MAC</th><th>IP</th><th>Hostname</th><th>Sightings</th><th>First seen (UTC)</th><th>Last seen (UTC)</th><th>Seen on</th><th>On the graph</th></tr>";
+                data.identities.forEach(a => {
+                    identHtml += "<tr" + (a.current ? " class=\"alias-current\"" : "") + "><td>" + esc(a.mac || "—") + (a.current ? " <span class=\"muted\">(this record)</span>" : "") + "</td><td>" + esc(a.ip) + "</td><td>" + esc(a.names || "") + "</td><td>" + a.count + "</td><td>" + esc(a.first_display) + "</td><td>" + esc(a.last_display) + "</td><td>" + esc(a.boxes || "") + "</td><td>" + (a.merged ? "yes" : "no -- " + esc(a.skipped || "")) + "</td></tr>";
+                });
+                identHtml += "</table></div></details>";
+            }
             if (!nodes.length) {
                 graphEl.style.display = "none";
                 bodyEl.innerHTML = "<p class=\"hint\">No switch/port or wireless AP records for this device in the window (" + esc(data.from) + " .. " + esc(data.to) + ")." +
-                    (data.rows ? "" : " The property-change log had nothing at all for it in that period.") + "</p>";
+                    (data.rows ? "" : " The property-change log had nothing at all for it in that period.") + "</p>" + identHtml;
                 return;
             }
+            const withIdent = nodes.some(n => n.identities && n.identities.length);
             const maxCount = Math.max.apply(null, nodes.map(n => n.count || 1));
             const N = nodes.length;
             const W = Math.max(760, 300 + N * 70), H = Math.max(520, 300 + N * 36);
@@ -2394,7 +2473,7 @@
                 svg.appendChild(el("text", { x: mx, y: my + 4, "text-anchor": "middle", "font-size": 11, fill: "#fff" }, String(n.count)));
                 const g = el("g", { class: "roaming-node" });
                 const c = el("circle", { cx: x, cy: y, r: r, fill: colour, "fill-opacity": n.still_connected ? 0.95 : 0.55, stroke: n.still_connected ? "#fff" : colour, "stroke-width": n.still_connected ? 3 : 1 });
-                c.appendChild(el("title", {}, (n.kind === "ap" ? "Wireless AP " : "Switch ") + n.label + (n.sub ? " / " + n.sub : "") + "\nconnected " + n.count + "x, " + fmtDur(n.seconds) + " in total\n" + n.first_display + " .. " + n.last_display + (n.still_connected ? "\n(still connected)" : "")));
+                c.appendChild(el("title", {}, (n.kind === "ap" ? "Wireless AP " : "Switch ") + n.label + (n.sub ? " / " + n.sub : "") + "\nconnected " + n.count + "x, " + fmtDur(n.seconds) + " in total\n" + n.first_display + " .. " + n.last_display + (n.still_connected ? "\n(still connected)" : "") + (n.identities && n.identities.length ? "\nidentity: " + n.identities.join(", ") : "")));
                 g.appendChild(c);
                 const below = y > cy ? 1 : -1;
                 const ty = y + below * (r + 14);
@@ -2408,15 +2487,15 @@
             parts.forEach((p, i) => svg.appendChild(el("text", { x: cx, y: cy + 4 + (i - (parts.length - 1) / 2) * 13, "text-anchor": "middle", "font-size": 10, "font-weight": 700, fill: "#fff" }, p)));
             graphEl.appendChild(svg);
             graphEl.style.display = "block";
-            let html = "<p class=\"hint\">" + esc(data.from) + " .. " + esc(data.to) + (data.appliance ? " -- from " + esc(data.appliance) : "") + (data.rows != null ? " -- " + data.rows + " property changes replayed" : "") + (data.sources ? " -- sources: " + esc(data.sources) : "") + "</p>" +
-                "<table class=\"roaming-table\"><tr><th>Type</th><th>Switch / AP</th><th>Port / SSID</th><th>Times connected</th><th>Time connected</th><th>First seen (UTC)</th><th>Last seen (UTC)</th></tr>";
+            let html = "<p class=\"hint\">" + esc(data.from) + " .. " + esc(data.to) + (data.appliance ? " -- from " + esc(data.appliance) : "") + (data.rows != null ? " -- " + data.rows + " property changes replayed" : "") + (data.sources ? " -- sources: " + esc(data.sources) : "") + "</p>" + identHtml +
+                "<table class=\"roaming-table\"><tr><th>Type</th><th>Switch / AP</th><th>Port / SSID</th><th>Times connected</th><th>Time connected</th><th>First seen (UTC)</th><th>Last seen (UTC)</th>" + (withIdent ? "<th>Identity</th>" : "") + "</tr>";
             nodes.forEach(n => {
-                html += "<tr><td>" + (n.kind === "ap" ? "Wireless AP" : "Switch") + "</td><td>" + esc(n.label) + "</td><td>" + esc(n.sub || "—") + "</td><td>" + n.count + "</td><td>" + fmtDur(n.seconds) + (n.still_connected ? " <span class=\"muted\">(still connected)</span>" : "") + "</td><td>" + esc(n.first_display) + "</td><td>" + esc(n.last_display) + "</td></tr>";
+                html += "<tr><td>" + (n.kind === "ap" ? "Wireless AP" : "Switch") + "</td><td>" + esc(n.label) + "</td><td>" + esc(n.sub || "—") + "</td><td>" + n.count + "</td><td>" + fmtDur(n.seconds) + (n.still_connected ? " <span class=\"muted\">(still connected)</span>" : "") + "</td><td>" + esc(n.first_display) + "</td><td>" + esc(n.last_display) + "</td>" + (withIdent ? "<td>" + esc((n.identities || []).join(", ")) + "</td>" : "") + "</tr>";
             });
             html += "</table>";
             if (data.events && data.events.length) {
-                html += "<details class=\"data-section\" style=\"margin-top:0.5rem;\"><summary>Timeline (" + data.events.length + " events, oldest first)</summary><table class=\"roaming-table\"><tr><th>Time (UTC)</th><th>Event</th><th>Switch / AP</th><th>Port / SSID</th></tr>";
-                data.events.forEach(e => { html += "<tr><td>" + esc(e.time) + "</td><td>" + esc(e.event) + "</td><td>" + esc(e.label) + "</td><td>" + esc(e.sub || "—") + "</td></tr>"; });
+                html += "<details class=\"data-section\" style=\"margin-top:0.5rem;\"><summary>Timeline (" + data.events.length + " events, oldest first)</summary><table class=\"roaming-table\"><tr><th>Time (UTC)</th><th>Event</th><th>Switch / AP</th><th>Port / SSID</th>" + (withIdent ? "<th>Identity</th>" : "") + "</tr>";
+                data.events.forEach(e => { html += "<tr><td>" + esc(e.time) + "</td><td>" + esc(e.event) + "</td><td>" + esc(e.label) + "</td><td>" + esc(e.sub || "—") + "</td>" + (withIdent ? "<td>" + esc(e.identity || "") + "</td>" : "") + "</tr>"; });
                 html += "</table></details>";
             }
             bodyEl.innerHTML = html;

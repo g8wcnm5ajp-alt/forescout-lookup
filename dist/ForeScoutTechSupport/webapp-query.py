@@ -200,6 +200,9 @@ Verbs (see the plan this was built from, forescout-lookup):
     rawfields <ip>          the full raw hostinfo property dump (every
                             field, not the curated lookup subset) --
                             lazy-loaded by the UI, can run 1000+ fields
+    hostinfo <ip>           the raw `fstool hostinfo` TEXT exactly as the
+                            CLI prints it (Live Analyze "Host info"
+                            download, David 2026-09-18)
     arplist <ip>            just the ARP decode table (appliance, arp
                             source, resolved IP, MAC, OUI vendor,
                             arp/mac resolve times) -- lightweight, backs
@@ -1091,8 +1094,14 @@ def _do_lookup_inner(ip):
     all_targets_result = get_all_targets()
 
     mac_source = get_field_source(fields, "mac")
+    t0 = time.time()
+    aliases, alias_failed = get_identity_aliases(ip, mode, appliance, fields, targets=all_targets_result)
+    notes = location_notes(ip, fields, verdict, aliases, all_targets_result, alias_failed)
+    _log_lookup(f"identity aliases: {len(aliases)} row(s), {len(notes)} note(s), elapsed={time.time()-t0:.2f}s")
     result = {
         "ip": ip,
+        "identity_aliases": aliases,
+        "location_notes": notes,
         "mac": get_field(fields, "mac"),
         # Raw source (e.g. "snow@<node id> []") kept alongside its
         # decoded appliance, same convention as arp_list/policy_history/
@@ -3204,36 +3213,124 @@ ROAMING_PROPS = (
 ROAMING_SEP = "#~#"
 
 
-def get_roaming(ip, mode, appliance, window_seconds):
+def get_roaming(ip, mode, appliance, window_seconds, aliases=None, this_mac=None):
     """-> {"nodes": [...], "events": [...], "rows": n} -- stints on each switch/port or AP/SSID the
     host was connected to inside the window, built by replaying source_log in time order."""
     int_ip = ip_to_int(ip)
     now = int(time.time())
     cutoff_ms = (now - window_seconds) * 1000
     names = ", ".join("'" + p + "'" for p in ROAMING_PROPS)
+    # every identity that carried this host's hostname in the window (randomised MACs, re-created
+    # records) -- David's ask 2026-09-18: cross-check by the Android name, not just the MAC
+    # Only identities with real evidence are merged into the graph: the host's own (MAC, IP), plus
+    # aliases seen more than once on a unicast address. A single DHCP-hostname sighting or a
+    # multicast "IP" is shown in the identity table but must not pull another device's ports in --
+    # the lab Pi's hostname was also claimed once by a VMware MAC, whose Fa0/1 then leaked into
+    # the Pi's graph (2026-09-18).
+    this_mac = (this_mac or "").lower() or None
+    merged_ids = {}     # (mac, ip) -> label
+    for a in (aliases or []):
+        a["merged"] = False
+        if a.get("current") and a.get("mac"):
+            this_mac = a["mac"]
+    for a in (aliases or []):
+        why = None
+        if not a.get("current"):
+            if a.get("count", 0) < 2:
+                why = "single sighting"
+            elif a["ip"].split(".")[0].isdigit() and (int(a["ip"].split(".")[0]) >= 224 or a["ip"] == "0.0.0.0"):
+                why = "not a unicast address"
+        if why:
+            a["skipped"] = why
+            continue
+        a["merged"] = True
+        merged_ids[(a.get("mac") or "", a["ip"])] = f"{a.get('mac') or '?'} @ {a['ip']}"
+    merged_ids.setdefault((this_mac or "", ip), f"{this_mac or '?'} @ {ip}")
+    ids = {ip_to_int(i) for m, i in merged_ids}
+    macs = {m for m, i in merged_ids if m}
+    where_id = f"primary_id IN ({', '.join(str(i) for i in sorted(ids))})"
+    if macs:
+        where_id = f"({where_id} OR id IN ({', '.join(_sql_str(m) for m in sorted(macs))}))"
     sql = (
-        f"SELECT time, name, coalesce(details,''), coalesce(status,'') FROM source_log "
-        f"WHERE primary_id={int_ip} AND time>={cutoff_ms} AND name IN ({names}) ORDER BY time LIMIT 20000;"
+        f"SELECT time, name, coalesce(details,''), coalesce(status,''), coalesce(id,''), primary_id FROM source_log "
+        f"WHERE {where_id} AND time>={cutoff_ms} AND name IN ({names}) ORDER BY time LIMIT 20000;"
     )
-    if mode == "em":
-        out, err, rc = run(["psql", "-t", "-A", "-F", ROAMING_SEP, "-c", sql], timeout=120)
-    else:
-        out, err, rc = ssh_appliance(appliance, f"psql -t -A -F '{ROAMING_SEP}' -c \"{sql}\"", timeout=120)
-    if rc != 0:
-        fail(f"source_log query failed on {appliance or 'the EM'}: {(err or out).strip()[-300:]}")
+    # every known box, in parallel: the managing appliance, the EM (the wireless plugin writes the
+    # WLAN rows into the EM's own source_log here) and any other appliance that held the host before
+    # a re-assignment. Deduped below.
+    # the managing appliance, the EM, and only those other boxes where an identity of this host
+    # was actually found -- not a blind query of every appliance
+    alias_boxes = [b.strip() for a in (aliases or []) for b in a.get("boxes", "").split(",") if b.strip()]
+    targets = list(dict.fromkeys([EM_IP] + ([appliance] if appliance else []) + alias_boxes))
+    own = EM_IP if mode == "em" else appliance
+    results = _parallel_target_map(targets, lambda t: _psql_on(t, sql, timeout=ALIAS_QUERY_TIMEOUT))
+    if results.get(own, ("", 1))[1] != 0:
+        fail(f"source_log query failed on {own}")
+    outs = [out for out, rc in results.values() if rc == 0]
+    incomplete = sorted(t for t, (out, rc) in results.items() if rc != 0)
 
-    events = []
-    for line in out.splitlines():
-        parts = line.split(ROAMING_SEP)
-        if len(parts) != 4 or not parts[0].strip().isdigit():
-            continue
-        t = int(parts[0]) // 1000
-        name, details, status = parts[1].strip(), parts[2].strip(), parts[3].strip()
-        if status.lower() == "failed" or details.startswith("Failed to learn"):
-            continue
-        events.append((t, name, details))
+    seen = set()
+    per_identity = {}   # identity label -> [(t, name, details)]
+    n_rows = 0
+    for out in outs:
+        for line in out.splitlines():
+            parts = line.split(ROAMING_SEP)
+            if len(parts) != 6 or not parts[0].strip().isdigit():
+                continue
+            t = int(parts[0]) // 1000
+            name, details, status = parts[1].strip(), parts[2].strip(), parts[3].strip()
+            if status.lower() == "failed" or details.startswith("Failed to learn"):
+                continue
+            row_mac, row_ip = parts[4].strip().lower(), int_to_ip(parts[5].strip())
+            # a row belongs to a merged identity by exact (MAC, IP) match; the host's own MAC on
+            # another address, or its IP under a blank MAC, count as the host itself
+            ident = merged_ids.get((row_mac, row_ip))
+            if ident is None:
+                if row_ip == ip or (this_mac and row_mac == this_mac):
+                    ident = merged_ids[(this_mac or "", ip)]
+                else:
+                    continue
+            k = (ident, t, name, details)
+            if k in seen:
+                continue
+            seen.add(k)
+            n_rows += 1
+            per_identity.setdefault(ident, []).append((t, name, details))
 
-    # replay: one open "stint" per medium (wired / wireless); a stint = a spell on one node
+    # replay every identity on its own (its own switch/port state), then merge the nodes: mixing
+    # two identities' events through one state machine pairs one device's switch with another's port
+    nodes, stints, timeline = {}, [], []
+    for ident, ev in per_identity.items():
+        ev.sort()
+        i_nodes, i_stints, i_timeline = _replay_roaming_events(ev, now)
+        for key, n in i_nodes.items():
+            m = nodes.get(key)
+            if m is None:
+                m = nodes[key] = dict(n, identities=[])
+            else:
+                m["count"] += n["count"]
+                m["seconds"] += n["seconds"]
+                m["first"] = min(m["first"], n["first"])
+                m["last"] = max(m["last"], n["last"])
+                m["still_connected"] = m["still_connected"] or n["still_connected"]
+            m["identities"].append(ident)
+        stints.extend(i_stints)
+        for e in i_timeline:
+            e["identity"] = ident
+        timeline.extend(i_timeline)
+    timeline.sort(key=lambda e: e["t"])
+    out_nodes = sorted(nodes.values(), key=lambda n: (-n["count"], -n["seconds"]))
+    for n in out_nodes:
+        n["first_display"] = format_epoch(n["first"])
+        n["last_display"] = format_epoch(n["last"])
+    return {"nodes": out_nodes, "events": timeline[-400:], "rows": n_rows, "incomplete": incomplete,
+            "identities_merged": sorted(merged_ids.values()),
+            "from": format_epoch(now - window_seconds), "to": format_epoch(now)}
+
+
+def _replay_roaming_events(events, now):
+    """One identity's time-ordered (t, name, details) source_log events -> (nodes, stints, timeline).
+    One open "stint" per medium (wired / wireless); a stint = a spell on one node."""
     nodes = {}          # key -> node dict
     stints = []         # (key, start, end|None)
     open_stint = {"wired": None, "wireless": None}
@@ -3327,24 +3424,219 @@ def get_roaming(ip, mode, appliance, window_seconds):
 
     for key, start, end in stints:
         nodes[key]["seconds"] += (end if end is not None else now) - start
-    out_nodes = sorted(nodes.values(), key=lambda n: (-n["count"], -n["seconds"]))
-    for n in out_nodes:
-        n["first_display"] = format_epoch(n["first"])
-        n["last_display"] = format_epoch(n["last"])
+    for n in nodes.values():
         n["still_connected"] = any(k == n["key"] and e is None for k, s, e in stints)
-    return {"nodes": out_nodes, "events": timeline[-400:], "rows": len(events),
-            "from": format_epoch(now - window_seconds), "to": format_epoch(now)}
+    return nodes, stints, timeline
 
+
+
+# ---------------------------------------------------------------------
+# Identity cross-check + "why is this undetermined" notes -- David,
+# 2026-09-18, after his Android phone came up as a brand-new host with one field:
+# a phone on a randomised MAC that had been away for more than the host
+# TTL (purge.host.ttl.sec, 3 days here) is purged and re-created as "New
+# Host", while DHCP keeps handing it the same IP by name. source_log
+# keeps the old history (keyed by IP + MAC), so the DHCP/NetBIOS hostname
+# is the thread that ties the identities together.
+# ---------------------------------------------------------------------
+ALIAS_PROPS = ("DHCP Hostname", "NetBIOS Hostname", "Hostname")
+# hostnames too generic to tie two records together as one device
+GENERIC_HOSTNAMES = {"android", "iphone", "ipad", "localhost", "unknown", "ubuntu", "windows", "pc", "laptop",
+                     "desktop", "macbook", "macbook-pro", "macbook-air", "galaxy", "oneplus", "pixel", "phone",
+                     "printer", "server", "host", "device", "linux", "debian", "raspberrypi", "kali", "?", "???"}
+# every box gets the same generous cap -- a box cut off early silently loses history, and David's
+# call (2026-09-18) is data quality over speed; boxes that still do not answer are named in the result
+ALIAS_QUERY_TIMEOUT = 150
+
+
+def int_to_ip(n):
+    try:
+        n = int(n) & 0xFFFFFFFF
+    except (TypeError, ValueError):
+        return str(n)
+    return ".".join(str((n >> s) & 255) for s in (24, 16, 8, 0))
+
+
+def _sql_str(s):
+    return "'" + s.replace("'", "''") + "'"
+
+
+def _psql_on(target, sql, timeout=60):
+    """(out, rc) of a read-only psql on the EM (target == EM_IP) or a managed appliance. Timed per box
+    into the lookup log -- the two slow lab appliances took 40s+ here on 2026-09-18."""
+    t0 = time.time()
+    if target == EM_IP:
+        out, err, rc = run(["psql", "-t", "-A", "-F", ROAMING_SEP, "-c", sql], timeout=timeout)
+    else:
+        out, err, rc = ssh_appliance(target, f"psql -t -A -F '{ROAMING_SEP}' -c \"{sql}\"", timeout=timeout)
+    _log_lookup(f"source_log query on {target}: rc={rc} elapsed={time.time()-t0:.2f}s rows={out.count(chr(10))}")
+    return out if rc == 0 else "", rc
+
+
+def get_identity_aliases(ip, mode, appliance, fields, window_seconds=28 * 86400, targets=None):
+    """Every (MAC, IP) pair that carried this host's DHCP/NetBIOS hostname in source_log inside the
+    window, on EVERY known box (a host's history moves between appliances with its assignment; the
+    lookup window is at least 90 days here because a purged-and-recreated record is exactly the
+    case this exists for) -> ([{mac, ip, first_display, last_display, count, current, boxes, names}],
+    [boxes that did not answer])."""
+    cutoff_ms = (int(time.time()) - max(window_seconds, 90 * 86400)) * 1000
+    if targets is None:
+        targets = [EM_IP] + ([appliance] if appliance else [])
+    own = EM_IP if mode == "em" else appliance
+    props = ", ".join(_sql_str(p) for p in ALIAS_PROPS)
+    names = set()
+    for f in ("dhcp_hostname", "dhcp_hostname_v2", "nbthost", "hostname"):
+        v = get_field(fields, f)
+        if v and v not in ("???", ""):
+            names.add(v)
+            if "." in v and f == "hostname":
+                names.add(v.split(".", 1)[0])
+    # a brand-new record (the phone in its first minutes: one field) has no hostname yet, but the
+    # DHCP server handed it the same IP -- the old rows under that IP still carry the name
+    own_sql = (f"SELECT DISTINCT coalesce(details,'') FROM source_log WHERE primary_id={ip_to_int(ip)} "
+               f"AND name IN ({props}) AND time>={cutoff_ms} AND coalesce(status,'')<>'Failed';")
+    for box, (out, rc) in _parallel_target_map(list(dict.fromkeys([own, EM_IP])),
+                                               lambda t: _psql_on(t, own_sql, timeout=ALIAS_QUERY_TIMEOUT)).items():
+        if rc == 0:
+            names.update(v.strip() for v in out.splitlines())
+    names = {n for n in names if len(n) >= 3 and n.lower() not in GENERIC_HOSTNAMES
+             and not n.startswith("Property value cleared")}
+    _log_lookup(f"identity aliases: hostnames to cross-check: {sorted(names)}")
+    if not names:
+        return [], []
+    sql = (
+        f"SELECT coalesce(id,''), primary_id, min(time), max(time), count(*), details FROM source_log "
+        f"WHERE name IN ({props}) AND details IN ({', '.join(_sql_str(n) for n in names)}) "
+        f"AND time>={cutoff_ms} GROUP BY 1,2,6 ORDER BY 4 DESC LIMIT 60;"
+    )
+    results = _parallel_target_map(targets, lambda t: _psql_on(t, sql, timeout=ALIAS_QUERY_TIMEOUT))
+    this_mac = (get_field(fields, "mac") or "").lower()
+    merged = {}
+    failed = []
+    for box, (out, rc) in results.items():
+        if rc != 0:
+            _log_lookup(f"identity aliases: query failed on {box} rc={rc}")
+            failed.append(box)
+            continue
+        for line in out.splitlines():
+            p = line.split(ROAMING_SEP)
+            if len(p) != 6 or not p[1].strip().lstrip("-").isdigit():
+                continue
+            mac = p[0].strip().lower()
+            alias_ip = int_to_ip(p[1].strip())
+            k = (mac, alias_ip)
+            r = merged.get(k)
+            first, last, n = int(p[2]) // 1000, int(p[3]) // 1000, int(p[4])
+            if r is None:
+                r = merged[k] = {"mac": mac or None, "ip": alias_ip, "count": 0, "first": first, "last": last,
+                                 "current": (mac == this_mac and alias_ip == ip), "boxes": [], "names": []}
+            r["count"] += n
+            r["first"] = min(r["first"], first)
+            r["last"] = max(r["last"], last)
+            if box not in r["boxes"]:
+                r["boxes"].append(box)
+            if p[5].strip() not in r["names"]:
+                r["names"].append(p[5].strip())
+    rows = sorted(merged.values(), key=lambda r: -r["last"])
+    for r in rows:
+        r["first_display"] = format_epoch(r["first"])
+        r["last_display"] = format_epoch(r["last"])
+        r["boxes"] = ", ".join(r["boxes"])
+        r["names"] = ", ".join(r["names"])
+    return rows, sorted(failed)
+
+
+def get_last_wlc_read(all_targets):
+    """When the wireless plugin last read a controller's client table -- the newest
+    `wifi_update_client_table` line in wireless.log on any known box. -> (epoch, box) or (None, None)."""
+    cmd = ("f=/usr/local/forescout/log/plugin/wireless/wireless.log; [ -f $f ] && tail -c 300000 $f | "
+           "grep -a wifi_update_client_table | tail -1 | cut -d: -f3 | cut -d. -f1")
+    best = (None, None)
+    for t in all_targets:
+        if t == EM_IP:
+            out, err, rc = run(["bash", "-c", cmd], timeout=8)
+        else:
+            out, err, rc = ssh_appliance(t, cmd, timeout=8)
+        v = out.strip()
+        if rc == 0 and v.isdigit() and (best[0] is None or int(v) > best[0]):
+            best = (int(v), t)
+    return best
+
+
+def get_host_ttl_seconds():
+    try:
+        with open("/usr/local/forescout/etc/local.properties") as f:
+            for line in f:
+                if line.startswith("purge.host.ttl.sec="):
+                    return int(line.strip().split("=", 1)[1])
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def location_notes(ip, fields, verdict, aliases, all_targets, alias_failed=()):
+    """Plain-language reasons shown under the wired/wireless verdict."""
+    notes = []
+    if alias_failed:
+        notes.append(f"The hostname cross-check did not complete on {', '.join(alias_failed)} "
+                     f"(no answer within {ALIAS_QUERY_TIMEOUT}s) -- the identity list may be incomplete.")
+    now = int(time.time())
+    adm_t = get_field_epoch(fields, "adm")
+    created = min((get_field_epoch(fields, f) for f in ("mac", "adm", "_times") if get_field_epoch(fields, f)), default=None)
+    others = [a for a in aliases if not a["current"]]
+    if created and now - created < 3600:
+        notes.append(f"This host record is only {dur_short(now - created)} old (admission: "
+                     f"{get_field(fields, 'adm') or '?'} at {format_epoch(adm_t or created)})"
+                     + (" -- properties are still arriving; look again in a minute." if verdict == "undetermined"
+                        else " -- earlier history for this device is under the other identities below." if others
+                        else "."))
+    if others:
+        macs = sorted({a["mac"] for a in others if a["mac"]})
+        ttl = get_host_ttl_seconds()
+        notes.append(f"The same hostname was seen under {len(others)} other MAC/IP identit{'y' if len(others) == 1 else 'ies'}"
+                     + (f" ({', '.join(macs[:4])}{'...' if len(macs) > 4 else ''})" if macs else "")
+                     + " -- randomised MAC addresses and/or a record re-created after the host TTL purge"
+                     + (f" (hosts offline for more than {ttl // 86400} days are purged here)" if ttl else "") + ".")
+    if verdict == "undetermined":
+        if len(fields) <= 3:
+            notes.append("The managing appliance returned almost nothing for this host yet.")
+        else:
+            notes.append("No switch port and no wireless-controller data on this host record: it is seen only through "
+                         "ARP/DHCP/traffic so far.")
+        last, box = get_last_wlc_read(all_targets)
+        if last:
+            notes.append(f"The wireless plugin last read a controller's client table at {format_epoch(last)} (on {box})"
+                         + (" -- AFTER this host appeared, so it is not on a managed controller."
+                            if created and last > created + 30 else
+                            " -- BEFORE this host appeared; a wireless client shows up only after the next read, retry then."))
+    return notes
+
+
+def dur_short(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
 
 def do_roaming(ip, window_str):
+    _lookup_log_ctx["active"] = True
+    _lookup_log_ctx["tag"] = f"[roaming {ip} {window_str}] "
     window_seconds = parse_window(window_str)
     if window_seconds is None or not (86400 <= window_seconds <= 28 * 86400):
         fail("invalid window -- expected 1d to 28d")
     mode, appliance = get_assigned_to(ip)
     if mode is None:
         fail(f"could not determine managing appliance for {ip}")
-    data = get_roaming(ip, mode, appliance, window_seconds)
-    data.update({"ip": ip, "window": window_str, "appliance": appliance or "EM"})
+    raw, err, rc = (run(["fstool", "hostinfo", ip], timeout=30) if mode == "em"
+                    else ssh_appliance(appliance, f"fstool hostinfo {ip}", timeout=30))
+    fields = parse_hostinfo_lines(raw)
+    aliases, alias_failed = get_identity_aliases(ip, mode, appliance, fields, window_seconds=window_seconds,
+                                                 targets=get_all_targets())
+    data = get_roaming(ip, mode, appliance, window_seconds, aliases=aliases, this_mac=get_field(fields, "mac"))
+    data["incomplete"] = sorted(set(data.get("incomplete", [])) | set(alias_failed))
+    data.update({"ip": ip, "window": window_str, "appliance": appliance or "EM", "identities": aliases})
     print(json.dumps(data))
 
 def do_matched(ip, window_str):
@@ -3400,6 +3692,22 @@ def do_rawfields(ip):
              "status": f["status"], "time": format_epoch(f["epoch"])}
             for f in fields
         ],
+    }))
+
+
+def do_hostinfo(ip):
+    """The raw `fstool hostinfo <ip>` text, untouched -- what an engineer gets on the CLI, downloaded
+    from the Live Analyze tab as a .txt. Nothing parsed, nothing filtered."""
+    mode, appliance = get_assigned_to(ip)
+    if mode is None:
+        fail(f"could not determine managing appliance for {ip}")
+    raw, err, rc = (run(["fstool", "hostinfo", ip], timeout=45) if mode == "em"
+                    else ssh_appliance(appliance, f"fstool hostinfo {ip}", timeout=45))
+    if rc != 0 and not raw.strip():
+        fail(f"fstool hostinfo failed on {appliance or 'the EM'}: {(err or raw).strip()[-300:]}")
+    print(json.dumps({
+        "ip": ip, "appliance": appliance or "EM", "field_count": len(parse_hostinfo_lines(raw)),
+        "generated": format_epoch(int(time.time())), "text": raw,
     }))
 
 
@@ -4021,6 +4329,10 @@ def main():
     if m:
         return do_rawfields(m.group(1))
 
+    m = re.fullmatch(rf"hostinfo ({IP_RE})", original.strip())
+    if m:
+        return do_hostinfo(m.group(1))
+
     m = re.fullmatch(rf"arplist ({IP_RE})", original.strip())
     if m:
         return do_arplist(m.group(1))
@@ -4047,7 +4359,7 @@ def main():
         "techsupportdownload </shared/shared/case/.../.../...> | "
         "techsupportcleanup </shared/shared/case/.../.../...> | "
         "policytree | "
-        "lastchecked <ip> | matched <ip> <N>h|d|w | history <ip> <N>h|d|w | roaming <ip> <N>d | rawfields <ip> | "
+        "lastchecked <ip> | matched <ip> <N>h|d|w | history <ip> <N>h|d|w | roaming <ip> <N>d | rawfields <ip> | hostinfo <ip> | "
         "arplist <ip> | appliances | runshowerrors <target> <N>m|h | "
         "pluginlist <target> | "
         "analyzeadm <target> <bundle|-> <window> <switch_filter|-> <top_n> <spike_n> <stale_days> | "
