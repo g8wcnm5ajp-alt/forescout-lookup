@@ -302,8 +302,11 @@ IP_RE = rf"{IP_OCTET}(?:\.{IP_OCTET}){{3}}"
 # dispatcher's own shape check was just IP-only. Distinct from IP_RE,
 # which stays as-is for verbs addressing a HOST being looked up (always
 # IP-addressed in this app's domain, e.g. lookup/arplist/history).
+# 2026-09-18: a customer estate registers appliances by SHORT name (no
+# dot) -- one or more labels now; resolve_target's reg-table membership
+# check remains the real gate.
 HOSTNAME_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
-TARGET_RE = rf"(?:{IP_RE}|{HOSTNAME_LABEL}(?:\.{HOSTNAME_LABEL})+)"
+TARGET_RE = rf"(?:{IP_RE}|{HOSTNAME_LABEL}(?:\.{HOSTNAME_LABEL})*)"
 
 # One "<plugin>:<level>:<minutes>" triple, comma-separated list of them.
 # The plugin name here is only shape-validated (safe identifier charset,

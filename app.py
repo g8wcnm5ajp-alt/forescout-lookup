@@ -45,17 +45,11 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.5.5"
+APP_VERSION = "1.5.6"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
 _tree_cache = {"tree": None}
-
-# Debug panel rows are named "include_<target>_<plugin>" / "level_<target>_<plugin>" --
-# target is an appliance/EM IP (dotted quad), plugin the shape the EM wrapper also
-# validates. Anchored so a target's dots can't be confused with the plugin name that
-# follows the last one.
-TARGET_PLUGIN_KEY_RE = re.compile(r"^((?:\d{1,3}\.){3}\d{1,3})_([a-z][a-z0-9_]{1,40})$")
 
 # A pasted "IP,IP,IP..." could in principle fan out into an unbounded
 # number of SSH round trips through the EM -- capped as a sanity limit,
@@ -1444,139 +1438,8 @@ def do_lookup():
     return render(ip=ip_raw, results=results, error=error, action="lookup", active_ip=active_ip)
 
 
-def _checked_targets():
-    """
-    {target: [plugin, ...]} from whichever include_<target>_<plugin> rows the debug panel's JS built and the
-    user left checked -- the panel already deduplicated plugin/appliance pairs across whichever hosts are
-    ticked, so this just reads back what it rendered.
-    """
-    by_target = {}
-    for key, value in request.form.items():
-        if not key.startswith("include_") or value != "1":
-            continue
-        m = TARGET_PLUGIN_KEY_RE.match(key[len("include_"):])
-        if not m:
-            continue
-        by_target.setdefault(m.group(1), []).append(m.group(2))
-    return by_target
-
-
 def _fmt_utc(epoch):
     return datetime.fromtimestamp(epoch, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
-@app.route("/debugset", methods=["POST"])
-def do_debugset():
-    """
-    Builds one "<plugin>:<level>:<minutes>" spec per target appliance
-    from the debug panel's checkbox/level/duration controls -- a single
-    submission can span more than one appliance (e.g. two hosts on
-    different switch appliances), so this fires one backend call per
-    distinct target and combines the results into one page. mode=start
-    uses each plugin's configured level/minutes; mode=stop ignores those
-    and forces level=0/minutes=1 on the same checked plugins,
-    immediately -- both always take effect right away regardless of
-    time_mode.
-
-    time_mode=window additionally accepts a shared start_epoch/end_epoch
-    (computed client-side from the browser's local timezone) that applies
-    across every checked target. A debug level is a real configuration
-    change to the plugin -- it can never be backdated, only ever take
-    effect from whenever it's actually applied -- so mode=start with
-    time_mode=window splits three ways:
-      - end <= now: fully in the past -- no live debug at all, builds a
-        tech-support bundle per target scoped to that exact historical
-        window instead (fstool's own -t utc:X -t utc:Y, confirmed live
-        against already-rotated logs).
-      - start <= now < end: starts immediately on every target, runs
-        until end_epoch (the already-elapsed start..now portion can't be
-        recovered).
-      - start > now: genuinely delayed -- one schedule_debug_job per
-        target, each firing debug_set_appliance() at start_epoch,
-        running for (end - start).
-    """
-    if not _check_csrf():
-        return render(error="Session expired -- please try again.", action="debugset")
-    mode = request.form.get("mode", "start")
-    time_mode = request.form.get("time_mode", "duration")
-    by_target = _checked_targets()
-    _log_activity("debugset", mode=mode, time_mode=time_mode, targets=list(by_target.keys()))
-
-    if not by_target:
-        return render(error="No plugins selected.", action="debugset")
-
-    if mode == "stop" or time_mode == "duration":
-        duration_minutes = request.form.get("duration_minutes", "60").strip()
-        all_debug_set, errors = [], []
-        for target, plugins in by_target.items():
-            items = []
-            for plugin in plugins:
-                if mode == "stop":
-                    items.append(f"{plugin}:0:1")
-                else:
-                    level = request.form.get(f"level_{target}_{plugin}", "4").strip()
-                    items.append(f"{plugin}:{level}:{duration_minutes}")
-            try:
-                r = debug_set_appliance(target, ",".join(items))
-                all_debug_set.extend(r.get("debug_set", []))
-            except ForescoutClientError as e:
-                errors.append(f"{target}: {e}")
-        result = {"debug_set": all_debug_set} if all_debug_set else None
-        return render(result=result, error="; ".join(errors) or None, action="debugset")
-
-    # time_mode == "window", mode == "start"
-    try:
-        start_epoch = int(request.form.get("start_epoch", "").strip())
-        end_epoch = int(request.form.get("end_epoch", "").strip())
-    except ValueError:
-        return render(error="Invalid start/end time.", action="debugset")
-    if end_epoch <= start_epoch:
-        return render(error="End time must be after start time.", action="debugset")
-
-    now = int(time.time())
-    case_ref, err = _validate_case_ref()
-    if err:
-        return render(error=err, action="debugset")
-
-    if end_epoch <= now:
-        all_bundles, errors = [], []
-        for target, plugins in by_target.items():
-            try:
-                r = build_techsupport_window_appliance(target, start_epoch, end_epoch, plugins, case_ref=case_ref)
-                all_bundles.extend(r.get("bundles", []))
-                for b in r.get("bundles", []):
-                    _log_case_build("window", target, case_ref, {"bundles": [b]}, None)
-            except ForescoutClientError as e:
-                errors.append(f"{target}: {e}")
-        result = {"bundles": all_bundles} if all_bundles else None
-        return render(result=result, error="; ".join(errors) or None, action="techsupport")
-
-    if start_epoch <= now:
-        minutes = max(1, (end_epoch - now + 59) // 60)
-        all_debug_set, errors = [], []
-        for target, plugins in by_target.items():
-            items = [f"{p}:{request.form.get(f'level_{target}_{p}', '4').strip()}:{minutes}" for p in plugins]
-            try:
-                r = debug_set_appliance(target, ",".join(items))
-                all_debug_set.extend(r.get("debug_set", []))
-            except ForescoutClientError as e:
-                errors.append(f"{target}: {e}")
-        result = {"debug_set": all_debug_set} if all_debug_set else None
-        return render(result=result, error="; ".join(errors) or None, action="debugset")
-
-    # start_epoch > now: genuinely scheduled, one job per target.
-    minutes = max(1, (end_epoch - start_epoch + 59) // 60)
-    jobs = []
-    for target, plugins in by_target.items():
-        items = [f"{p}:{request.form.get(f'level_{target}_{p}', '4').strip()}:{minutes}" for p in plugins]
-        spec = ",".join(items)
-        job_id = schedule_debug_job(target, spec, start_epoch)
-        jobs.append({
-            "target": target, "job_id": job_id, "spec": spec,
-            "spec_display": _spec_display(spec),
-            "start_display": _fmt_utc(start_epoch), "end_display": _fmt_utc(end_epoch),
-        })
-    return render(result={"jobs": jobs}, action="debugscheduled")
 
 
 @app.route("/scheduled/cancel", methods=["POST"])

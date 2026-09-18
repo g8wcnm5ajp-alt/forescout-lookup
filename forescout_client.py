@@ -48,8 +48,13 @@ def valid_ip(ip):
 # problem, this app's own validation was just IP-only. valid_ip stays
 # separate and unchanged for HOST ips (the thing actually being looked
 # up), which are always IP-addressed in this app's domain.
+# 2026-09-18, a customer estate: appliances registered by SHORT name
+# ("appliance01", no dot) -- the "at least one label after a dot" shape
+# rejected every one of them ("is not a valid target"). A hostname is one
+# or more labels; the EM-side resolve_target still requires the value to
+# be in the reg table, so the shape check is not the authorization.
 HOSTNAME_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
-TARGET_RE = re.compile(rf"^(?:{IP_RE.pattern[1:-1]}|{HOSTNAME_LABEL}(?:\.{HOSTNAME_LABEL})+)$")
+TARGET_RE = re.compile(rf"^(?:{IP_RE.pattern[1:-1]}|{HOSTNAME_LABEL}(?:\.{HOSTNAME_LABEL})*)$")
 
 
 def valid_target(target):
