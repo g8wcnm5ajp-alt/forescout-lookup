@@ -781,6 +781,17 @@ def list_uploaded_bundles(timeout=20):
 
 
 MAX_CORRELATE_BUNDLES = 8
+ROAM_KEY_RE = re.compile(r"^(?:[0-9a-fA-F]{12}|(?:[0-9a-fA-F]{2}[:\-]){5}[0-9a-fA-F]{2}|\d{1,3}(?:\.\d{1,3}){3})$")
+
+
+def bundle_roaming(path, key, timeout=1900):
+    """Where one device (MAC or IP) was seen connected, from a bundle's own logs -- see webapp-query.py's
+    do_bundleroam. Same three accepted path shapes as analyze_admission."""
+    if not (BUNDLE_PATH_RE.match(path or "") or UPLOAD_PATH_RE.match(path or "") or MANUAL_STAGING_PATH_RE.match(path or "")):
+        raise ForescoutClientError(f"'{path}' is not a recognized tech-support bundle path.")
+    if not ROAM_KEY_RE.match(key or ""):
+        raise ForescoutClientError("Enter a MAC address (aa:bb:cc:dd:ee:ff or aabbccddeeff) or an IPv4 address.")
+    return _run_verb(f"bundleroam {path} {key}", timeout=timeout)
 
 
 def correlate_bundles(paths, gap=150, context=120, top_n=10, timeout=3700):
@@ -818,6 +829,19 @@ def matched_rules(ip, window, timeout=30):
     if not WINDOW_RE.match(window or ""):
         raise ForescoutClientError(f"'{window}' is not a valid window (expected e.g. 24h, 3d, 2w).")
     return _run_verb(f"matched {ip} {window}", timeout=timeout)
+
+
+ROAMING_WINDOW_RE = re.compile(r"^(?:[1-9]|1\d|2[0-8])d$")
+
+
+def roaming(ip, window, timeout=150):
+    """Switches/ports and wireless APs the host was connected to inside the window (1d-28d), with
+    counts -- see webapp-query.py's do_roaming (replays the managing appliance's source_log)."""
+    if not valid_ip(ip):
+        raise ForescoutClientError(f"'{ip}' is not a valid IPv4 address.")
+    if not ROAMING_WINDOW_RE.match(window or ""):
+        raise ForescoutClientError(f"'{window}' is not a valid roaming window (expected 1d to 28d).")
+    return _run_verb(f"roaming {ip} {window}", timeout=timeout)
 
 
 def policy_history(ip, window, timeout=30):

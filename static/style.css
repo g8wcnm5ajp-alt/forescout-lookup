@@ -176,6 +176,14 @@ table.params td { word-break: break-all; max-width: 380px; }
 /* Upload & Review reports are column-aligned tables -- need a fixed-width face and more room */
 .analyze-output-mono { font-family: Consolas, "Cascadia Mono", "Courier New", monospace; font-size: 0.78rem; max-height: 70vh; white-space: pre; overflow-x: auto; }
 .analyze-disabled-link { pointer-events: none; opacity: 0.4; }
+/* Roaming graph/table (IP Lookup section + Upload & Review view), 2026-09-18 */
+.roaming-graph { height: auto; max-height: 70vh; overflow: auto; }
+.roaming-svg text { fill: var(--text); }
+.roaming-table { width: 100%; margin-top: 0.5rem; }
+.roaming-table th, .roaming-table td { font-size: 0.85rem; }
+/* IP Lookup cards are <details> now; keep the grid cards level with each other */
+details.ip-section { align-self: start; }
+details.ip-section > summary { font-size: 1.05rem; }
 .analyze-progress { margin-top: 0.5rem; }
 .analyze-steps { margin: 0.4rem 0 0.4rem 1.2rem; padding: 0; }
 .analyze-steps li { margin-bottom: 0.15rem; }

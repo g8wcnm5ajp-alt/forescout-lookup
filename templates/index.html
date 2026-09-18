@@ -165,13 +165,15 @@
                     </form>
                     <button type="button" class="btn-small btn-gold ip-report-export-btn" onclick="window.print()">Export to PDF</button>
                     <a class="btn-small" href="/hostlog/download/{{ result.ip }}">Download host log (.zip)</a>
+                    <button type="button" class="btn-small btn-secondary ip-sections-expand" data-slug="{{ slug }}">Expand all</button>
+                    <button type="button" class="btn-small btn-secondary ip-sections-collapse" data-slug="{{ slug }}">Collapse all</button>
                     </span>
                 </h2>
                 <p class="hint no-print">Printed report includes this IP's identity, location, and policy data below -- other open IP tabs and the search controls above are left out.</p>
 
                 <div class="grid">
-                    <div class="card">
-                        <h3>Identity</h3>
+                    <details class="card data-section ip-section" data-section="identity" open>
+                        <summary>Identity</summary>
                         <table>
                             <tr><th>MAC</th><td>{{ result.mac or '—' }}{% if result.mac_source_appliance %} <span class="muted">(via {{ result.mac_source_appliance }})</span>{% endif %}</td></tr>
                             <tr><th>Managing appliance</th><td>{{ result.managing_appliance }}</td></tr>
@@ -182,11 +184,11 @@
                             <tr><th>Active</th><td>{{ result.active or '—' }}</td></tr>
                             <tr><th>Current connection since</th><td>{{ result.connection_since or 'unknown' }}</td></tr>
                         </table>
-                    </div>
+                    </details>
 
                     {% if result.location.wired %}
-                    <div class="card">
-                        <h3>Wired location</h3>
+                    <details class="card data-section ip-section" data-section="wired">
+                        <summary>Wired location</summary>
                         <table>
                             <tr><th>Switch</th><td>{{ result.location.wired.switch_hostname or '—' }} ({{ result.location.wired.switch_ip or '—' }})</td></tr>
                             <tr><th>Port</th><td>{{ result.location.wired.port or '—' }}</td></tr>
@@ -196,25 +198,25 @@
                             <tr><th>ARP source appliance <span class="muted">(L3)</span></th><td>{{ result.location.wired.arp_source_appliances|join(', ') or '—' }}</td></tr>
                         </table>
                         <p class="hint">Appliance(s) recorded as the source of the switch/port and ARP data above -- the same field-source attribution shown elsewhere on this page (e.g. the MAC's source), not independently-verified proof of which appliance physically polls the switch itself.</p>
-                    </div>
+                    </details>
                     {% endif %}
 
                     {% if result.location.wireless %}
-                    <div class="card">
-                        <h3>Wireless location</h3>
+                    <details class="card data-section ip-section" data-section="wireless">
+                        <summary>Wireless location</summary>
                         <table>
                             <tr><th>SSID</th><td>{{ result.location.wireless.ssid or '—' }}</td></tr>
                             <tr><th>AP</th><td>{{ result.location.wireless.ap or '—' }}</td></tr>
                             <tr><th>WLC</th><td>{{ result.location.wireless.wlc or '—' }}{% if result.location.wireless.wlc_source == 'wireless_plugin_config' %} <span class="muted">(from plugin config)</span>{% endif %}</td></tr>
                             <tr><th>Client status</th><td>{{ result.location.wireless.client_status or '—' }}</td></tr>
                         </table>
-                    </div>
+                    </details>
                     {% endif %}
                 </div>
 
                 {% if result.arp_list %}
-                <div class="card">
-                    <h3>ARP decode</h3>
+                <details class="card data-section ip-section" data-section="arp">
+                    <summary>ARP decode</summary>
                     <table id="arp-decode-table-{{ slug }}" data-ip="{{ result.ip }}"
                            data-initial-rows="{{ result.arp_list|tojson|forceescape }}">
                         <tr><th>Appliance</th><th>ARP source</th><th>Resolved IP</th><th>MAC</th><th>Vendor</th><th>ARP resolved</th><th>MAC resolved</th><th>Last checked</th></tr>
@@ -228,18 +230,38 @@
                         {% endfor %}
                     </table>
                     <p class="hint" id="arp-refresh-status-{{ slug }}"></p>
-                </div>
+                </details>
                 {% endif %}
 
-                <div class="card">
-                    <h3>Host Details</h3>
+                <details class="card data-section ip-section" data-section="roaming">
+                    <summary>Roaming <span class="muted">(switches / ports and wireless APs this device was seen connected to)</span></summary>
+                    <div class="tree-filter-row no-print">
+                        <label class="tree-filter-toggle">Show the last</label>
+                        <select id="roaming-window-{{ slug }}">
+                            <option value="1d">1 day</option>
+                            <option value="3d">3 days</option>
+                            <option value="7d" selected>1 week</option>
+                            <option value="14d">2 weeks</option>
+                            <option value="28d">4 weeks</option>
+                        </select>
+                        <button type="button" id="roaming-load-{{ slug }}" class="btn-small">Load</button>
+                        <button type="button" class="btn-small btn-secondary print-graph-btn" data-target="roaming-graph-{{ slug }}" data-title="Roaming -- {{ result.ip }}">Print graph</button>
+                        <span class="muted" id="roaming-status-{{ slug }}"></span>
+                    </div>
+                    <p class="hint">Replayed from the managing appliance's own property-change log (source_log): every switch/port or AP/SSID the host was recorded on inside the window, how many times it (re)connected there, and how long it stayed. Bigger circle = seen there more often. Green = wired, orange = wireless.</p>
+                    <div id="roaming-graph-{{ slug }}" class="roaming-graph tree-graphic-container" data-ip="{{ result.ip }}" style="display:none;"></div>
+                    <div id="roaming-body-{{ slug }}"></div>
+                </details>
+
+                <details class="card data-section ip-section" data-section="hostdetails">
+                    <summary>Host Details</summary>
                     <button type="button" id="hostdetails-btn-{{ slug }}" class="no-print">Load Host Details</button>
                     <p class="hint">A categorized summary (Classification, General, User, Network Access, Classification Details, More) built from the same raw field data as the Raw fields table further down -- only shows fields this app actually recognizes.</p>
                     <div id="hostdetails-body-{{ slug }}"></div>
-                </div>
+                </details>
 
-                <div class="card">
-                    <h3>Policy match history <span class="muted">(fleet-health noise filtered out)</span></h3>
+                <details class="card data-section ip-section" data-section="history">
+                    <summary>Policy match history <span class="muted">(fleet-health noise filtered out)</span></summary>
                     <p class="hint">Current connection since: <strong>{{ result.connection_since or 'unknown' }}</strong> — rows from an earlier connection (e.g. a prior wired session before the host moved to its current medium) are dimmed and marked <span class="conn-badge conn-prior">prior</span>.</p>
                     <div class="tree-filter-row no-print">
                         <label class="tree-filter-toggle">Showing matches from the last</label>
@@ -276,10 +298,10 @@
                         </tr>
                         {% endfor %}
                     </table>
-                </div>
+                </details>
 
-                <div class="card">
-                    <h3>Current Policy Tree</h3>
+                <details class="card data-section ip-section" data-section="tree">
+                    <summary>Current Policy Tree</summary>
                     <div class="tree-filter-row no-print">
                         <label class="tree-filter-toggle">
                             <input type="checkbox" id="tree-filter-{{ slug }}" checked>
@@ -292,14 +314,15 @@
                             <option value="w">Week(s)</option>
                         </select>
                         <span class="muted" id="tree-window-status-{{ slug }}"></span>
+                        <button type="button" class="btn-small btn-secondary print-graph-btn" data-target="policy-tree-graphic-{{ slug }}" data-title="Current Policy Tree -- {{ result.ip }}">Print tree</button>
                     </div>
-                    <p class="hint no-print">Click and drag to pan around the tree.</p>
+                    <p class="hint no-print">Click and drag to pan around the tree. Print tree prints the whole tree as currently expanded, at full size.</p>
                     <div id="policy-tree-graphic-{{ slug }}" class="tree-graphic-container" data-initial-ids="{{ result.last_checked.rule_ids|tojson|forceescape }}">
                     </div>
-                </div>
+                </details>
 
-                <div class="card">
-                    <h3>Raw fields <span class="muted">(the full `fstool hostinfo` property dump -- {{ result.raw_field_count }} fields total)</span></h3>
+                <details class="card data-section ip-section" data-section="rawfields">
+                    <summary>Raw fields <span class="muted">(the full `fstool hostinfo` property dump -- {{ result.raw_field_count }} fields total)</span></summary>
                     <button type="button" id="rawfields-load-btn-{{ slug }}" class="no-print">Load raw fields</button>
                     <div id="rawfields-controls-{{ slug }}" class="tree-filter-row no-print" style="display:none; margin-top:0.75rem;">
                         <input type="text" id="rawfields-search-{{ slug }}" placeholder="Filter field names, e.g. dhcp" style="flex:1; min-width:200px;">
@@ -314,7 +337,7 @@
                         <table id="rawfields-table-{{ slug }}" class="rawfields-table"><tr><th>Field</th><th>Value</th><th>Source</th><th>Appliance</th><th>Time</th></tr></table>
                     </div>
                     <p class="hint" id="rawfields-refresh-status-{{ slug }}"></p>
-                </div>
+                </details>
             </section>
         {% endfor %}
 
@@ -521,6 +544,21 @@
                 <button type="button" id="upload-output-clear" class="btn-small btn-secondary">Clear results</button>
             </div>
             <pre id="upload-bundle-output" class="analyze-output analyze-output-mono" style="display:none;"></pre>
+        </div>
+        <div class="card no-print" id="upload-roaming-card" style="display:none;">
+            <h3>Roaming <span class="muted">(one device's switches / ports / wireless APs, from a bundle's own logs)</span></h3>
+            <div class="tree-filter-row">
+                <label class="tree-filter-toggle">Bundle</label>
+                <select id="upload-roaming-bundle" style="min-width:22em;"></select>
+                <label class="tree-filter-toggle">MAC or IP</label>
+                <input type="text" id="upload-roaming-key" placeholder="aa:bb:cc:dd:ee:ff or 10.0.0.5" style="width:16em;">
+                <button type="button" id="upload-roaming-btn">Load</button>
+                <button type="button" class="btn-small btn-secondary print-graph-btn" data-target="upload-roaming-graph" data-title="Roaming (bundle)">Print graph</button>
+                <span class="hint" id="upload-roaming-status"></span>
+            </div>
+            <p class="hint">Only as complete as the logs in the bundle: trap-driven MAC add/remove on switch ports, plugin learn events, trace learn events and wireless client clears. At baseline debug the Switch plugin does not log every admission, so this can be sparse unless keyed debug was on.</p>
+            <div id="upload-roaming-graph" class="roaming-graph tree-graphic-container" style="display:none;"></div>
+            <div id="upload-roaming-body"></div>
         </div>
         </section>
 
@@ -1940,7 +1978,7 @@
                             " (deleted after reading -- this panel is a live review, not a retained bundle)</p>" +
                             renderCategories(result.categories) +
                             renderDiagFiles(result.diag_files) +
-                            "<h4 class=\"diag-section-heading\">Policy Flow Graph</h4>" +
+                            "<h4 class=\"diag-section-heading\">Policy Flow Graph <button type=\"button\" class=\"btn-small btn-secondary print-graph-btn no-print\" data-title=\"Policy Flow Graph\">Print tree</button></h4>" +
                             "<p class=\"hint\">This EM's full policy tree, collapsed by default (it's large) -- click a folder to expand it.</p>" +
                             "<div class=\"card\"><div class=\"tree-graphic-container policy-graph-container\"></div></div>"
                         );
@@ -2166,7 +2204,9 @@
             // precise ETA or per-step state we don't have.
             window.renderAnalyzeProgress = function (d) {
                 const elapsed = Math.max(0, Math.round((Date.now() - d.started_at * 1000) / 1000));
-                const steps = d.kind === "correlate"
+                const steps = d.kind === "roaming"
+                    ? ["Stream the bundle once looking for this device: " + d.bundle]
+                    : d.kind === "correlate"
                     ? ["Stream each bundle once (nothing is unpacked to disk): " + d.bundle,
                        "Identify each bundle (EM / appliance, node ID) and line the clocks up",
                        "Rebuild the EM-to-appliance disconnect timeline from both sides' Trace_cu logs",
@@ -2256,6 +2296,168 @@
     </script>
 
     <script>
+        // IP Lookup sections (David's ask, 2026-09-18: "a tree view like the appliance page"):
+        // every result card is a native <details>; Identity opens by default, the rest
+        // remember what you last left open (per section name, in this browser).
+        (function () {
+            const KEY = "ipSectionsOpen";
+            let prefs = {};
+            try { prefs = JSON.parse(localStorage.getItem(KEY) || "{}"); } catch (e) { prefs = {}; }
+            const sections = Array.from(document.querySelectorAll("details.ip-section"));
+            if (!sections.length) return;
+            sections.forEach(d => {
+                const name = d.dataset.section;
+                if (name in prefs) d.open = !!prefs[name];
+                d.addEventListener("toggle", () => {
+                    prefs[name] = d.open;
+                    try { localStorage.setItem(KEY, JSON.stringify(prefs)); } catch (e) { /* private window etc. */ }
+                });
+            });
+            document.querySelectorAll(".ip-sections-expand, .ip-sections-collapse").forEach(btn => {
+                btn.addEventListener("click", () => {
+                    const open = btn.classList.contains("ip-sections-expand");
+                    btn.closest("section.result").querySelectorAll("details.ip-section").forEach(d => { d.open = open; });
+                });
+            });
+        })();
+
+        // Print tree / Print graph (David's ask, 2026-09-18): print ONE tree or graph, as currently
+        // expanded, at its full size -- the on-page container scrolls and pans, so a plain page
+        // print would clip it. Opens the SVG alone in a print window with the app's own styles.
+        window.printGraphContainer = function (container, title) {
+            const svg = container && container.querySelector("svg");
+            if (!svg) { window.alert("Nothing to print yet -- load or expand the graph first."); return; }
+            const w = window.open("", "_blank");
+            if (!w) { window.alert("The browser blocked the print window -- allow pop-ups for this site."); return; }
+            const clone = svg.cloneNode(true);
+            clone.style.transform = "";
+            clone.removeAttribute("style");
+            const width = parseFloat(svg.getAttribute("width")) || svg.getBoundingClientRect().width;
+            const height = parseFloat(svg.getAttribute("height")) || svg.getBoundingClientRect().height;
+            const links = Array.from(document.querySelectorAll("link[rel=stylesheet]")).map(l => l.outerHTML).join("");
+            w.document.write("<!doctype html><html><head><title>" + (title || "Graph").replace(/</g, "&lt;") + "</title>" + links +
+                "<style>@page{size:auto;margin:10mm} html,body{background:#fff !important;color:#000;margin:0} " +
+                ".sheet{padding:8mm} h1{font-size:14pt;margin:0 0 6mm 0} svg{max-width:100%;height:auto;display:block} " +
+                ".tree-graphic-node text,.roaming-graph text{fill:#000 !important}</style></head><body><div class=\"sheet\">" +
+                "<h1>" + (title || "").replace(/</g, "&lt;") + "</h1></div></body></html>");
+            w.document.close();
+            w.document.querySelector(".sheet").appendChild(clone);
+            clone.setAttribute("width", width);
+            clone.setAttribute("height", height);
+            w.focus();
+            setTimeout(() => { w.print(); }, 400);
+        };
+        document.addEventListener("click", ev => {
+            const btn = ev.target.closest(".print-graph-btn");
+            if (!btn) return;
+            let container = btn.dataset.target ? document.getElementById(btn.dataset.target) : null;
+            if (!container) {
+                const scope = btn.closest(".card, .appliance-report, section") || document;
+                container = scope.querySelector(".policy-graph-container, .tree-graphic-container");
+            }
+            window.printGraphContainer(container, btn.dataset.title || "Graph");
+        });
+
+        // Roaming graph + table renderer (shared by the IP Lookup section and the Upload & Review
+        // view). data = {nodes:[{kind,label,sub,count,seconds,first_display,last_display,still_connected}],
+        // events:[{time,kind,event,label,sub}], from, to, rows, appliance}
+        window.renderRoaming = function (graphEl, bodyEl, data, centreLabel) {
+            const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[c]));
+            const fmtDur = s => { s = Math.round(s || 0); if (s < 60) return s + "s"; if (s < 3600) return Math.floor(s / 60) + "m"; if (s < 86400) return Math.floor(s / 3600) + "h " + Math.floor((s % 3600) / 60) + "m"; return Math.floor(s / 86400) + "d " + Math.floor((s % 86400) / 3600) + "h"; };
+            const nodes = data.nodes || [];
+            graphEl.innerHTML = "";
+            if (!nodes.length) {
+                graphEl.style.display = "none";
+                bodyEl.innerHTML = "<p class=\"hint\">No switch/port or wireless AP records for this device in the window (" + esc(data.from) + " .. " + esc(data.to) + ")." +
+                    (data.rows ? "" : " The property-change log had nothing at all for it in that period.") + "</p>";
+                return;
+            }
+            const maxCount = Math.max.apply(null, nodes.map(n => n.count || 1));
+            const N = nodes.length;
+            const W = Math.max(760, 300 + N * 70), H = Math.max(520, 300 + N * 36);
+            const cx = W / 2, cy = H / 2;
+            const R = Math.min(W, H) / 2 - 120;
+            const svgNS = "http://www.w3.org/2000/svg";
+            const svg = document.createElementNS(svgNS, "svg");
+            svg.setAttribute("width", W); svg.setAttribute("height", H); svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+            svg.classList.add("roaming-svg");
+            const el = (name, attrs, text) => { const e = document.createElementNS(svgNS, name); for (const k in attrs) e.setAttribute(k, attrs[k]); if (text != null) e.textContent = text; return e; };
+            nodes.forEach((n, i) => {
+                const a = -Math.PI / 2 + (2 * Math.PI * i) / N;
+                const x = cx + R * Math.cos(a), y = cy + R * Math.sin(a);
+                const r = 14 + 30 * Math.sqrt((n.count || 1) / maxCount);
+                const colour = n.kind === "ap" ? "#e8a33d" : "#3fa34d";
+                const line = el("line", { x1: cx, y1: cy, x2: x, y2: y, stroke: colour, "stroke-opacity": 0.55, "stroke-width": 1 + 5 * ((n.count || 1) / maxCount) });
+                svg.appendChild(line);
+                const mx = (cx + x) / 2, my = (cy + y) / 2;
+                svg.appendChild(el("rect", { x: mx - 16, y: my - 9, width: 32, height: 18, rx: 9, fill: "#1f2937", stroke: colour }));
+                svg.appendChild(el("text", { x: mx, y: my + 4, "text-anchor": "middle", "font-size": 11, fill: "#fff" }, String(n.count)));
+                const g = el("g", { class: "roaming-node" });
+                const c = el("circle", { cx: x, cy: y, r: r, fill: colour, "fill-opacity": n.still_connected ? 0.95 : 0.55, stroke: n.still_connected ? "#fff" : colour, "stroke-width": n.still_connected ? 3 : 1 });
+                c.appendChild(el("title", {}, (n.kind === "ap" ? "Wireless AP " : "Switch ") + n.label + (n.sub ? " / " + n.sub : "") + "\nconnected " + n.count + "x, " + fmtDur(n.seconds) + " in total\n" + n.first_display + " .. " + n.last_display + (n.still_connected ? "\n(still connected)" : "")));
+                g.appendChild(c);
+                const below = y > cy ? 1 : -1;
+                const ty = y + below * (r + 14);
+                g.appendChild(el("text", { x: x, y: ty, "text-anchor": "middle", "font-size": 12, "font-weight": 600 }, n.label.length > 34 ? n.label.slice(0, 33) + "…" : n.label));
+                if (n.sub) g.appendChild(el("text", { x: x, y: ty + below * 14, "text-anchor": "middle", "font-size": 11, opacity: 0.8 }, n.sub.length > 40 ? n.sub.slice(0, 39) + "…" : n.sub));
+                svg.appendChild(g);
+            });
+            svg.appendChild(el("circle", { cx: cx, cy: cy, r: 38, fill: "#2563eb", stroke: "#fff", "stroke-width": 2 }));
+            const cl = String(centreLabel);
+            const parts = cl.length > 12 && cl.indexOf(":") > 0 ? [cl.slice(0, 8), cl.slice(8)] : [cl];
+            parts.forEach((p, i) => svg.appendChild(el("text", { x: cx, y: cy + 4 + (i - (parts.length - 1) / 2) * 13, "text-anchor": "middle", "font-size": 10, "font-weight": 700, fill: "#fff" }, p)));
+            graphEl.appendChild(svg);
+            graphEl.style.display = "block";
+            let html = "<p class=\"hint\">" + esc(data.from) + " .. " + esc(data.to) + (data.appliance ? " -- from " + esc(data.appliance) : "") + (data.rows != null ? " -- " + data.rows + " property changes replayed" : "") + (data.sources ? " -- sources: " + esc(data.sources) : "") + "</p>" +
+                "<table class=\"roaming-table\"><tr><th>Type</th><th>Switch / AP</th><th>Port / SSID</th><th>Times connected</th><th>Time connected</th><th>First seen (UTC)</th><th>Last seen (UTC)</th></tr>";
+            nodes.forEach(n => {
+                html += "<tr><td>" + (n.kind === "ap" ? "Wireless AP" : "Switch") + "</td><td>" + esc(n.label) + "</td><td>" + esc(n.sub || "—") + "</td><td>" + n.count + "</td><td>" + fmtDur(n.seconds) + (n.still_connected ? " <span class=\"muted\">(still connected)</span>" : "") + "</td><td>" + esc(n.first_display) + "</td><td>" + esc(n.last_display) + "</td></tr>";
+            });
+            html += "</table>";
+            if (data.events && data.events.length) {
+                html += "<details class=\"data-section\" style=\"margin-top:0.5rem;\"><summary>Timeline (" + data.events.length + " events, oldest first)</summary><table class=\"roaming-table\"><tr><th>Time (UTC)</th><th>Event</th><th>Switch / AP</th><th>Port / SSID</th></tr>";
+                data.events.forEach(e => { html += "<tr><td>" + esc(e.time) + "</td><td>" + esc(e.event) + "</td><td>" + esc(e.label) + "</td><td>" + esc(e.sub || "—") + "</td></tr>"; });
+                html += "</table></details>";
+            }
+            bodyEl.innerHTML = html;
+        };
+
+        // Roaming section on each IP Lookup result: loads on demand (Load button, or the first time
+        // the section is opened), one time-bounded query per load.
+        (function () {
+            document.querySelectorAll("details.ip-section[data-section=roaming]").forEach(sec => {
+                const graphEl = sec.querySelector(".roaming-graph");
+                const ip = graphEl.dataset.ip;
+                const slug = ip.replace(/\./g, "-");
+                const sel = document.getElementById("roaming-window-" + slug);
+                const btn = document.getElementById("roaming-load-" + slug);
+                const status = document.getElementById("roaming-status-" + slug);
+                const body = document.getElementById("roaming-body-" + slug);
+                let loaded = false, busy = false;
+                function load() {
+                    if (busy) return;
+                    busy = true; btn.disabled = true;
+                    status.textContent = "Loading…";
+                    fetch("/api/roaming/" + ip + "?window=" + encodeURIComponent(sel.value))
+                        .then(r => r.json())
+                        .then(d => {
+                            if (d.error) { status.textContent = "Failed: " + d.error; return; }
+                            loaded = true;
+                            status.textContent = (d.nodes || []).length + " place(s)";
+                            window.renderRoaming(graphEl, body, d, ip);
+                        })
+                        .catch(err => { status.textContent = "Failed: " + err; })
+                        .finally(() => { busy = false; btn.disabled = false; });
+                }
+                btn.addEventListener("click", load);
+                sel.addEventListener("change", load);
+                sec.addEventListener("toggle", () => { if (sec.open && !loaded) load(); });
+                if (sec.open) load();
+            });
+        })();
+    </script>
+
+    <script>
         // Upload & Review Bundle tab -- one or several bundles are uploaded
         // straight to the EM (sequentially, /bundle/upload with analyze=0),
         // listed from /bundle/uploads, then either correlated together
@@ -2315,6 +2517,10 @@
                 }).join("");
                 allBox.checked = bundles.length > 0 && bundles.every(b => ticked.has(b.path));
                 if (busy) setBusy(true);
+                const roamSel = document.getElementById("upload-roaming-bundle");
+                const keep = roamSel.value;
+                roamSel.innerHTML = bundles.map(b => "<option value=\"" + esc(b.path) + "\"" + (b.path === keep ? " selected" : "") + ">" + esc(b.name) + "</option>").join("");
+                document.getElementById("upload-roaming-card").style.display = bundles.length ? "" : "none";
             }
 
             function refreshList() {
@@ -2460,6 +2666,47 @@
                         .catch(err => window.alert("Failed to delete: " + err));
                 }
             });
+
+            // Roaming from a bundle (David's ask, 2026-09-18): same graph/table as the IP Lookup section
+            (function () {
+                const sel = document.getElementById("upload-roaming-bundle");
+                const key = document.getElementById("upload-roaming-key");
+                const btn = document.getElementById("upload-roaming-btn");
+                const st = document.getElementById("upload-roaming-status");
+                const graph = document.getElementById("upload-roaming-graph");
+                const body = document.getElementById("upload-roaming-body");
+                function poll(runId, label) {
+                    fetch("/api/analyze_run/" + runId)
+                        .then(r => r.json())
+                        .then(d => {
+                            if (d.error && !d.status) { st.textContent = "error: " + d.error; btn.disabled = false; return; }
+                            if (d.status === "running") {
+                                st.textContent = "Scanning the bundle for " + label + "… (" + Math.max(0, Math.round((Date.now() - d.started_at * 1000) / 1000)) + "s)";
+                                setTimeout(() => poll(runId, label), 3000);
+                                return;
+                            }
+                            btn.disabled = false;
+                            if (d.status === "failed") { st.textContent = "Failed: " + (d.error || "unknown error"); return; }
+                            const r = d.result || {};
+                            st.textContent = (r.nodes || []).length + " place(s), " + (r.rows || 0) + " matching log lines";
+                            window.renderRoaming(graph, body, r, label);
+                            if (r.note) body.insertAdjacentHTML("beforeend", "<p class=\"hint\">" + esc(r.note) + "</p>");
+                        })
+                        .catch(() => { setTimeout(() => poll(runId, label), 3000); });
+                }
+                btn.addEventListener("click", () => {
+                    const k = key.value.trim();
+                    if (!sel.value || !k) { window.alert("Pick a bundle and enter a MAC or IP address."); return; }
+                    btn.disabled = true;
+                    st.textContent = "Starting…";
+                    graph.style.display = "none"; body.innerHTML = "";
+                    fetch("/bundle/roaming", { method: "POST", body: new URLSearchParams({ csrf_token: CSRF_TOKEN, path: sel.value, key: k }) })
+                        .then(r => r.json())
+                        .then(d => { if (d.error) { btn.disabled = false; st.textContent = "Failed to start: " + d.error; return; } poll(d.run_id, k); })
+                        .catch(err => { btn.disabled = false; st.textContent = "Failed to start: " + err; });
+                });
+                key.addEventListener("keydown", ev => { if (ev.key === "Enter") btn.click(); });
+            })();
 
             correlateBtn.addEventListener("click", () => {
                 if (!ticked.size) { window.alert("Tick the bundles that belong together -- an EM bundle and its appliance bundle(s)."); return; }

@@ -187,6 +187,11 @@ Verbs (see the plan this was built from, forescout-lookup):
                             for this host (from eval_status, the record
                             of every rule *evaluated*, not just ones
                             that fired an action) -- cheap
+    roaming <ip> <N>d       switches/ports and wireless APs the host was
+                            connected to inside the window (1d-28d), with
+                            counts and connected time -- replays the managing
+                            appliance's source_log (time-bounded, never
+                            unbounded)
     matched <ip> <N><h|d|w> distinct rule_ids matched (np_action fired,
                             or eval_status matched) within a real time
                             window -- e.g. "matched 203.0.113.10 3d" --
@@ -238,6 +243,9 @@ Verbs (see the plan this was built from, forescout-lookup):
                             the uploads directory only
     bundleuploadlist        no args -- every bundle currently in the
                             uploads directory (name, size, mtime)
+    bundleroam <path> <mac|ip>
+                            where one device was seen connected, from that
+                            bundle's own logs (bundle-correlate.py --roaming)
     bundlecorrelate <path>[,<path>...] <gap_s> <context_s> <top_n>
                             runs bundle-correlate.py over 1-8 bundles
                             together (EM + appliance): clock alignment,
@@ -3172,6 +3180,173 @@ def do_history(ip, window_str):
     }))
 
 
+
+# ---------------------------------------------------------------------
+# Endpoint roaming -- David's ask, 2026-09-18: which switches/ports and
+# wireless APs a device was seen connected to over an adjustable window,
+# with counts, so the console can draw a "roaming" graph.
+#
+# Source: the managing appliance's source_log table -- every per-property
+# learn/update for the host, one row per change, `time` in epoch
+# MILLISECONDS (confirmed in Client Activity Log Tool, 2026-08-19), the
+# property's display name in `name` and its value in `details`. The
+# switch/AP properties used here were confirmed live on a lab appliance
+# 2026-09-18 ("Switch IP/FQDN", "Switch Port Name", "Switch Port Connect"
+# = Connected/Disconnected, "WLAN AP Name", "WLAN SSID", "WLAN BSSID",
+# ...). ALWAYS time-bounded: an unbounded source_log query for one host
+# ran 10+ minutes live; a bounded one returns in well under a second.
+# ---------------------------------------------------------------------
+ROAMING_PROPS = (
+    "Switch IP/FQDN", "Switch Hostname", "Switch Port Name", "Switch Port Alias", "Switch Port Connect",
+    "WLAN AP Name", "WLAN AP Location", "WLAN BSSID", "WLAN SSID", "WLAN Association Status",
+    "WLAN Client Connectivity Status",
+)
+ROAMING_SEP = "#~#"
+
+
+def get_roaming(ip, mode, appliance, window_seconds):
+    """-> {"nodes": [...], "events": [...], "rows": n} -- stints on each switch/port or AP/SSID the
+    host was connected to inside the window, built by replaying source_log in time order."""
+    int_ip = ip_to_int(ip)
+    now = int(time.time())
+    cutoff_ms = (now - window_seconds) * 1000
+    names = ", ".join("'" + p + "'" for p in ROAMING_PROPS)
+    sql = (
+        f"SELECT time, name, coalesce(details,''), coalesce(status,'') FROM source_log "
+        f"WHERE primary_id={int_ip} AND time>={cutoff_ms} AND name IN ({names}) ORDER BY time LIMIT 20000;"
+    )
+    if mode == "em":
+        out, err, rc = run(["psql", "-t", "-A", "-F", ROAMING_SEP, "-c", sql], timeout=120)
+    else:
+        out, err, rc = ssh_appliance(appliance, f"psql -t -A -F '{ROAMING_SEP}' -c \"{sql}\"", timeout=120)
+    if rc != 0:
+        fail(f"source_log query failed on {appliance or 'the EM'}: {(err or out).strip()[-300:]}")
+
+    events = []
+    for line in out.splitlines():
+        parts = line.split(ROAMING_SEP)
+        if len(parts) != 4 or not parts[0].strip().isdigit():
+            continue
+        t = int(parts[0]) // 1000
+        name, details, status = parts[1].strip(), parts[2].strip(), parts[3].strip()
+        if status.lower() == "failed" or details.startswith("Failed to learn"):
+            continue
+        events.append((t, name, details))
+
+    # replay: one open "stint" per medium (wired / wireless); a stint = a spell on one node
+    nodes = {}          # key -> node dict
+    stints = []         # (key, start, end|None)
+    open_stint = {"wired": None, "wireless": None}
+    cur = {"sw": None, "sw_name": None, "port": None, "alias": None, "ap": None, "ap_loc": None, "ssid": None, "bssid": None}
+    timeline = []
+
+    def close(medium, t):
+        st = open_stint[medium]
+        if st is not None and st[2] is None:
+            st[2] = t
+        open_stint[medium] = None
+
+    def open_(medium, key, label, sub, kind, t):
+        st = open_stint[medium]
+        if st is not None and st[0] == key and st[2] is None:
+            return
+        close(medium, t)
+        st = [key, t, None]
+        stints.append(st)
+        open_stint[medium] = st
+        n = nodes.get(key)
+        if n is None:
+            n = nodes[key] = {"key": key, "kind": kind, "label": label, "sub": sub, "count": 0,
+                              "first": t, "last": t, "seconds": 0}
+        n["count"] += 1
+        n["first"] = min(n["first"], t)
+        n["last"] = max(n["last"], t)
+        timeline.append({"time": format_epoch(t), "t": t, "kind": kind, "label": label, "sub": sub, "event": "connected"})
+
+    for t, name, details in events:
+        # "Property value cleared: Switch Port Name - Fa0/8; Context: Purger" -- the property was
+        # removed (purger, or the plugin dropping it), not a new value: treat as a disconnect
+        if details.startswith("Property value cleared"):
+            medium = "wired" if name.startswith("Switch") else "wireless"
+            if open_stint[medium] is not None:
+                k = open_stint[medium][0]
+                timeline.append({"time": format_epoch(t), "t": t, "kind": nodes[k]["kind"], "label": nodes[k]["label"],
+                                 "sub": nodes[k]["sub"], "event": "cleared"})
+            close(medium, t)
+            for f in ({"Switch IP/FQDN": "sw", "Switch Hostname": "sw_name", "Switch Port Name": "port",
+                       "Switch Port Alias": "alias", "WLAN AP Name": "ap", "WLAN AP Location": "ap_loc",
+                       "WLAN SSID": "ssid", "WLAN BSSID": "bssid"}.get(name),):
+                if f:
+                    cur[f] = None
+            continue
+        if name in ("Switch IP/FQDN", "Switch Hostname", "Switch Port Name", "Switch Port Alias"):
+            field = {"Switch IP/FQDN": "sw", "Switch Hostname": "sw_name", "Switch Port Name": "port",
+                     "Switch Port Alias": "alias"}[name]
+            if field == "port" and details != cur["port"]:
+                cur["alias"] = None          # the alias belongs to the port; a new port's alias arrives as its own event
+            cur[field] = details or None
+            if cur["sw"] and cur["port"]:
+                key = "sw:" + cur["sw"] + "/" + cur["port"]
+                label = cur["sw"] + (f" ({cur['sw_name']})" if cur["sw_name"] and cur["sw_name"] != cur["sw"] else "")
+                sub = cur["port"] + (f" -- {cur['alias']}" if cur["alias"] else "")
+                open_("wired", key, label, sub, "switch", t)
+                if key in nodes:
+                    nodes[key]["last"] = max(nodes[key]["last"], t)
+        elif name == "Switch Port Connect":
+            if details.lower().startswith("disconnect"):
+                if open_stint["wired"] is not None:
+                    timeline.append({"time": format_epoch(t), "t": t, "kind": "switch",
+                                     "label": nodes[open_stint["wired"][0]]["label"],
+                                     "sub": nodes[open_stint["wired"][0]]["sub"], "event": "disconnected"})
+                close("wired", t)
+            elif details.lower().startswith("connect") and cur["sw"] and cur["port"]:
+                key = "sw:" + cur["sw"] + "/" + cur["port"]
+                open_("wired", key, nodes[key]["label"] if key in nodes else cur["sw"],
+                      nodes[key]["sub"] if key in nodes else cur["port"], "switch", t)
+        elif name in ("WLAN AP Name", "WLAN AP Location", "WLAN SSID", "WLAN BSSID"):
+            field = {"WLAN AP Name": "ap", "WLAN AP Location": "ap_loc", "WLAN SSID": "ssid", "WLAN BSSID": "bssid"}[name]
+            cur[field] = details or None
+            if cur["ap"]:
+                key = "ap:" + cur["ap"] + "/" + (cur["ssid"] or "")
+                sub = (cur["ssid"] or "") + (f"  {cur['bssid']}" if cur["bssid"] else "") \
+                    + (f"  [{cur['ap_loc']}]" if cur["ap_loc"] else "")
+                open_("wireless", key, cur["ap"], sub.strip(), "ap", t)
+                if key in nodes:
+                    nodes[key]["last"] = max(nodes[key]["last"], t)
+        elif name in ("WLAN Association Status", "WLAN Client Connectivity Status"):
+            low = details.lower()
+            if low.startswith(("disassoc", "disconnect", "not ")):
+                if open_stint["wireless"] is not None:
+                    k = open_stint["wireless"][0]
+                    timeline.append({"time": format_epoch(t), "t": t, "kind": "ap", "label": nodes[k]["label"],
+                                     "sub": nodes[k]["sub"], "event": "disconnected"})
+                close("wireless", t)
+            elif low.startswith(("assoc", "connect")) and cur["ap"]:
+                key = "ap:" + cur["ap"] + "/" + (cur["ssid"] or "")
+                open_("wireless", key, cur["ap"], nodes[key]["sub"] if key in nodes else (cur["ssid"] or ""), "ap", t)
+
+    for key, start, end in stints:
+        nodes[key]["seconds"] += (end if end is not None else now) - start
+    out_nodes = sorted(nodes.values(), key=lambda n: (-n["count"], -n["seconds"]))
+    for n in out_nodes:
+        n["first_display"] = format_epoch(n["first"])
+        n["last_display"] = format_epoch(n["last"])
+        n["still_connected"] = any(k == n["key"] and e is None for k, s, e in stints)
+    return {"nodes": out_nodes, "events": timeline[-400:], "rows": len(events),
+            "from": format_epoch(now - window_seconds), "to": format_epoch(now)}
+
+
+def do_roaming(ip, window_str):
+    window_seconds = parse_window(window_str)
+    if window_seconds is None or not (86400 <= window_seconds <= 28 * 86400):
+        fail("invalid window -- expected 1d to 28d")
+    mode, appliance = get_assigned_to(ip)
+    if mode is None:
+        fail(f"could not determine managing appliance for {ip}")
+    data = get_roaming(ip, mode, appliance, window_seconds)
+    data.update({"ip": ip, "window": window_str, "appliance": appliance or "EM"})
+    print(json.dumps(data))
+
 def do_matched(ip, window_str):
     window_seconds = parse_window(window_str)
     if window_seconds is None:
@@ -3422,6 +3597,30 @@ def do_bundlecorrelate(paths, gap, context, top_n):
         result = json.loads(out)
     except json.JSONDecodeError:
         fail(f"bundle-correlate returned something unexpected: {out[:300]}")
+    print(json.dumps(result))
+
+
+ROAM_KEY_RE = r"(?:[0-9a-fA-F]{12}|(?:[0-9a-fA-F]{2}[:\-]){5}[0-9a-fA-F]{2}|\d{1,3}(?:\.\d{1,3}){3})"
+
+
+def do_bundleroam(path, key):
+    """Upload & Review view's Roaming box -- where one device (MAC or IP) was seen connected, from
+    the bundle's own logs (bundle-correlate.py --roaming). Same path whitelist as analyzeadm."""
+    if not os.path.isfile(CORRELATE_SCRIPT_PATH):
+        fail(f"{CORRELATE_SCRIPT_PATH} not found on this EM -- redeploy this app to install it.")
+    if not _is_safe_analyze_bundle_path(path):
+        fail(f"'{path}' is not a known tech-support bundle path.")
+    if not os.path.isfile(path):
+        fail(f"'{path}' does not exist on this EM.")
+    out, err, rc = run([sys.executable, CORRELATE_SCRIPT_PATH, "--roaming", key, path], timeout=1800)
+    if rc != 0:
+        fail((err or out or f"bundle-correlate exited {rc}").strip()[-2000:])
+    try:
+        result = json.loads(out)
+    except json.JSONDecodeError:
+        fail(f"bundle-correlate returned something unexpected: {out[:300]}")
+    if "error" in result:
+        fail(result["error"])
     print(json.dumps(result))
 
 
@@ -3696,6 +3895,13 @@ def main():
     if original.strip() == "bundleuploadlist":
         return do_bundle_upload_list()
 
+    m = re.fullmatch(
+        rf"bundleroam (/shared/shared/case/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+|"
+        rf"{UPLOAD_PATH_RE.pattern[1:-1]}|{MANUAL_STAGING_PATH_RE.pattern[1:-1]}) ({ROAM_KEY_RE})", original.strip(),
+    )
+    if m:
+        return do_bundleroam(m.group(1), m.group(2))
+
     _any_bundle = (
         rf"(?:/shared/shared/case/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+|"
         rf"{UPLOAD_PATH_RE.pattern[1:-1]}|{MANUAL_STAGING_PATH_RE.pattern[1:-1]})"
@@ -3803,6 +4009,10 @@ def main():
     if m:
         return do_matched(m.group(1), m.group(2))
 
+    m = re.fullmatch(rf"roaming ({IP_RE}) (\d{{1,2}}d)", original.strip())
+    if m:
+        return do_roaming(m.group(1), m.group(2))
+
     m = re.fullmatch(rf"history ({IP_RE}) (\d{{1,4}}[hdw])", original.strip())
     if m:
         return do_history(m.group(1), m.group(2))
@@ -3837,13 +4047,13 @@ def main():
         "techsupportdownload </shared/shared/case/.../.../...> | "
         "techsupportcleanup </shared/shared/case/.../.../...> | "
         "policytree | "
-        "lastchecked <ip> | matched <ip> <N>h|d|w | history <ip> <N>h|d|w | rawfields <ip> | "
+        "lastchecked <ip> | matched <ip> <N>h|d|w | history <ip> <N>h|d|w | roaming <ip> <N>d | rawfields <ip> | "
         "arplist <ip> | appliances | runshowerrors <target> <N>m|h | "
         "pluginlist <target> | "
         "analyzeadm <target> <bundle|-> <window> <switch_filter|-> <top_n> <spike_n> <stale_days> | "
         "pluginlogszip <target> <plugin,...> <start>:<end> | "
         "bundleupload <filename> | bundleuploadcleanup <path> | bundleuploadlist | "
-        "bundlecorrelate <path>[,<path>...] <gap_s> <context_s> <top_n> | "
+        "bundlecorrelate <path>[,<path>...] <gap_s> <context_s> <top_n> | bundleroam <path> <mac|ip> | "
         "getadmincidr | setadmincidr <cidr>)",
         code=2,
     )

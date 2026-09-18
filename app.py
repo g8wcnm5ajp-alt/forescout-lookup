@@ -24,10 +24,10 @@ from werkzeug.security import check_password_hash, generate_password_hash
 from forescout_client import (
     CASE_REF_RE, COMPANY_NAME_RE, LEVEL_RE, ForescoutClientError, analyze_admission, arp_list,
     build_techsupport_em, build_techsupport_window_appliance, clear_lookup_debug_log, clear_techsupport_log,
-    collect_techsupport, correlate_bundles, debug_set_appliance, delete_techsupport_bundle, delete_uploaded_bundle,
+    bundle_roaming, collect_techsupport, correlate_bundles, debug_set_appliance, delete_techsupport_bundle, delete_uploaded_bundle,
     download_plugin_logs_zip, download_techsupport_bundle, get_admin_cidr, last_checked, list_appliances,
     list_plugins, list_uploaded_bundles, lookup, matched_rules, policy_history, policy_tree, preview_techsupport,
-    preview_techsupport_em, raw_fields, run_show_errors, set_admin_cidr, tail_lookup_debug_log,
+    preview_techsupport_em, raw_fields, roaming, run_show_errors, set_admin_cidr, tail_lookup_debug_log,
     tail_techsupport_log, trace_defaults, trace_list, trace_set, upload_bundle, valid_cidr, valid_ip,
     valid_target,
 )
@@ -45,7 +45,7 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.5.0"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
@@ -880,6 +880,33 @@ def start_correlate_run(paths, gap, context, top_n):
     return run_id
 
 
+def start_bundle_roaming_run(path, key):
+    """Upload & Review view's Roaming box: where one device was seen connected, from a bundle's logs.
+    Same tracking/polling as a correlate run (kind "roaming")."""
+    run_key = f"roaming:{path}:{key.lower()}"
+    run_id = f"{int(time.time() * 1000)}-{os.urandom(3).hex()}"
+    with _analyze_runs_lock:
+        runs = _load_analyze_runs()
+        if any(r["key"] == run_key and r["status"] == "running" for r in runs):
+            return None
+        runs.append({
+            "id": run_id, "key": run_key, "kind": "roaming", "target": BUNDLE_ANALYZE_PLACEHOLDER_TARGET,
+            "bundle": os.path.basename(path), "status": "running",
+            "started_at": int(time.time()), "finished_at": None, "result": None, "error": None,
+        })
+        _save_analyze_runs(runs)
+
+    def _worker():
+        try:
+            result = bundle_roaming(path, key)
+            _update_analyze_run(run_id, status="complete", finished_at=int(time.time()), result=result)
+        except ForescoutClientError as e:
+            _update_analyze_run(run_id, status="failed", finished_at=int(time.time()), error=str(e))
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return run_id
+
+
 def get_analyze_run(run_id):
     with _analyze_runs_lock:
         runs = _load_analyze_runs()
@@ -1560,6 +1587,16 @@ def api_raw_fields(ip):
     """
     try:
         return jsonify(raw_fields(ip))
+    except ForescoutClientError as e:
+        return jsonify({"error": str(e)}), 502
+
+
+@app.route("/api/roaming/<ip>", methods=["GET"])
+def api_roaming(ip):
+    """Roaming section on each IP lookup result -- David's ask, 2026-09-18 (?window=1d .. 28d)."""
+    window = request.args.get("window", "7d")
+    try:
+        return jsonify(roaming(ip, window))
     except ForescoutClientError as e:
         return jsonify({"error": str(e)}), 502
 
@@ -2483,6 +2520,23 @@ def bundle_correlate_route():
     run_id = start_correlate_run(paths, gap, context, top_n)
     if run_id is None:
         return jsonify({"error": "A correlate run is already going for this selection."}), 409
+    return jsonify({"run_id": run_id})
+
+
+@app.route("/bundle/roaming", methods=["POST"])
+def bundle_roaming_route():
+    """Roaming in the Review view -- David's ask, 2026-09-18: the same roaming graph as IP Lookup, but for
+    a MAC/IP inside an uploaded bundle. Background run, polled via /api/analyze_run/<id>."""
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    path = request.form.get("path", "").strip()
+    key = request.form.get("key", "").strip()
+    if not path or not key:
+        return jsonify({"error": "Pick a bundle and enter a MAC or IP address."}), 400
+    _log_activity("bundle_roaming", username=session.get("username"), bundle=os.path.basename(path), key=key)
+    run_id = start_bundle_roaming_run(path, key)
+    if run_id is None:
+        return jsonify({"error": "That lookup is already running."}), 409
     return jsonify({"run_id": run_id})
 
 

@@ -2224,6 +2224,182 @@ def build_report(bundles, args):
     return "\n".join([header] + render_findings(findings) + rep.lines) + "\n"
 
 
+
+# ----------------------------------------------------------------------
+# --roaming <mac|ip>: where one device was seen connected, from a bundle's
+# logs (Upload & Review view; David's ask 2026-09-18). Only as complete as
+# the logs: at baseline debug the Switch plugin logs trap-driven MAC
+# add/remove per port but not every admission, so it can be sparse.
+# ----------------------------------------------------------------------
+
+RX_RM_SW_ADD = re.compile(rb"sw_add_mac:\d+:\[[^\]]*\]:\[keys:([0-9.]+),([0-9.]+):([^,\]]+),([0-9a-f]{12})\]")
+RX_RM_SW_DEL = re.compile(rb"deleting mac\[([0-9a-f]{12})\] from ipport\[([0-9.]+):([^\s\]]+)")
+RX_RM_SW_TRAP = re.compile(rb"\[keys:([0-9.]+)[^\]]*\]:\d+: mac\[([0-9a-f]{12})\] reporting trap \[(up|down)\]")
+RX_RM_SW_IPPORT = re.compile(rb"ip\[([0-9.]+)\],? port\[([^\]]+)\]")
+RX_RM_LEARN_ENTRY = re.compile(rb"\{name=(sw_ip|sw_port|sw_port_desc|wifi_ap_name|wifi_ssid|wifi_bssid|adm),value=([^}]*)\}")
+RX_RM_TRACE_FIELD = re.compile(rb"fieldName=(sw_ip|sw_port|sw_port_desc|wifi_ap_name|wifi_ssid|wifi_bssid), value=([^,]*),")
+RX_RM_WIFI_CLEAR = re.compile(rb"wifi_clear_client:\d+: wifi_ip \[[^\]]*\] ip \[([0-9.]*)\] mac \[([0-9a-f]*)\]")
+
+
+def _rm_time(line):
+    m = RX_EV_EPOCH.match(line)
+    if m:
+        return int(m.group(2))
+    m = RX_TS_TRACE.search(line[:60])
+    if m:
+        return int(m.group(1)) // 1000
+    return None
+
+
+def bundle_roaming(paths, key, top=400):
+    key = key.strip().lower()
+    mac = re.sub(r"[^0-9a-f]", "", key) if not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", key) else None
+    if mac is not None and len(mac) != 12:
+        return {"error": f"'{key}' is neither an IPv4 address nor a MAC address"}
+    if mac:
+        variants = [mac.encode(), ":".join(mac[i:i + 2] for i in range(0, 12, 2)).encode(),
+                    "-".join(mac[i:i + 2] for i in range(0, 12, 2)).encode(), mac.upper().encode(),
+                    ":".join(mac[i:i + 2] for i in range(0, 12, 2)).upper().encode()]
+    else:
+        variants = [key.encode()]
+    raw = []            # (t, kind, sw_or_ap, port_or_ssid, event, source family)
+    seen = set()
+    sources = Counter()
+    lines_hit = 0
+
+    def add(t, kind, a, b, event, fam):
+        nonlocal lines_hit
+        if t is None or not a:
+            return
+        k = (t, kind, a, b or "", event)
+        if k in seen:
+            return
+        seen.add(k)
+        raw.append((t, kind, a, b or "", event, fam))
+        sources[fam] += 1
+
+    def scan(rel, fobj):
+        nonlocal lines_hit
+        fam = family(rel)
+        carry = b""
+        while True:
+            chunk = fobj.read(4 * 1024 * 1024)
+            if not chunk:
+                break
+            data = carry + chunk
+            cut = data.rfind(b"\n")
+            if cut < 0:
+                carry = data[-65536:]
+                continue
+            carry = data[cut + 1:]
+            body = data[:cut + 1]
+            starts = set()
+            for v in variants:
+                pos = body.find(v)
+                while pos >= 0:
+                    starts.add(body.rfind(b"\n", 0, pos) + 1)
+                    nl = body.find(b"\n", pos)
+                    if nl < 0:
+                        break
+                    pos = body.find(v, nl + 1)
+            for ls in sorted(starts):
+                le = body.find(b"\n", ls)
+                line = body[ls:le if le >= 0 else len(body)][:6000]
+                lines_hit += 1
+                handle(line, fam)
+
+    def handle(line, fam):
+        t = _rm_time(line)
+        d = lambda b: b.decode("utf-8", "replace").strip()
+        if b"plugin_learn_cb" in line:
+            ent = dict((a.decode(), d(b)) for a, b in RX_RM_LEARN_ENTRY.findall(line))
+            if ent.get("sw_ip") and ent.get("sw_port"):
+                add(t, "switch", ent["sw_ip"], ent["sw_port"], "seen (learn event" + (", adm=" + ent["adm"] if ent.get("adm") else "") + ")", fam)
+            if ent.get("wifi_ap_name"):
+                add(t, "ap", ent["wifi_ap_name"], ent.get("wifi_ssid", ""), "seen (learn event" + (", adm=" + ent["adm"] if ent.get("adm") else "") + ")", fam)
+            return
+        if b"|" in line[:40] and (b"fieldName=sw_" in line or b"fieldName=wifi_" in line):
+            f = dict((a.decode(), d(b)) for a, b in RX_RM_TRACE_FIELD.findall(line))
+            if f.get("sw_ip") and f.get("sw_port"):
+                add(t, "switch", f["sw_ip"], f["sw_port"], "seen (EM/appliance trace)", fam)
+            if f.get("wifi_ap_name"):
+                add(t, "ap", f["wifi_ap_name"], f.get("wifi_ssid", ""), "seen (EM/appliance trace)", fam)
+            return
+        m = RX_RM_SW_ADD.search(line)
+        if m:
+            add(t, "switch", d(m.group(2)), d(m.group(3)), "connected (link-up trap)", fam)
+            return
+        m = RX_RM_SW_DEL.search(line)
+        if m:
+            add(t, "switch", d(m.group(2)), d(m.group(3)), "disconnected (removed from port)", fam)
+            return
+        m = RX_RM_SW_TRAP.search(line)
+        if m:
+            add(t, "switch", d(m.group(1)), "", "trap " + d(m.group(3)), fam)
+            return
+        m = RX_RM_WIFI_CLEAR.search(line)
+        if m:
+            add(t, "ap", "(wireless client cleared)", "", "disconnected (client cleared)", fam)
+            return
+        m = RX_RM_SW_IPPORT.search(line)
+        if m and fam.startswith("log/plugin/sw/") or (m and "mac_track" in fam):
+            add(t, "switch", d(m.group(1)), d(m.group(2)), "seen (switch plugin)", fam)
+
+    def wanted(rel):
+        return (rel.startswith(FS + "log/") and not SWEEP_EXCLUDE_RX.search(rel)) or \
+            (rel.startswith(FS + "log/") and "/Trace_cu_" in rel) or rel.startswith("files/tmp/")
+
+    for path in paths:
+        if os.path.isdir(path):
+            for dirpath, _, files in os.walk(path):
+                for fn in files:
+                    full = os.path.join(dirpath, fn)
+                    rel = os.path.relpath(full, path).replace(os.sep, "/")
+                    rel = rel.split("/", 1)[1] if not os.path.isdir(os.path.join(path, "info")) and "/" in rel else rel
+                    if wanted(rel):
+                        with open(full, "rb") as f:
+                            scan(rel, f)
+        else:
+            with tarfile.open(path, "r|*") as tar:
+                for member in tar:
+                    if not member.isfile():
+                        continue
+                    rel = rel_member(member.name)
+                    if rel and wanted(rel):
+                        fobj = tar.extractfile(member)
+                        if fobj is not None:
+                            scan(rel, fobj)
+
+    raw.sort()
+    nodes = {}
+    events = []
+    for t, kind, a, b, event, fam in raw:
+        k = kind + ":" + a + "/" + b
+        n = nodes.get(k)
+        if n is None and event.startswith("disconnected"):
+            events.append({"time": utc(t), "t": t, "kind": kind, "label": a, "sub": b, "event": event + " -- " + fam})
+            continue                      # a bare disconnect is a timeline event, not a place
+        if n is None:
+            n = nodes[k] = {"key": k, "kind": kind, "label": a, "sub": b, "count": 0, "first": t, "last": t,
+                            "seconds": 0, "still_connected": False, "sources": Counter()}
+        if not event.startswith("disconnected"):
+            n["count"] += 1
+        n["first"] = min(n["first"], t)
+        n["last"] = max(n["last"], t)
+        n["sources"][fam] += 1
+        events.append({"time": utc(t), "t": t, "kind": kind, "label": a, "sub": b, "event": event + " -- " + fam})
+    out = sorted(nodes.values(), key=lambda n: (-n["count"], -n["last"]))
+    for n in out:
+        n["first_display"] = utc(n["first"])
+        n["last_display"] = utc(n["last"])
+        n["sources"] = ", ".join(f"{f} x{c}" for f, c in n["sources"].most_common(3))
+    return {"key": key, "nodes": out, "events": events[-top:], "rows": lines_hit,
+            "from": utc(raw[0][0]) if raw else "-", "to": utc(raw[-1][0]) if raw else "-",
+            "sources": ", ".join(f"{f} x{c}" for f, c in sources.most_common(6)) or "no matching lines",
+            "note": "From the bundle's logs only: trap-driven MAC add/remove on switch ports, plugin learn events, "
+                    "trace learn events, wireless client clears. Sparse unless plugin debug was raised."}
+
+
 def main():
     ap = argparse.ArgumentParser(description="Correlate Forescout tech-support bundles (EM + appliance) offline.")
     ap.add_argument("bundles", nargs="+", help=".tgz/.tar.gz bundle, or an unpacked bundle directory")
@@ -2231,7 +2407,16 @@ def main():
     ap.add_argument("-c", "--context", type=int, default=120, help="seconds of context either side of a disconnect [120]")
     ap.add_argument("-n", "--top", type=int, default=10, help="rows per section [10]")
     ap.add_argument("--json", action="store_true", help="emit {bundles:[...], output:'...'} instead of plain text")
+    ap.add_argument("--roaming", metavar="MAC_OR_IP", help="instead of a report: where this one device was seen connected (JSON)")
     args = ap.parse_args()
+
+    if args.roaming:
+        for path in args.bundles:
+            if not os.path.exists(path):
+                print(json.dumps({"error": f"'{path}' does not exist."}))
+                return 2
+        print(json.dumps(bundle_roaming(args.bundles, args.roaming, top=args.top * 40)))
+        return 0
 
     bundles = []
     for path in args.bundles:
