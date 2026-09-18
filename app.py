@@ -45,7 +45,7 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.5.3"
+APP_VERSION = "1.5.4"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
@@ -1696,11 +1696,32 @@ def hostinfo_download_route(ip):
     except ForescoutClientError as e:
         return jsonify({"error": str(e)}), 502
     header = (f"# fstool hostinfo {ip} -- managing appliance: {data.get('appliance')} -- "
-              f"{data.get('field_count')} fields -- generated {data.get('generated')}\n#\n")
-    _log_activity("hostinfo_downloaded", username=session.get("username"), ip=ip)
+              f"{data.get('field_count')} fields -- generated {data.get('generated')}\n")
+    text = data.get("text", "")
+    decoded = request.args.get("decoded") == "1"
+    suffix = ""
+    if decoded:
+        # Every appliance node ID (19-digit reg-table node_id, or the EM's own 0 after "@" /
+        # "ID: ") -> the address the EM registered it under. Whole-token matches only, so a
+        # value that merely contains digits is never touched. Longest IDs first.
+        nodes = data.get("nodes") or {}
+        used = {}
+        for node_id, addr in sorted(nodes.items(), key=lambda kv: -len(kv[0])):
+            if node_id == "0":
+                pattern = r"(?<=@)0(?=\s|\)|\]|,|$)|(?<=ID: )0(?=\)|,|\s|$)"
+            else:
+                pattern = rf"(?<![\d.\w-]){re.escape(node_id)}(?![\d.\w-])"
+            text, n = re.subn(pattern, addr, text)
+            if n:
+                used[node_id] = (addr, n)
+        header += "# decoded: appliance node IDs replaced by their registered address -- " + (
+            ", ".join(f"{k} -> {v[0]} ({v[1]}x)" for k, v in used.items()) if used else "none found") + "\n"
+        suffix = "-decoded"
+    header += "#\n"
+    _log_activity("hostinfo_downloaded", username=session.get("username"), ip=ip, decoded=decoded)
     return send_file(
-        io.BytesIO((header + data.get("text", "")).encode("utf-8")), mimetype="text/plain",
-        as_attachment=True, download_name=f"hostinfo-{ip.replace('.', '-')}.txt",
+        io.BytesIO((header + text).encode("utf-8")), mimetype="text/plain",
+        as_attachment=True, download_name=f"hostinfo-{ip.replace('.', '-')}{suffix}.txt",
     )
 
 

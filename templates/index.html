@@ -432,11 +432,14 @@
             <form id="hostinfo-form" class="inline-form" style="display:flex; gap:0.5rem; align-items:center; flex-wrap:wrap;">
                 <input type="text" id="hostinfo-ip" placeholder="Host IP, e.g. 192.168.1.10" style="width:16em;"
                        pattern="^(?:\d{1,3}\.){3}\d{1,3}$" required autocomplete="off">
-                <button type="submit" id="hostinfo-download-btn">Download hostinfo</button>
+                <button type="submit" id="hostinfo-download-btn" data-decoded="0">Download original</button>
+                <button type="submit" id="hostinfo-download-decoded-btn" class="btn-secondary" data-decoded="1">Download decoded</button>
                 <span class="hint" id="hostinfo-status" style="margin-top:0;"></span>
             </form>
             <p class="hint">The full property dump for that host exactly as the CLI prints it, fetched live from its managing
-                appliance -- no debug, no bundle. For the parsed view use IP Lookup's Raw fields section.</p>
+                appliance -- no debug, no bundle. <strong>Decoded</strong> = the same text with every appliance node ID
+                (e.g. <code>sw@8565155208648015208</code>) replaced by that appliance's registered name or IP.
+                For the parsed view use IP Lookup's Raw fields section.</p>
         </div>
         {% if active_analyze_runs %}
         <div class="card no-print">
@@ -2092,14 +2095,17 @@
         (function () {
             const form = document.getElementById("hostinfo-form");
             if (!form) return;
-            const ipEl = document.getElementById("hostinfo-ip"), st = document.getElementById("hostinfo-status"), btn = document.getElementById("hostinfo-download-btn");
+            const ipEl = document.getElementById("hostinfo-ip"), st = document.getElementById("hostinfo-status");
+            const btns = [document.getElementById("hostinfo-download-btn"), document.getElementById("hostinfo-download-decoded-btn")];
             form.addEventListener("submit", async ev => {
                 ev.preventDefault();
+                const decoded = ev.submitter && ev.submitter.dataset.decoded === "1";
+                const suffix = decoded ? "-decoded" : "";
                 const ip = ipEl.value.trim();
                 if (!/^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/.test(ip)) { st.textContent = "Enter a valid IPv4 address."; return; }
-                btn.disabled = true; st.textContent = "Fetching hostinfo for " + ip + " …";
+                btns.forEach(b => b.disabled = true); st.textContent = "Fetching " + (decoded ? "decoded " : "") + "hostinfo for " + ip + " …";
                 try {
-                    const r = await fetch("/hostinfo/download/" + ip, { credentials: "same-origin" });
+                    const r = await fetch("/hostinfo/download/" + ip + (decoded ? "?decoded=1" : ""), { credentials: "same-origin" });
                     if (!r.ok) {
                         let msg = "HTTP " + r.status;
                         try { msg = (await r.json()).error || msg; } catch (e) { /* not JSON */ }
@@ -2107,13 +2113,13 @@
                     }
                     const blob = await r.blob();
                     const a = document.createElement("a");
-                    a.href = URL.createObjectURL(blob); a.download = "hostinfo-" + ip.replace(/\./g, "-") + ".txt";
+                    a.href = URL.createObjectURL(blob); a.download = "hostinfo-" + ip.replace(/\./g, "-") + suffix + ".txt";
                     document.body.appendChild(a); a.click(); a.remove();
                     setTimeout(() => URL.revokeObjectURL(a.href), 5000);
-                    st.textContent = "Downloaded hostinfo-" + ip.replace(/\./g, "-") + ".txt (" + Math.round(blob.size / 1024) + " KB).";
+                    st.textContent = "Downloaded hostinfo-" + ip.replace(/\./g, "-") + suffix + ".txt (" + Math.round(blob.size / 1024) + " KB).";
                 } catch (e) {
                     st.textContent = "Failed: " + e.message;
-                } finally { btn.disabled = false; }
+                } finally { btns.forEach(b => b.disabled = false); }
             });
         })();
 

@@ -3705,9 +3705,13 @@ def do_hostinfo(ip):
                     else ssh_appliance(appliance, f"fstool hostinfo {ip}", timeout=45))
     if rc != 0 and not raw.strip():
         fail(f"fstool hostinfo failed on {appliance or 'the EM'}: {(err or raw).strip()[-300:]}")
+    # node_id -> registered address, so the app can offer a decoded copy (David 2026-09-18:
+    # "sw@8565155208648015208" -> the appliance name or IP); node 0 is the EM itself
+    nodes = dict(get_node_map())
+    nodes["0"] = f"EM({EM_IP})"
     print(json.dumps({
         "ip": ip, "appliance": appliance or "EM", "field_count": len(parse_hostinfo_lines(raw)),
-        "generated": format_epoch(int(time.time())), "text": raw,
+        "generated": format_epoch(int(time.time())), "text": raw, "nodes": nodes,
     }))
 
 
