@@ -67,6 +67,12 @@
             <a href="/" class="btn-small btn-secondary" id="lookup-clear-all">Clear results</a>
             {% endif %}
         </form>
+        <div class="card no-print" id="lookup-progress" style="display:none;">
+            <h3>Collecting host data <span class="muted" id="lookup-progress-elapsed"></span></h3>
+            <div id="lookup-progress-rows"></div>
+            <p class="hint">Each bar follows the real steps the EM-side collector reports for that host -- the hostname
+                cross-check across appliances is the slow part on a large estate.</p>
+        </div>
 
         {% if error and action not in ("techsupport", "debugset", "debugscheduled") %}
         <div class="error">{{ error }}</div>
@@ -2438,6 +2444,12 @@
             if (data.incomplete && data.incomplete.length) {
                 identHtml += "<p class=\"roaming-warn\">Did not answer within the time limit: " + esc(data.incomplete.join(", ")) + " -- this result may be incomplete.</p>";
             }
+            if (data.skipped && data.skipped.length) {
+                identHtml += "<p class=\"roaming-warn\">Hostname cross-check skipped on " + esc(data.skipped.map(s => s.box + " (" + Math.round(s.rows / 1e6) + "M rows)").join(", ")) + " -- its property-change log is too large to search in time.</p>";
+            }
+            if (data.identities_source) {
+                identHtml += "<p class=\"hint\">Identities " + esc(data.identities_source) + ".</p>";
+            }
             if (data.identities && data.identities.length) {
                 const merged = data.identities.filter(a => a.merged), skipped = data.identities.filter(a => !a.merged);
                 identHtml += "<p class=\"roaming-caveat\"><strong>Best effort -- probable match.</strong> " +
@@ -4059,15 +4071,73 @@
         // Disabling the button also stops an impatient double-click from
         // firing a second identical lookup while the first is still in
         // flight.
+        // Progress bar (David, 2026-09-18): every /lookup form (the search box and each tab's Refresh)
+        // starts a background run and polls it; the bar per IP follows the collector's real steps.
+        // If the start call fails the form falls back to its normal synchronous POST.
         (function () {
-            const form = document.querySelector(".lookup-form");
-            const btn = document.getElementById("lookup-submit-btn");
-            const spinner = document.getElementById("lookup-spinner");
-            if (!form || !btn || !spinner) return;
-            form.addEventListener("submit", () => {
-                btn.disabled = true;
-                btn.textContent = "Looking up…";
-                spinner.style.display = "";
+            const card = document.getElementById("lookup-progress"), rows = document.getElementById("lookup-progress-rows"),
+                  elapsedEl = document.getElementById("lookup-progress-elapsed");
+            const btn = document.getElementById("lookup-submit-btn"), spinner = document.getElementById("lookup-spinner");
+            if (!card || !rows) return;
+            const esc = s => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;" }[c]));
+            const fmt = s => s < 60 ? s + "s" : Math.floor(s / 60) + "m " + (s % 60) + "s";
+            function draw(data) {
+                elapsedEl.textContent = "(" + fmt(data.elapsed) + ")";
+                rows.innerHTML = data.ips.map(ip => {
+                    const p = data.per_ip[ip] || { pct: 0, step: "Queued", status: "queued" };
+                    return "<div class=\"lookup-progress-row\" data-ip=\"" + esc(ip) + "\">" +
+                        "<div class=\"lookup-progress-label\"><strong>" + esc(ip) + "</strong> <span class=\"muted\">" + esc(p.step) + "</span></div>" +
+                        "<div class=\"lookup-progress-bar\"><div class=\"lookup-progress-fill" + (p.status === "done" ? " done" : "") + "\" style=\"width:" + p.pct + "%\"></div></div>" +
+                        "<div class=\"lookup-progress-pct\">" + p.pct + "%</div></div>";
+                }).join("");
+            }
+            document.querySelectorAll("form[action=\"/lookup\"]").forEach(form => {
+                form.addEventListener("submit", async ev => {
+                    if (form.dataset.fallback === "1") return;   // second submit after a failed start: plain POST
+                    ev.preventDefault();
+                    const fd = new FormData(form);
+                    if (btn) { btn.disabled = true; btn.textContent = "Looking up…"; }
+                    if (spinner) spinner.style.display = "";
+                    let runId;
+                    try {
+                        const r = await fetch("/lookup/start", { method: "POST", body: fd, credentials: "same-origin" });
+                        const j = await r.json();
+                        if (!r.ok || !j.run_id) { const err = new Error(j.error || ("HTTP " + r.status)); err.rejected = (r.status === 400 || r.status === 403); throw err; }
+                        runId = j.run_id;
+                    } catch (e) {
+                        if (btn) { btn.disabled = false; btn.textContent = "Look up"; }
+                        if (spinner) spinner.style.display = "none";
+                        card.style.display = "";
+                        if (e.rejected) {   // the server understood and said no (bad IP, too many, expired session)
+                            rows.innerHTML = "<div class=\"error\">" + esc(e.message) + "</div>";
+                            return;
+                        }
+                        rows.innerHTML = "<div class=\"error\">Could not start the lookup: " + esc(e.message) + " -- submitting the plain way.</div>";
+                        form.dataset.fallback = "1";
+                        form.requestSubmit ? form.requestSubmit() : form.submit();
+                        return;
+                    }
+                    card.style.display = "";
+                    draw({ elapsed: 0, ips: String(fd.get("ip") || "").split(",").map(s => s.trim()).filter(Boolean), per_ip: {} });
+                    const active = fd.get("active_ip") || "";
+                    const poll = async () => {
+                        try {
+                            const r = await fetch("/api/lookup_run/" + runId, { credentials: "same-origin" });
+                            const d = await r.json();
+                            if (!r.ok) throw new Error(d.error || ("HTTP " + r.status));
+                            draw(d);
+                            if (d.status === "done") {
+                                window.location.href = "/lookup?run=" + runId + (active ? "&active_ip=" + encodeURIComponent(active) : "");
+                                return;
+                            }
+                        } catch (e) {
+                            rows.insertAdjacentHTML("beforeend", "<div class=\"error\">" + esc(e.message) + "</div>");
+                            return;
+                        }
+                        setTimeout(poll, 2000);
+                    };
+                    setTimeout(poll, 1500);
+                });
             });
         })();
 
@@ -4191,10 +4261,28 @@
                             statusEl.textContent = d.error;
                             return;
                         }
-                        statusEl.textContent = "Support log ready.";
+                        const fname = d.filename || "forescout-lookup-support-log.zip";
                         linkEl.href = d.download_url;
-                        linkEl.setAttribute("download", d.filename || "forescout-lookup-support-log.zip");
+                        linkEl.setAttribute("download", fname);
                         resultEl.style.display = "";
+                        // Save it straight away (David, 2026-09-18: on a customer install the file
+                        // "did not appear to save") -- fetch the zip and hand the blob to the browser,
+                        // the same path the hostinfo download uses, and say exactly what happened.
+                        // The link stays as a manual fallback.
+                        statusEl.textContent = "Support log ready -- saving " + fname + " …";
+                        fetch(d.download_url, { credentials: "same-origin" })
+                            .then(async r => {
+                                if (!r.ok) throw new Error("download returned HTTP " + r.status + ": " + (await r.text()).slice(0, 200));
+                                return r.blob();
+                            })
+                            .then(blob => {
+                                const a = document.createElement("a");
+                                a.href = URL.createObjectURL(blob); a.download = fname;
+                                document.body.appendChild(a); a.click(); a.remove();
+                                setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+                                statusEl.textContent = "Saved " + fname + " (" + Math.round(blob.size / 1024) + " KB). If your browser did not keep it, use the link below.";
+                            })
+                            .catch(e => { statusEl.textContent = "Generated, but saving failed: " + e.message + " -- use the link below."; });
                     })
                     .catch(() => {
                         generateBtn.disabled = false;

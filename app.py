@@ -45,7 +45,7 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.5.4"
+APP_VERSION = "1.5.5"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
@@ -1265,6 +1265,136 @@ def index():
     return render()
 
 
+# ---------------------------------------------------------------------
+# Background IP lookups with a progress bar -- David's ask 2026-09-18
+# ("a progress bar on collecting IP data") after a customer lookup took
+# 188 s with nothing on screen. The page starts a run, polls it, and the
+# bar is driven by the REAL steps webapp-query.py writes to its own
+# lookup-debug.log on the EM (read through the existing lookuplogtail
+# verb), not a fake timer. Runs live in memory only -- minutes long,
+# nothing to persist across a restart.
+# ---------------------------------------------------------------------
+LOOKUP_RUNS = {}
+_lookup_runs_lock = threading.Lock()
+LOOKUP_RUN_TTL = 1800
+# (marker in a `[ip]`-tagged lookup-debug.log line, percent, what the bar says)
+LOOKUP_STEPS = [
+    ("=== lookup start", 5, "Resolving the managing appliance"),
+    ("get_assigned_to: assigned-to", 12, "Fetching the host record"),
+    ("parsed ", 22, "Discovering plugins across the estate"),
+    ("detect_plugins: elapsed", 40, "Probing which appliances know this host"),
+    ("identity aliases: hostnames to cross-check", 55, "Searching hostname history (identity cross-check)"),
+    ("identity aliases: skipped", 60, "Searching hostname history (identity cross-check)"),
+    (" row(s), ", 80, "Reading appliance databases"),
+    ("get_databases(", 88, "Reading appliance databases"),
+    ("=== lookup end", 100, "Done"),
+]
+_LOG_LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC \[([^\]]+)\] (.*)$")
+_lookup_log_cache = {"at": 0.0, "text": ""}
+
+
+def _expire_lookup_runs():
+    now = time.time()
+    for rid in [r for r, run in LOOKUP_RUNS.items() if now - run["started"] > LOOKUP_RUN_TTL]:
+        LOOKUP_RUNS.pop(rid, None)
+
+
+def start_lookup_run(ips, active_ip):
+    run_id = secrets.token_hex(8)
+    run = {
+        "id": run_id, "ips": ips, "active_ip": active_ip, "started": int(time.time()), "finished": None,
+        "status": "running", "results": [], "error": None,
+        "per_ip": {ip: {"status": "queued", "pct": 0, "step": "Queued"} for ip in ips},
+    }
+    with _lookup_runs_lock:
+        _expire_lookup_runs()
+        LOOKUP_RUNS[run_id] = run
+
+    def worker():
+        for ip in ips:
+            with _lookup_runs_lock:
+                run["per_ip"][ip].update(status="running", pct=3, step="Starting")
+            try:
+                result = lookup(ip)
+                entry = {"ip": ip, "result": result, "error": None}
+            except ForescoutClientError as e:
+                entry = {"ip": ip, "result": None, "error": str(e)}
+            with _lookup_runs_lock:
+                run["results"].append(entry)
+                run["per_ip"][ip].update(status="done", pct=100, step="Done" if not entry["error"] else "Failed: " + entry["error"][:120])
+        with _lookup_runs_lock:
+            run["status"] = "done"
+            run["finished"] = int(time.time())
+
+    threading.Thread(target=worker, daemon=True).start()
+    return run_id
+
+
+def _lookup_log_text():
+    """The EM-side lookup-debug.log tail, cached for 1.5 s so a burst of polls costs one verb call."""
+    now = time.time()
+    if now - _lookup_log_cache["at"] < 1.5:
+        return _lookup_log_cache["text"]
+    try:
+        text = tail_lookup_debug_log().get("log", "") or ""
+    except ForescoutClientError:
+        text = _lookup_log_cache["text"]
+    _lookup_log_cache.update(at=now, text=text)
+    return text
+
+
+def lookup_run_progress(run):
+    """Fills each running IP's pct/step from the debug log lines written since the run started."""
+    running = [ip for ip, p in run["per_ip"].items() if p["status"] == "running"]
+    if not running:
+        return
+    started = datetime.fromtimestamp(run["started"], tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    best = {ip: None for ip in running}
+    for line in _lookup_log_text().splitlines():
+        m = _LOG_LINE_RE.match(line)
+        if not m or m.group(1) < started or m.group(2) not in best:
+            continue
+        msg = m.group(3)
+        for marker, pct, label in LOOKUP_STEPS:
+            if marker in msg and (best[m.group(2)] is None or pct > best[m.group(2)][0]):
+                best[m.group(2)] = (pct, label)
+    with _lookup_runs_lock:
+        for ip, hit in best.items():
+            if hit and run["per_ip"][ip]["status"] == "running":
+                run["per_ip"][ip].update(pct=min(hit[0], 97), step=hit[1])
+
+
+@app.route("/lookup/start", methods=["POST"])
+def lookup_start_route():
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    ip_raw = request.form.get("ip", "").strip()
+    active_ip = request.form.get("active_ip", "").strip() or None
+    ips = [p.strip() for p in ip_raw.split(",") if p.strip()]
+    if not ips:
+        return jsonify({"error": "Enter at least one IPv4 address."}), 400
+    bad = [p for p in ips if not valid_ip(p)]
+    if bad:
+        return jsonify({"error": f"Not a valid IPv4 address: {', '.join(bad)}"}), 400
+    if len(ips) > MAX_LOOKUP_IPS:
+        return jsonify({"error": f"Too many IPs ({len(ips)}) -- limit is {MAX_LOOKUP_IPS} per lookup."}), 400
+    _log_activity("lookup", ips=ips)
+    return jsonify({"run_id": start_lookup_run(ips, active_ip)})
+
+
+@app.route("/api/lookup_run/<run_id>", methods=["GET"])
+def api_lookup_run(run_id):
+    run = LOOKUP_RUNS.get(run_id)
+    if run is None:
+        return jsonify({"error": "unknown run id"}), 404
+    lookup_run_progress(run)
+    with _lookup_runs_lock:
+        return jsonify({
+            "status": run["status"], "ips": run["ips"], "active_ip": run["active_ip"],
+            "elapsed": int(time.time()) - run["started"], "per_ip": run["per_ip"],
+        })
+
+
 @app.route("/lookup", methods=["GET", "POST"])
 def do_lookup():
     """
@@ -1283,6 +1413,13 @@ def do_lookup():
     # Allowed" page that read as a crash. A GET with ?ip= now runs the lookup (a result page can be
     # refreshed, bookmarked or shared); without it, back to the front page.
     if request.method == "GET":
+        # a finished background run (progress-bar path): render what it collected
+        run = LOOKUP_RUNS.get(request.args.get("run", ""))
+        if run is not None:
+            if run["status"] != "done":
+                return redirect(url_for("index"))
+            return render(ip=",".join(run["ips"]), results=list(run["results"]), error=None, action="lookup",
+                          active_ip=request.args.get("active_ip", "").strip() or run["active_ip"])
         ip_raw = request.args.get("ip", "").strip()
         active_ip = request.args.get("active_ip", "").strip() or None
         if not ip_raw:

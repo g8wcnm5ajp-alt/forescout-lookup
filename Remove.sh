@@ -82,6 +82,8 @@ if [ "$PURGE" -eq 1 ]; then
         rm -f "$WEBAPP_QUERY_WRAPPER"
         echo "Removed $WEBAPP_QUERY_WRAPPER"
     fi
+    # the wrapper's own scratch: per-host identity cache written by IP Lookup (v1.5.5)
+    rm -rf "$(dirname "$WEBAPP_QUERY_WRAPPER")/alias-cache"
     echo "Removed ${DIR}/keys, ${DIR}/certs, ${DIR}/data"
 else
     echo

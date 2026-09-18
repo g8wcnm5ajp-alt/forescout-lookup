@@ -1095,8 +1095,10 @@ def _do_lookup_inner(ip):
 
     mac_source = get_field_source(fields, "mac")
     t0 = time.time()
-    aliases, alias_failed = get_identity_aliases(ip, mode, appliance, fields, targets=all_targets_result)
-    notes = location_notes(ip, fields, verdict, aliases, all_targets_result, alias_failed)
+    aliases, alias_failed, alias_skipped, known_boxes = get_identity_aliases(
+        ip, mode, appliance, fields, targets=history_boxes(fields, mode, appliance), probe_targets=all_targets_result)
+    alias_cache_write(ip, aliases, alias_failed, alias_skipped, known_boxes)
+    notes = location_notes(ip, fields, verdict, aliases, all_targets_result, alias_failed, alias_skipped)
     _log_lookup(f"identity aliases: {len(aliases)} row(s), {len(notes)} note(s), elapsed={time.time()-t0:.2f}s")
     result = {
         "ip": ip,
@@ -3213,7 +3215,7 @@ ROAMING_PROPS = (
 ROAMING_SEP = "#~#"
 
 
-def get_roaming(ip, mode, appliance, window_seconds, aliases=None, this_mac=None):
+def get_roaming(ip, mode, appliance, window_seconds, aliases=None, this_mac=None, extra_boxes=()):
     """-> {"nodes": [...], "events": [...], "rows": n} -- stints on each switch/port or AP/SSID the
     host was connected to inside the window, built by replaying source_log in time order."""
     int_ip = ip_to_int(ip)
@@ -3261,9 +3263,9 @@ def get_roaming(ip, mode, appliance, window_seconds, aliases=None, this_mac=None
     # the managing appliance, the EM, and only those other boxes where an identity of this host
     # was actually found -- not a blind query of every appliance
     alias_boxes = [b.strip() for a in (aliases or []) for b in a.get("boxes", "").split(",") if b.strip()]
-    targets = list(dict.fromkeys([EM_IP] + ([appliance] if appliance else []) + alias_boxes))
+    targets = list(dict.fromkeys([EM_IP] + ([appliance] if appliance else []) + alias_boxes + list(extra_boxes)))
     own = EM_IP if mode == "em" else appliance
-    results = _parallel_target_map(targets, lambda t: _psql_on(t, sql, timeout=ALIAS_QUERY_TIMEOUT))
+    results = _parallel_target_map(targets, lambda t: _psql_on(t, sql, timeout=120, stmt_timeout_ms=110000))
     if results.get(own, ("", 1))[1] != 0:
         fail(f"source_log query failed on {own}")
     outs = [out for out, rc in results.values() if rc == 0]
@@ -3444,9 +3446,16 @@ ALIAS_PROPS = ("DHCP Hostname", "NetBIOS Hostname", "Hostname")
 GENERIC_HOSTNAMES = {"android", "iphone", "ipad", "localhost", "unknown", "ubuntu", "windows", "pc", "laptop",
                      "desktop", "macbook", "macbook-pro", "macbook-air", "galaxy", "oneplus", "pixel", "phone",
                      "printer", "server", "host", "device", "linux", "debian", "raspberrypi", "kali", "?", "???"}
-# every box gets the same generous cap -- a box cut off early silently loses history, and David's
-# call (2026-09-18) is data quality over speed; boxes that still do not answer are named in the result
-ALIAS_QUERY_TIMEOUT = 150
+# Caps for the hostname cross-check. Lesson from the first customer run (2026-09-18, 10 appliances):
+# a 150s SSH cap with no server-side limit left full-table scans grinding on 8 production
+# appliances after this side gave up, and the lookup took 188s for nothing. Now: a Postgres
+# statement_timeout on every query (the scan really stops), a size gate before any hostname scan
+# is attempted, and the search scoped to the boxes this host's record actually points at.
+ALIAS_QUERY_TIMEOUT = 75            # SSH-side cap, seconds
+ALIAS_STMT_TIMEOUT_MS = 60000       # server-side statement_timeout for the hostname scan
+ALIAS_MAX_SOURCE_LOG_ROWS = 30_000_000   # above this the scan cannot finish in time -- skipped, and said so
+ALIAS_CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "alias-cache")
+ALIAS_CACHE_MAX_AGE = 2 * 3600      # roaming reuses the lookup's identities this long instead of searching again
 
 
 def int_to_ip(n):
@@ -3461,28 +3470,93 @@ def _sql_str(s):
     return "'" + s.replace("'", "''") + "'"
 
 
-def _psql_on(target, sql, timeout=60):
-    """(out, rc) of a read-only psql on the EM (target == EM_IP) or a managed appliance. Timed per box
-    into the lookup log -- the two slow lab appliances took 40s+ here on 2026-09-18."""
+def _psql_on(target, sql, timeout=60, stmt_timeout_ms=None):
+    """(out, rc) of a read-only psql on the EM (target == EM_IP) or a managed appliance, with a
+    server-side statement_timeout a little under the SSH cap so a query this side stops waiting
+    for is cancelled on the box too (verified 2026-09-18 locally and over ssh: "canceling statement
+    due to statement timeout"). Timed per box into the lookup log."""
     t0 = time.time()
+    stmt_ms = stmt_timeout_ms or max(5000, (timeout - 5) * 1000)
     if target == EM_IP:
-        out, err, rc = run(["psql", "-t", "-A", "-F", ROAMING_SEP, "-c", sql], timeout=timeout)
+        out, err, rc = run(["env", f"PGOPTIONS=-c statement_timeout={stmt_ms}",
+                            "psql", "-t", "-A", "-F", ROAMING_SEP, "-c", sql], timeout=timeout)
     else:
-        out, err, rc = ssh_appliance(target, f"psql -t -A -F '{ROAMING_SEP}' -c \"{sql}\"", timeout=timeout)
-    _log_lookup(f"source_log query on {target}: rc={rc} elapsed={time.time()-t0:.2f}s rows={out.count(chr(10))}")
+        out, err, rc = ssh_appliance(target, f"PGOPTIONS='-c statement_timeout={stmt_ms}' "
+                                             f"psql -t -A -F '{ROAMING_SEP}' -c \"{sql}\"", timeout=timeout)
+    why = ""
+    if rc != 0:
+        why = " (statement timeout on the box)" if "statement timeout" in (err or "") else f" err={(err or '').strip()[:120]!r}"
+    _log_lookup(f"source_log query on {target}: rc={rc} elapsed={time.time()-t0:.2f}s rows={out.count(chr(10))}{why}")
     return out if rc == 0 else "", rc
 
 
-def get_identity_aliases(ip, mode, appliance, fields, window_seconds=28 * 86400, targets=None):
+def _source_log_rows(target):
+    """Estimated row count of source_log on a box (pg_class.reltuples -- instant, no scan) -> int|None."""
+    out, rc = _psql_on(target, "SELECT reltuples::bigint FROM pg_class WHERE relname='source_log';", timeout=15)
+    v = out.strip()
+    return int(v) if rc == 0 and v.lstrip("-").isdigit() else None
+
+
+def history_boxes(fields, mode, appliance):
+    """The boxes this host's own record points at: the EM, its managing appliance, and every
+    appliance that contributed a field (resolved from each field's `plugin@<node id>` source). The
+    hostname cross-check searches these instead of every appliance in the estate."""
+    node_map = get_node_map()
+    boxes = [EM_IP] + ([appliance] if appliance else [])
+    for f in fields:
+        b = resolve_source_appliance(f.get("source"), node_map)
+        if b:
+            boxes.append(b)
+    return list(dict.fromkeys(boxes))
+
+
+def _alias_cache_path(ip):
+    return os.path.join(ALIAS_CACHE_DIR, ip.replace(".", "-") + ".json")
+
+
+def alias_cache_write(ip, aliases, failed, skipped, known_boxes):
+    try:
+        os.makedirs(ALIAS_CACHE_DIR, exist_ok=True)
+        with open(_alias_cache_path(ip), "w") as f:
+            json.dump({"ts": int(time.time()), "aliases": aliases, "failed": failed, "skipped": skipped,
+                       "known_boxes": known_boxes}, f)
+    except OSError as e:
+        _log_lookup(f"identity aliases: cache write failed: {e}")
+
+
+def alias_cache_read(ip):
+    """-> (aliases, failed, skipped, age_seconds) from the last IP Lookup of this host, or None if
+    there is none young enough. David 2026-09-18: roaming waits for the lookup's identities, it
+    does not go searching on its own."""
+    try:
+        with open(_alias_cache_path(ip)) as f:
+            d = json.load(f)
+        age = int(time.time()) - int(d.get("ts", 0))
+        if age <= ALIAS_CACHE_MAX_AGE:
+            return d.get("aliases", []), d.get("failed", []), d.get("skipped", []), d.get("known_boxes", []), age
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def get_identity_aliases(ip, mode, appliance, fields, window_seconds=28 * 86400, targets=None, probe_targets=None):
     """Every (MAC, IP) pair that carried this host's DHCP/NetBIOS hostname in source_log inside the
     window, on EVERY known box (a host's history moves between appliances with its assignment; the
     lookup window is at least 90 days here because a purged-and-recreated record is exactly the
     case this exists for) -> ([{mac, ip, first_display, last_display, count, current, boxes, names}],
-    [boxes that did not answer])."""
+    [boxes that did not answer], [{"box", "rows"} skipped because source_log is too large to scan],
+    [boxes whose source_log knows this IP at all]).
+
+    Scope (customer lesson 2026-09-18): the cheap, indexed per-IP probe runs on every box (probe_targets)
+    -- it is milliseconds and it tells us which boxes hold any history for this IP, including the
+    previous managing appliance of a purged-and-recreated record. Only those boxes, plus the EM, the
+    managing appliance and the boxes that contributed fields (targets), get the heavy hostname scan."""
     cutoff_ms = (int(time.time()) - max(window_seconds, 90 * 86400)) * 1000
     if targets is None:
-        targets = [EM_IP] + ([appliance] if appliance else [])
+        targets = history_boxes(fields, mode, appliance)
     own = EM_IP if mode == "em" else appliance
+    if probe_targets is None:
+        probe_targets = list(dict.fromkeys([own, EM_IP]))
     props = ", ".join(_sql_str(p) for p in ALIAS_PROPS)
     names = set()
     for f in ("dhcp_hostname", "dhcp_hostname_v2", "nbthost", "hostname"):
@@ -3495,21 +3569,32 @@ def get_identity_aliases(ip, mode, appliance, fields, window_seconds=28 * 86400,
     # DHCP server handed it the same IP -- the old rows under that IP still carry the name
     own_sql = (f"SELECT DISTINCT coalesce(details,'') FROM source_log WHERE primary_id={ip_to_int(ip)} "
                f"AND name IN ({props}) AND time>={cutoff_ms} AND coalesce(status,'')<>'Failed';")
-    for box, (out, rc) in _parallel_target_map(list(dict.fromkeys([own, EM_IP])),
+    known_boxes = []
+    for box, (out, rc) in _parallel_target_map(list(dict.fromkeys(list(probe_targets) + [own, EM_IP])),
                                                lambda t: _psql_on(t, own_sql, timeout=ALIAS_QUERY_TIMEOUT)).items():
-        if rc == 0:
+        if rc == 0 and out.strip():
             names.update(v.strip() for v in out.splitlines())
+            known_boxes.append(box)
+    targets = list(dict.fromkeys(list(targets) + known_boxes))
     names = {n for n in names if len(n) >= 3 and n.lower() not in GENERIC_HOSTNAMES
              and not n.startswith("Property value cleared")}
-    _log_lookup(f"identity aliases: hostnames to cross-check: {sorted(names)}")
+    _log_lookup(f"identity aliases: hostnames to cross-check: {sorted(names)} on {targets}")
     if not names:
-        return [], []
+        return [], [], [], sorted(known_boxes)
+    # size gate: the hostname search is a scan of the window; a box whose source_log is too big to
+    # finish inside the statement timeout is skipped up front and named, not left grinding
+    sizes = _parallel_target_map(targets, _source_log_rows)
+    skipped = [{"box": t, "rows": n} for t, n in sizes.items() if n is not None and n > ALIAS_MAX_SOURCE_LOG_ROWS]
+    if skipped:
+        _log_lookup("identity aliases: skipped (source_log too large): " + ", ".join(f"{s['box']}={s['rows']}" for s in skipped))
+    targets = [t for t in targets if not any(s["box"] == t for s in skipped)]
     sql = (
         f"SELECT coalesce(id,''), primary_id, min(time), max(time), count(*), details FROM source_log "
         f"WHERE name IN ({props}) AND details IN ({', '.join(_sql_str(n) for n in names)}) "
         f"AND time>={cutoff_ms} GROUP BY 1,2,6 ORDER BY 4 DESC LIMIT 60;"
     )
-    results = _parallel_target_map(targets, lambda t: _psql_on(t, sql, timeout=ALIAS_QUERY_TIMEOUT))
+    results = _parallel_target_map(targets, lambda t: _psql_on(t, sql, timeout=ALIAS_QUERY_TIMEOUT,
+                                                              stmt_timeout_ms=ALIAS_STMT_TIMEOUT_MS))
     this_mac = (get_field(fields, "mac") or "").lower()
     merged = {}
     failed = []
@@ -3543,7 +3628,7 @@ def get_identity_aliases(ip, mode, appliance, fields, window_seconds=28 * 86400,
         r["last_display"] = format_epoch(r["last"])
         r["boxes"] = ", ".join(r["boxes"])
         r["names"] = ", ".join(r["names"])
-    return rows, sorted(failed)
+    return rows, sorted(failed), sorted(skipped, key=lambda s: s["box"]), sorted(known_boxes)
 
 
 def get_last_wlc_read(all_targets):
@@ -3574,12 +3659,16 @@ def get_host_ttl_seconds():
     return None
 
 
-def location_notes(ip, fields, verdict, aliases, all_targets, alias_failed=()):
+def location_notes(ip, fields, verdict, aliases, all_targets, alias_failed=(), alias_skipped=()):
     """Plain-language reasons shown under the wired/wireless verdict."""
     notes = []
     if alias_failed:
         notes.append(f"The hostname cross-check did not complete on {', '.join(alias_failed)} "
-                     f"(no answer within {ALIAS_QUERY_TIMEOUT}s) -- the identity list may be incomplete.")
+                     f"(cancelled after {ALIAS_STMT_TIMEOUT_MS // 1000}s) -- the identity list may be incomplete.")
+    if alias_skipped:
+        notes.append("The hostname cross-check was skipped on "
+                     + ", ".join(f"{s['box']} ({s['rows'] / 1e6:.0f}M rows)" for s in alias_skipped)
+                     + f" -- its property-change log is too large to search within {ALIAS_STMT_TIMEOUT_MS // 1000}s.")
     now = int(time.time())
     adm_t = get_field_epoch(fields, "adm")
     created = min((get_field_epoch(fields, f) for f in ("mac", "adm", "_times") if get_field_epoch(fields, f)), default=None)
@@ -3632,11 +3721,22 @@ def do_roaming(ip, window_str):
     raw, err, rc = (run(["fstool", "hostinfo", ip], timeout=30) if mode == "em"
                     else ssh_appliance(appliance, f"fstool hostinfo {ip}", timeout=30))
     fields = parse_hostinfo_lines(raw)
-    aliases, alias_failed = get_identity_aliases(ip, mode, appliance, fields, window_seconds=window_seconds,
-                                                 targets=get_all_targets())
-    data = get_roaming(ip, mode, appliance, window_seconds, aliases=aliases, this_mac=get_field(fields, "mac"))
+    cached = alias_cache_read(ip)
+    if cached:
+        aliases, alias_failed, alias_skipped, known_boxes, age = cached
+        identities_source = f"from the IP Lookup {dur_short(age)} ago"
+        _log_lookup(f"identity aliases: reused the lookup's {len(aliases)} identit(ies) from {age}s ago")
+    else:
+        aliases, alias_failed, alias_skipped, known_boxes = get_identity_aliases(
+            ip, mode, appliance, fields, window_seconds=window_seconds,
+            targets=history_boxes(fields, mode, appliance), probe_targets=get_all_targets())
+        alias_cache_write(ip, aliases, alias_failed, alias_skipped, known_boxes)
+        identities_source = "fresh search (no recent IP Lookup of this host)"
+    data = get_roaming(ip, mode, appliance, window_seconds, aliases=aliases, this_mac=get_field(fields, "mac"),
+                       extra_boxes=known_boxes)
     data["incomplete"] = sorted(set(data.get("incomplete", [])) | set(alias_failed))
-    data.update({"ip": ip, "window": window_str, "appliance": appliance or "EM", "identities": aliases})
+    data.update({"ip": ip, "window": window_str, "appliance": appliance or "EM", "identities": aliases,
+                 "identities_source": identities_source, "skipped": alias_skipped})
     print(json.dumps(data))
 
 def do_matched(ip, window_str):

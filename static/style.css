@@ -180,6 +180,13 @@ table.params td { word-break: break-all; max-width: 380px; }
 .roaming-graph { height: auto; max-height: 70vh; overflow: auto; }
 .roaming-svg text { fill: var(--text); }
 .roaming-table { width: 100%; margin-top: 0.5rem; }
+/* IP lookup progress (2026-09-18) */
+.lookup-progress-row { display: grid; grid-template-columns: minmax(16em, 2fr) 5fr 3.5em; gap: 0.75rem; align-items: center; margin: 0.4rem 0; }
+.lookup-progress-label .muted { display: block; font-size: 0.8rem; }
+.lookup-progress-bar { height: 12px; border-radius: 6px; background: rgba(255, 255, 255, 0.08); overflow: hidden; }
+.lookup-progress-fill { height: 100%; background: var(--accent); transition: width 0.5s ease; }
+.lookup-progress-fill.done { background: #3fa34d; }
+.lookup-progress-pct { text-align: right; font-size: 0.85rem; color: var(--muted); }
 /* identity cross-check (2026-09-18): notes under the verdict, "Also known as", probable-match caveat */
 .location-notes { margin: 0.6rem 0 0 0; padding-left: 1.2rem; font-size: 0.85rem; color: var(--muted); }
 .location-notes li { margin-bottom: 0.25rem; }
