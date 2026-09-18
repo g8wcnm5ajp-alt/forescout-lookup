@@ -45,7 +45,7 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.5.1"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
@@ -1265,7 +1265,7 @@ def index():
     return render()
 
 
-@app.route("/lookup", methods=["POST"])
+@app.route("/lookup", methods=["GET", "POST"])
 def do_lookup():
     """
     Accepts one IP or a comma-separated list. Each is looked up
@@ -1278,10 +1278,20 @@ def do_lookup():
     just one) but should still land back on the tab the player was
     actually looking at, not always the first one.
     """
-    if not _check_csrf():
-        return render(error="Session expired -- please try again.", action="lookup")
-    ip_raw = request.form.get("ip", "").strip()
-    active_ip = request.form.get("active_ip", "").strip() or None
+    # GET (David's report, 2026-09-18): after a batch lookup, Enter in the address bar, Back/Forward or
+    # reopening the tab sent `GET /lookup`, which only had a POST rule -- a bare Flask "405 Method Not
+    # Allowed" page that read as a crash. A GET with ?ip= now runs the lookup (a result page can be
+    # refreshed, bookmarked or shared); without it, back to the front page.
+    if request.method == "GET":
+        ip_raw = request.args.get("ip", "").strip()
+        active_ip = request.args.get("active_ip", "").strip() or None
+        if not ip_raw:
+            return redirect(url_for("index"))
+    else:
+        if not _check_csrf():
+            return render(error="Session expired -- please try again.", action="lookup")
+        ip_raw = request.form.get("ip", "").strip()
+        active_ip = request.form.get("active_ip", "").strip() or None
     ips = [p.strip() for p in ip_raw.split(",") if p.strip()]
     _log_activity("lookup", ips=ips)
     error = None
