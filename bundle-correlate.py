@@ -42,7 +42,7 @@ import tarfile
 import time
 from collections import Counter, defaultdict
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 
 FS = "files/usr/local/forescout/"
 
@@ -613,6 +613,10 @@ SIGNATURES = [
     ("service-restart", rb"Watch dog .{0,40}starting|Restarting (?:service|plugin|CounterACT)|is not running|"
                         rb"is stalled|stalled for|respawn|Starting CounterACT|Stopping CounterACT|clock moved backwards"),
     ("java-exception", rb"\b(?:[a-z_][\w$]*\.)+[A-Z][\w$]*(?:Exception|StackOverflowError|NoClassDefFoundError)\b"),
+    # A plugin handed a host key it cannot resolve -- in practice a placeholder (reserved-range)
+    # address for a host known by MAC but not by IP. Added 2026-09-23 from a customer label case:
+    # goodies.log threw 8 of these in an 8-minute window, for hosts other than the reported one.
+    ("identity-resolve", rb"Got invalid primary Key|goodies_noip_action|goodies_noip_prop"),
 ]
 
 # Stage 1 of the sweep. A multi-branch regex over raw log text ran at ~4MB/s -- a
@@ -638,6 +642,7 @@ STEMS = [
     b"Watch dog", b"Restarting ", b"is not running", b"is stalled", b"stalled for", b"respawn",
     b"Starting CounterACT", b"Stopping CounterACT", b"clock moved backwards",
     b"Exception", b"StackOverflowError", b"NoClassDefFoundError",
+    b"invalid primary Key", b"goodies_noip_",
 ]
 SWEEP_RX = re.compile(b"|".join(b"(?P<s%d>%s)" % (i, pat) for i, (_, pat) in enumerate(SIGNATURES)))
 RX_TS_FSTOOL = re.compile(rb"(?:^|:)(\d{10})\.\d+:")
@@ -944,6 +949,152 @@ def parse_hostinfo(text):
 
 
 # ----------------------------------------------------------------------
+# host identity and labels (files/tmp/Allhosts.txt)
+# ----------------------------------------------------------------------
+
+# Forescout's reserved range, from fslib_is_reserved_ip: the stand-in primary key it
+# allocates for a host it knows by MAC but not (yet) by IP.
+RESIP_START = 224 << 24
+RESIP_END = (247 << 24) | 0xFFFFFF
+
+
+def is_placeholder_ip(ip):
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return False
+    v = 0
+    for part in parts:
+        if not part.isdigit():
+            return False
+        n = int(part)
+        if n > 255:
+            return False
+        v = (v << 8) | n
+    return RESIP_START <= v <= RESIP_END
+
+
+# Only the handful of fields this aggregate needs, matched in one pass -- Allhosts.txt
+# runs to millions of lines on a real appliance, so everything else is rejected here.
+RX_ALLHOSTS = re.compile(
+    rb"^([0-9][0-9.]+), \d+,[^,]*, "
+    rb"(goodies_label_list|access_ip|mac|sw_ipport|dhcp_class|"
+    rb"action\.goodies_unlabel_action|action\.goodies_label_action), (.*)$")
+
+
+class LabelAgg:
+    """Every host record on the appliance, in `fstool hostinfo` line format.
+
+    Built 2026-09-23 from a customer "Delete Label does nothing" case. A host that eyeSight
+    keys with a placeholder address keeps its labels permanently: goodies.pl's
+    assign_label resolves that placeholder to the host's MAC before writing, while
+    remove_label clears against the placeholder itself -- which holds no label -- and
+    still replies success. Policies that add a label and later delete it to re-trigger a
+    check therefore never re-trigger on those hosts."""
+
+    MAX_EXAMPLES = 8
+
+    def __init__(self):
+        self.seen = False
+        self.keys = set()     # every distinct host key in the file
+        self.ph = {}          # placeholder-keyed hosts only -> facts
+        self._stats = None
+
+    @property
+    def hosts(self):
+        return len(self.keys)
+
+    def feed(self, fobj):
+        self.seen = True
+        self._stats = None
+        ph = self.ph
+        keys = self.keys
+        known = {}
+        for raw in fobj:
+            # Count host keys directly: not every record carries an assigned-to line (7,069 of
+            # 7,350 in the customer bundle), so that cannot be the total. The key must still look
+            # like an address -- a wrapped multi-line value (a switch running-config, say) also
+            # starts a line and would otherwise be counted as a host.
+            end = raw.find(b",")
+            if end <= 0:
+                continue
+            key_raw = raw[:end]
+            if b"." in key_raw and key_raw.replace(b".", b"").isdigit():
+                keys.add(key_raw)
+            m = RX_ALLHOSTS.match(raw)
+            if m is None:
+                continue
+            key_b, field, val = m.group(1), m.group(2), m.group(3)
+            placeholder = known.get(key_b)
+            if placeholder is None:
+                placeholder = known[key_b] = is_placeholder_ip(key_b.decode("ascii", "replace"))
+            if not placeholder:
+                continue
+            # an empty value sits straight against the source paren, so a cut at 0 counts
+            cut = val.find(b", (")
+            if cut >= 0:
+                val = val[:cut]
+            if val == b"???":      # Forescout's "could not resolve" marker -- not a value
+                val = b""
+            key = key_b.decode("ascii", "replace")
+            h = ph.get(key)
+            if h is None:
+                h = ph[key] = {"labels": [], "ip": "", "mac": "", "switch": "", "cls": "", "del": 0, "add": 0}
+            if field == b"goodies_label_list":
+                if val:
+                    h["labels"].append(val.decode("utf-8", "replace"))
+            elif field == b"access_ip":
+                if val:
+                    h["ip"] = val.decode("ascii", "replace")
+            elif field == b"mac":
+                if val:
+                    h["mac"] = val.decode("ascii", "replace")
+            elif field == b"sw_ipport":
+                if val:
+                    h["switch"] = val.decode("ascii", "replace")
+            elif field == b"dhcp_class":
+                if val:
+                    h["cls"] = val.decode("utf-8", "replace")
+            elif field == b"action.goodies_unlabel_action":
+                h["del"] += 1
+            else:
+                h["add"] += 1
+
+    def stats(self):
+        if self._stats is not None:
+            return self._stats
+        # every placeholder-keyed host in the file, not just the ones carrying a field this
+        # aggregate tracks -- self.ph only gains a host when one of those fields is seen
+        placeholder = sum(1 for k in self.keys if is_placeholder_ip(k.decode("ascii", "replace")))
+        out = {"hosts": self.hosts, "placeholder": placeholder, "ph_ip": 0, "ph_mac": 0, "ph_switch": 0,
+               "labelled": 0, "labelled_ip": 0, "stuck": 0, "retry": 0,
+               "labels": Counter(), "classes": Counter(), "examples": []}
+        for h in self.ph.values():
+            if h["ip"]:
+                out["ph_ip"] += 1
+            if h["mac"]:
+                out["ph_mac"] += 1
+            if h["switch"]:
+                out["ph_switch"] += 1
+            if not h["labels"]:
+                continue
+            out["labelled"] += 1
+            out["stuck"] += len(h["labels"])
+            if h["ip"]:
+                out["labelled_ip"] += 1
+            if h["del"]:
+                out["retry"] += 1
+            for name in h["labels"]:
+                out["labels"][name] += 1
+            if h["cls"]:
+                out["classes"][h["cls"]] += 1
+        # worst first: a delete already attempted, then the most labels held
+        out["examples"] = sorted(((k, h) for k, h in self.ph.items() if h["labels"]),
+                                 key=lambda kv: (-kv[1]["del"], -len(kv[1]["labels"])))[:self.MAX_EXAMPLES]
+        self._stats = out
+        return out
+
+
+# ----------------------------------------------------------------------
 # one bundle
 # ----------------------------------------------------------------------
 
@@ -978,6 +1129,7 @@ class Bundle:
         self.trace_ip_set_at = None
         self.summary = {}          # collection command / elapsed seconds, from summary.txt
         self.wireless_controllers = None
+        self.labels = LabelAgg()   # files/tmp/Allhosts.txt -- identity + label state
 
     # ---- identity ------------------------------------------------------
     @property
@@ -1133,6 +1285,9 @@ class Bundle:
                 m = re.search(r"Total Elements: \[(\d+)\]", fobj.read(4000).decode("utf-8", "replace"))
                 if m:
                     self.wireless_controllers = int(m.group(1))
+            elif base.lower().startswith("allhosts") and base.endswith((".txt", ".log")):
+                # every host record on the appliance -- streamed, never held whole (millions of lines)
+                self.labels.feed(fobj)
             elif base.endswith((".txt", ".log")) and "hostinfo" in base.lower():
                 self.hostinfo.update(parse_hostinfo(fobj.read(4000000).decode("utf-8", "replace")))
         elif rel.startswith(FS + "etc/") and base.endswith(".properties"):
@@ -1735,6 +1890,75 @@ def section_online(rep, bundles, args, findings):
                            "Start `fstool trace_ip` BEFORE reproducing, then collect."])
 
 
+def section_identity_labels(rep, bundles, args, findings):
+    """Placeholder-keyed hosts and the labels stuck on them (see LabelAgg)."""
+    shown = False
+    for b in bundles:
+        if not b.labels.seen:
+            continue
+        shown = True
+        st = b.labels.stats()
+        pct = (100.0 * st["placeholder"] / st["hosts"]) if st["hosts"] else 0.0
+        rep.p(f"  {b.label}: {st['hosts']:,} host record(s); {st['placeholder']:,} ({pct:.1f}%) keyed with a placeholder "
+              f"address (224.0.0.0-247.255.255.255 -- allocated when a host is known by MAC but not by IP)")
+        rep.p(f"      of those placeholder-keyed hosts: {st['ph_mac']:,} have a MAC, {st['ph_ip']:,} have a real IP "
+              f"(access_ip), {st['ph_switch']:,} are on a switch port")
+        if not st["labelled"]:
+            rep.p("      none of them carry a label -- Delete Label has nothing to fail on here")
+            continue
+        rep.p(f"      {st['labelled']:,} carry {st['stuck']:,} label(s) that Delete Label cannot remove; "
+              f"{st['labelled_ip']:,} of those hosts have a known IP; {st['retry']:,} have had a delete attempted already")
+        if st["labels"]:
+            top = ", ".join(f"{n} ({c})" for n, c in st["labels"].most_common(6))
+            rep.p(f"      labels stuck: {top}")
+        if st["classes"]:
+            top = ", ".join(f"{n} ({c})" for n, c in st["classes"].most_common(4))
+            rep.p(f"      device classes: {top}")
+        rep.p("      worst hosts:")
+        for key, h in st["examples"]:
+            ident = f"mac {h['mac'] or '?'}"
+            if h["ip"]:
+                ident += f", ip {h['ip']}"
+            if h["switch"]:
+                ident += f", on {h['switch']}"
+            rep.p(f"        {key}  ({ident})")
+            rep.p(f"           {len(h['labels'])} label(s): {', '.join(h['labels'][:6])}"
+                  + (f"   [{h['del']} delete attempt(s) recorded]" if h["del"] else ""))
+    if not shown:
+        rep.p("  No files/tmp/Allhosts.txt in these bundle(s) -- host identity and label state not available.")
+        return
+    for b in bundles:
+        if not b.labels.seen:
+            continue
+        st = b.labels.stats()
+        cause = ("goodies.pl: assign_label resolves a placeholder key to the host's MAC before writing, "
+                 "remove_label clears against the placeholder itself and still replies success")
+        if st["retry"]:
+            add_finding(findings, 3, b,
+                        f"Delete Label is failing silently -- {st['retry']:,} host(s) had a delete recorded and still carry the label",
+                        [f"{st['labelled']:,} placeholder-keyed host(s) hold {st['stuck']:,} label(s) that cannot be removed",
+                         f"{st['labelled_ip']:,} of those hosts have a known IP address, so they are not 'hosts without an IP'",
+                         f"cause: {cause}",
+                         "a policy that deletes a label to re-trigger a check never re-triggers on these hosts",
+                         "worst: " + "; ".join(f"{k} ({h['del']} delete(s), {len(h['labels'])} label(s))"
+                                               for k, h in st["examples"][:3])])
+        elif st["labelled"]:
+            add_finding(findings, 2, b,
+                        f"{st['labelled']:,} placeholder-keyed host(s) carry {st['stuck']:,} label(s) that Delete Label cannot remove",
+                        [f"no delete has been attempted on them yet in this data -- the failure is latent",
+                         f"{st['labelled_ip']:,} of those hosts have a known IP address",
+                         f"cause: {cause}"])
+        if st["ph_ip"]:
+            add_finding(findings, 2, b,
+                        f"{st['ph_ip']:,} host(s) keep a placeholder primary key although their real IP is known",
+                        [f"{st['ph_switch']:,} of the placeholder-keyed hosts are live on a switch port; "
+                         f"{st['ph_mac']:,} have a MAC",
+                         "the record is keyed by the placeholder while the real address sits in the access_ip property, "
+                         "so `fstool hostinfo <real ip>` answers under the placeholder address",
+                         "this is the precondition for the Delete Label failure above, and the product's own reply text "
+                         "for this path ('Action not applicable on hosts without an IP address') does not describe them"])
+
+
 def render_findings(findings):
     rep = Report()
     rep.h("0. Findings (most serious first)")
@@ -2161,7 +2385,11 @@ def build_report(bundles, args):
         rep.p("  `-p sw` from the appliance that manages the switch AND raise a plugin's debug on the host's managing appliance.")
 
     # ------------------------------------------------------------------ 7
-    rep.h("7. Trace_cu errors and warnings (grouped)")
+    rep.h("7. Host identity and labels: placeholder-keyed hosts, labels that cannot be deleted")
+    section_identity_labels(rep, bundles, args, findings)
+
+    # ------------------------------------------------------------------ 8
+    rep.h("8. Trace_cu errors and warnings (grouped)")
     for b in bundles:
         tr = b.trace
         rep.sub(f"{b.label}: {sum(r['count'] for r in tr.issues.values())} Error/Warning lines, "
@@ -2179,7 +2407,7 @@ def build_report(bundles, args):
         rep.p("    busiest trace categories: " + ", ".join(f"{c}|{lv} {n}" for n, c, lv in chatty[:6]))
 
     # ------------------------------------------------------------------ 6
-    rep.h("8. Error signatures in every other log (plugin, daemon, watchdog, syslog, kernel)")
+    rep.h("9. Error signatures in every other log (plugin, daemon, watchdog, syslog, kernel)")
     for b in bundles:
         sw = b.sweep
         rep.sub(f"{b.label}: {sw.files} files, {sw.bytes / 1048576:.0f}MB")
@@ -2204,7 +2432,7 @@ def build_report(bundles, args):
 
     # ------------------------------------------------------------------ 7
     if len(bundles) > 1 and common:
-        rep.h("9. Minutes where more than one system was in trouble at once")
+        rep.h("10. Minutes where more than one system was in trouble at once")
         lo, hi = int(common[0] // 60), int(common[1] // 60)
         scored = []
         for m in range(lo, hi + 1):
