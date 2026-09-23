@@ -412,9 +412,18 @@ def run(cmd, timeout=60, input=None):
     argument-list-length limit -- "OSError: [Errno 7] Argument list too
     long"). Piping via stdin has no such limit and needs no encoding at
     all, since the content never touches shell argument parsing.
+
+    Output is decoded as UTF-8 with errors="replace": a customer's lookups
+    of wireless hosts all died with UnicodeDecodeError (byte 0xf3) because
+    the wireless plugin's dev_db.wifi on their appliance holds a Latin-1
+    accented character. One stray byte in any command's output must never
+    kill the whole call -- it now shows as U+FFFD and parsing carries on.
     """
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=input)
+        p = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, input=input,
+        )
         return p.stdout, p.stderr, p.returncode
     except subprocess.TimeoutExpired:
         return "", f"timed out after {timeout}s", 1
