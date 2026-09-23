@@ -788,6 +788,8 @@ MANUAL_STAGING_PATH_RE = re.compile(r"^/root/scripts/staged-bundles/[A-Za-z0-9_.
 # reasoning as MAX_LOOKUP_IPS in app.py. Real bundles seen so far (up to
 # 867MB) are comfortably under this.
 MAX_UPLOAD_BYTES = 2 * 1024 * 1024 * 1024
+# Mirrors webapp-query.py's MAX_BUNDLE_PARTS.
+MAX_BUNDLE_PARTS = 64
 
 
 def upload_bundle(filename, stream, timeout=900):
@@ -807,13 +809,50 @@ def upload_bundle(filename, stream, timeout=900):
     """
     if not UPLOAD_FILENAME_RE.match(filename or ""):
         raise ForescoutClientError("Bundle filename must end in .tgz or .tar.gz (letters/digits/./-/_ only).")
+    return _stream_to_verb(f"bundleupload {filename}", stream, timeout)
+
+
+def upload_bundle_part(filename, index, count, size, stream, timeout=900):
+    """
+    One part of a split bundle (David, 2026-09-23): streamed to the EM's
+    `bundlepartappend`, which appends it in order onto <filename>.joining.
+    index is 0-based; size is the part's byte count as the browser saw it,
+    checked on the EM so a short transfer is never kept. Same 1MB streaming
+    and per-call cap as upload_bundle -- a split part is well under it.
+    """
+    if not UPLOAD_FILENAME_RE.match(filename or ""):
+        raise ForescoutClientError("Bundle filename must end in .tgz or .tar.gz (letters/digits/./-/_ only).")
+    if not (2 <= count <= MAX_BUNDLE_PARTS and 0 <= index < count):
+        raise ForescoutClientError(f"A split bundle must have 2 to {MAX_BUNDLE_PARTS} parts.")
+    if not 0 < size <= MAX_UPLOAD_BYTES:
+        raise ForescoutClientError(f"Each part must be under the {MAX_UPLOAD_BYTES // (1024 * 1024)}MB upload limit.")
+    return _stream_to_verb(f"bundlepartappend {filename} {index} {count} {size}", stream, timeout)
+
+
+def finish_bundle_parts(filename, count, timeout=60):
+    if not UPLOAD_FILENAME_RE.match(filename or ""):
+        raise ForescoutClientError("Bundle filename must end in .tgz or .tar.gz (letters/digits/./-/_ only).")
+    if not 2 <= count <= MAX_BUNDLE_PARTS:
+        raise ForescoutClientError(f"A split bundle must have 2 to {MAX_BUNDLE_PARTS} parts.")
+    return _run_verb(f"bundlepartfinish {filename} {count}", timeout=timeout)
+
+
+def abort_bundle_parts(filename, timeout=30):
+    if not UPLOAD_FILENAME_RE.match(filename or ""):
+        raise ForescoutClientError("Bundle filename must end in .tgz or .tar.gz (letters/digits/./-/_ only).")
+    return _run_verb(f"bundlepartabort {filename}", timeout=timeout)
+
+
+def _stream_to_verb(verb_command, stream, timeout):
+    """Streams `stream` to a stdin-reading EM verb in 1MB pieces (never held whole), capped at
+    MAX_UPLOAD_BYTES, and returns the verb's JSON reply."""
     if not os.path.isfile(SSH_KEY_PATH):
         raise ForescoutClientError(
             f"SSH key not found at {SSH_KEY_PATH} -- the container's key volume isn't mounted correctly."
         )
     cmd = [
         "ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "ConnectTimeout=10", "-i", SSH_KEY_PATH, f"root@{EM_HOST}", f"bundleupload {filename}",
+        "-o", "ConnectTimeout=10", "-i", SSH_KEY_PATH, f"root@{EM_HOST}", verb_command,
     ]
     try:
         proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)

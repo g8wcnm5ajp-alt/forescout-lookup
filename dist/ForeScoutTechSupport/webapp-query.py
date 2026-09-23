@@ -246,6 +246,15 @@ Verbs (see the plan this was built from, forescout-lookup):
                             the uploads directory only
     bundleuploadlist        no args -- every bundle currently in the
                             uploads directory (name, size, mtime)
+    bundlepartappend <filename> <index> <count> <size>
+                            one part (0-based index) of a split bundle,
+                            off stdin, appended in order onto
+                            <filename>.joining in the uploads directory
+    bundlepartfinish <filename> <count>
+                            all parts in: gzip-header check, renamed to
+                            <filename> in the uploads directory
+    bundlepartabort <filename>
+                            discards a half-finished join
     bundleroam <path> <mac|ip>
                             where one device was seen connected, from that
                             bundle's own logs (bundle-correlate.py --roaming)
@@ -2188,6 +2197,131 @@ def do_bundle_upload_cleanup(path):
         return
     if os.path.isfile(path):
         os.remove(path)
+    print(json.dumps({"ok": True}))
+
+
+# A bundle split into parts (`split -b 1G`, 7-Zip's .001/.002, ...) is sent
+# one part per call and appended, in order, onto a single growing file, so the
+# EM never holds the parts AND the joined copy at once -- disk use peaks at the
+# bundle's own size. David's ask 2026-09-23: customers send big bundles split
+# (the first real one was a 3.1 GB appliance bundle in three 1 GB parts, over
+# the 2 GB single-upload cap). The browser works out the order; this side
+# enforces it through a small state file, so a part sent twice, skipped or out
+# of order is refused rather than silently producing a scrambled archive.
+MAX_BUNDLE_PARTS = 64
+# Free space kept back on the uploads filesystem after a part lands -- the EM's
+# own root filesystem is where /tmp lives.
+PART_DISK_MARGIN_BYTES = 1024 * 1024 * 1024
+
+
+def _joining_paths(filename):
+    path = os.path.join(UPLOAD_DIR, filename)
+    return path + ".joining", path + ".joining.state"
+
+
+def _read_join_state(state_path):
+    try:
+        with open(state_path) as f:
+            state = json.load(f)
+        return int(state["next"]), int(state["count"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def do_bundle_part_append(filename, index, count, size):
+    """
+    Appends one part of a split bundle, read off stdin, to
+    UPLOAD_DIR/<filename>.joining. index is 0-based; part 0 starts a fresh
+    join (any earlier half-finished one for the same name is discarded).
+    size is the part's byte count as the browser saw it -- anything else
+    arriving (a dropped connection, say) is cut back off and refused, so the
+    joined file only ever holds whole parts.
+    """
+    if not UPLOAD_FILENAME_RE.match(filename or ""):
+        fail(f"'{filename}' is not a valid bundle filename.")
+    if not 2 <= count <= MAX_BUNDLE_PARTS:
+        fail(f"A split bundle must have 2 to {MAX_BUNDLE_PARTS} parts.")
+    if not 0 <= index < count:
+        fail(f"Part {index + 1} is outside 1-{count}.")
+    if size <= 0:
+        fail("Empty part.")
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+    joining, state_path = _joining_paths(filename)
+    if index == 0:
+        for stale in (joining, state_path):
+            if os.path.exists(stale):
+                os.remove(stale)
+        open(joining, "wb").close()
+    else:
+        state = _read_join_state(state_path)
+        if state is None or not os.path.isfile(joining):
+            fail(f"Part {index + 1} of {filename} arrived with no join in progress -- start again from part 1.")
+        expected, known_count = state
+        if known_count != count:
+            fail(f"{filename} was started as {known_count} parts, not {count}.")
+        if index != expected:
+            fail(f"{filename}: expected part {expected + 1}, got part {index + 1}.")
+    if shutil.disk_usage(UPLOAD_DIR).free < size + PART_DISK_MARGIN_BYTES:
+        fail(f"Not enough free disk on the EM for part {index + 1} of {filename} "
+             f"({size // (1024 * 1024)}MB plus {PART_DISK_MARGIN_BYTES // (1024 * 1024)}MB headroom).")
+    start = os.path.getsize(joining)
+    received = 0
+    try:
+        with open(joining, "ab") as f:
+            while True:
+                block = sys.stdin.buffer.read(1024 * 1024)
+                if not block:
+                    break
+                received += len(block)
+                if received > size:
+                    break
+                f.write(block)
+    except OSError as e:
+        with open(joining, "r+b") as f:
+            f.truncate(start)
+        fail(f"Writing part {index + 1} of {filename} failed: {e}")
+    if received != size:
+        with open(joining, "r+b") as f:
+            f.truncate(start)
+        fail(f"Part {index + 1} of {filename}: expected {size} bytes, received {received} -- not added.")
+    with open(state_path, "w") as f:
+        json.dump({"next": index + 1, "count": count}, f)
+    print(json.dumps({"part": index + 1, "count": count, "size": os.path.getsize(joining)}))
+
+
+def do_bundle_part_finish(filename, count):
+    """Every part is in: checks the count and that the joined file starts like a gzip archive,
+    then renames it into place as UPLOAD_DIR/<filename>, where it lists and analyses like any
+    other uploaded bundle."""
+    if not UPLOAD_FILENAME_RE.match(filename or ""):
+        fail(f"'{filename}' is not a valid bundle filename.")
+    joining, state_path = _joining_paths(filename)
+    state = _read_join_state(state_path)
+    if state is None or not os.path.isfile(joining):
+        fail(f"No join in progress for {filename}.")
+    received, known_count = state
+    if known_count != count or received != count:
+        fail(f"{filename}: {received} of {known_count} parts received, cannot finish.")
+    with open(joining, "rb") as f:
+        magic = f.read(2)
+    if magic != b"\x1f\x8b":
+        os.remove(joining)
+        os.remove(state_path)
+        fail(f"The joined {filename} does not start like a .tgz (gzip) archive -- "
+             "check part 1 is really the first part. Nothing was kept.")
+    path = os.path.join(UPLOAD_DIR, filename)
+    os.replace(joining, path)
+    os.remove(state_path)
+    print(json.dumps({"path": path, "size": os.path.getsize(path)}))
+
+
+def do_bundle_part_abort(filename):
+    """Throws away a half-finished join -- the browser calls this when any part fails."""
+    if not UPLOAD_FILENAME_RE.match(filename or ""):
+        fail(f"'{filename}' is not a valid bundle filename.")
+    for stale in _joining_paths(filename):
+        if os.path.exists(stale):
+            os.remove(stale)
     print(json.dumps({"ok": True}))
 
 
@@ -4945,6 +5079,18 @@ def main():
     if original.strip() == "bundleuploadlist":
         return do_bundle_upload_list()
 
+    m = re.fullmatch(rf"bundlepartappend ({UPLOAD_FILENAME_RE.pattern[1:-1]}) (\d{{1,2}}) (\d{{1,2}}) (\d{{1,12}})", original.strip())
+    if m:
+        return do_bundle_part_append(m.group(1), int(m.group(2)), int(m.group(3)), int(m.group(4)))
+
+    m = re.fullmatch(rf"bundlepartfinish ({UPLOAD_FILENAME_RE.pattern[1:-1]}) (\d{{1,2}})", original.strip())
+    if m:
+        return do_bundle_part_finish(m.group(1), int(m.group(2)))
+
+    m = re.fullmatch(rf"bundlepartabort ({UPLOAD_FILENAME_RE.pattern[1:-1]})", original.strip())
+    if m:
+        return do_bundle_part_abort(m.group(1))
+
     m = re.fullmatch(
         rf"bundleroam (/shared/shared/case/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+|"
         rf"{UPLOAD_PATH_RE.pattern[1:-1]}|{MANUAL_STAGING_PATH_RE.pattern[1:-1]}) ({ROAM_KEY_RE})", original.strip(),
@@ -5146,6 +5292,7 @@ def main():
         "analyzeadm <target> <bundle|-> <window> <switch_filter|-> <top_n> <spike_n> <stale_days> | "
         "pluginlogszip <target> <plugin,...> <start>:<end> | "
         "bundleupload <filename> | bundleuploadcleanup <path> | bundleuploadlist | "
+        "bundlepartappend <filename> <index> <count> <size> | bundlepartfinish <filename> <count> | bundlepartabort <filename> | "
         "bundlecorrelate <path>[,<path>...] <gap_s> <context_s> <top_n> | bundleroam <path> <mac|ip> | "
         "radiuslive <target> <start>:<end> | radiusbundle <path> | radiusfile (log on stdin) | "
         "admtapstatus <target> | admtappreview <target> (values on stdin) | admtapapply <target> <digest> | admtaprestart <target> <digest> | "

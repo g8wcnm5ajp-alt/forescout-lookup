@@ -31,6 +31,7 @@ from forescout_client import (
     list_plugins, list_uploaded_bundles, lookup, matched_rules, policy_history, policy_tree, preview_techsupport,
     preview_techsupport_em, radius_bundle, radius_file, radius_live, raw_fields, roaming, run_show_errors, set_admin_cidr, tail_lookup_debug_log,
     tail_techsupport_log, trace_defaults, trace_list, trace_set, upload_bundle, valid_cidr, valid_ip,
+    upload_bundle_part, finish_bundle_parts, abort_bundle_parts,
     valid_target,
 )
 
@@ -47,7 +48,7 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.10.0"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
@@ -843,34 +844,73 @@ def start_analyze_run(target, bundle_path, window, switch_filter, top_n, spike_n
     return run_id
 
 
-def start_correlate_run(paths, gap, context, top_n):
+def start_review_run(paths, gap, context, top_n):
     """
-    Upload & Review Bundle tab's Correlate -- several bundles analysed
-    together by bundle-correlate.py on the EM. Rides the same
-    analyze_runs.json tracking and /api/analyze_run/<id> polling as a
-    single-bundle analyze; "kind" tells the progress UI which step list to
-    show. The duplicate-run guard keys on the sorted path set, so the same
-    selection can't be started twice while it's still running.
+    Upload & Review Bundle tab's one "Review ticked bundles" button (David,
+    2026-09-23 -- replaces the separate Correlate and per-row "Analyze
+    admissions" buttons, after he ran Analyze admissions on a customer bundle
+    and, reasonably, found none of the label findings, which only the
+    Correlate report carried). One background run, one report:
+      Part 1 -- bundle-correlate.py over every ticked bundle: the ranked
+                Findings (all the case detectors, label/host-identity checks
+                included), clocks, EM<->appliance timeline, health, sweeps.
+      Part 2 -- high-admission-trace.sh's admission analysis, per bundle.
+    A part that fails is reported in place and the rest still runs -- the
+    run only fails if every part did. "phase" tells the progress UI which
+    step is running. Rides the same analyze_runs.json tracking and
+    /api/analyze_run/<id> polling as every other analyze; the duplicate-run
+    guard keys on the sorted path set.
     """
-    key = "correlate:" + ",".join(sorted(paths))
+    key = "review:" + ",".join(sorted(paths))
     run_id = f"{int(time.time() * 1000)}-{os.urandom(3).hex()}"
+    names = [os.path.basename(p) for p in paths]
     with _analyze_runs_lock:
         runs = _load_analyze_runs()
         if any(r["key"] == key and r["status"] == "running" for r in runs):
             return None
         runs.append({
-            "id": run_id, "key": key, "kind": "correlate", "target": BUNDLE_ANALYZE_PLACEHOLDER_TARGET,
-            "bundle": ", ".join(os.path.basename(p) for p in paths), "status": "running",
+            "id": run_id, "key": key, "kind": "review", "target": BUNDLE_ANALYZE_PLACEHOLDER_TARGET,
+            "bundle": ", ".join(names), "bundles": names, "phase": 0, "status": "running",
             "started_at": int(time.time()), "finished_at": None, "result": None, "error": None,
         })
         _save_analyze_runs(runs)
 
     def _worker():
+        rule = "=" * 78
+        sections = []
+        failures = 0
+        identity = []
         try:
-            result = correlate_bundles(paths, gap=gap, context=context, top_n=top_n)
-            _update_analyze_run(run_id, status="complete", finished_at=int(time.time()), result=result)
+            corr = correlate_bundles(paths, gap=gap, context=context, top_n=top_n)
+            identity = corr.get("bundles") or []
+            body = corr.get("output") or "(no output)"
         except ForescoutClientError as e:
-            _update_analyze_run(run_id, status="failed", finished_at=int(time.time()), error=str(e))
+            failures += 1
+            body = f"FAILED: {e}"
+        sections.append(f"{rule}\nPART 1 -- Findings, correlation and host/label checks ({len(paths)} bundle(s))\n{rule}\n\n{body}")
+        for i, (path, name) in enumerate(zip(paths, names), start=1):
+            _update_analyze_run(run_id, phase=i)
+            try:
+                adm = analyze_admission(
+                    BUNDLE_ANALYZE_PLACEHOLDER_TARGET, bundle_path=path, window="1h", switch_filter=None,
+                    top_n=10, spike_n=5, stale_days=7,
+                )
+                body = adm.get("output") or "(no output)"
+            except ForescoutClientError as e:
+                failures += 1
+                body = f"FAILED: {e}"
+            sections.append(f"{rule}\nPART 2.{i} -- Admission analysis: {name}\n{rule}\n\n{body}")
+        total = 1 + len(paths)
+        header = (f"Bundle review -- {len(paths)} bundle(s): {', '.join(names)}\n"
+                  f"Part 1 carries the ranked Findings for every bundle; Part 2 is the admission analysis per bundle."
+                  + (f"\n{failures} of {total} part(s) FAILED -- see the part(s) marked FAILED below." if failures else "")
+                  + "\n\n")
+        result = {"bundles": identity, "output": header + "\n\n".join(sections)}
+        if failures == total:
+            _update_analyze_run(run_id, status="failed", finished_at=int(time.time()),
+                                error="Every part of the review failed:\n" + result["output"][-3000:])
+        else:
+            _update_analyze_run(run_id, status="complete", finished_at=int(time.time()), result=result)
 
     threading.Thread(target=_worker, daemon=True).start()
     return run_id
@@ -2791,6 +2831,26 @@ def bundle_upload_route():
     # basename only -- strips any path component a crafted filename might
     # carry, before it ever reaches upload_bundle's own shape check.
     filename = os.path.basename(f.filename)
+    # One part of a split bundle (David, 2026-09-23): the browser grouped and
+    # ordered the parts and names the bundle they rebuild (join_name); the EM
+    # appends this part in order. /bundle/upload/finish completes the join.
+    if request.form.get("join_name"):
+        join_name = os.path.basename(request.form.get("join_name", ""))
+        try:
+            index = int(request.form.get("part_index", ""))
+            count = int(request.form.get("part_count", ""))
+            size = int(request.form.get("part_size", ""))
+        except ValueError:
+            return jsonify({"error": "Part number, part count and size must be numbers."}), 400
+        try:
+            result = upload_bundle_part(join_name, index, count, size, f.stream)
+        except ForescoutClientError as e:
+            return jsonify({"error": str(e)}), 400
+        _log_activity(
+            "bundle_part_uploaded", username=session.get("username"), filename=join_name,
+            part=f"{index + 1}/{count}", source=filename, size=size,
+        )
+        return jsonify(result)
     try:
         # f.stream, not f.read() -- werkzeug has already spooled the upload
         # to disk; it goes on to the EM in 1MB pieces instead of being
@@ -2802,13 +2862,49 @@ def bundle_upload_route():
         "bundle_uploaded", username=session.get("username"), filename=filename, size=result.get("size"),
     )
     # analyze=0: the multi-bundle flow uploads first and picks what to
-    # run afterwards (Correlate, or a per-bundle admission analyze).
+    # run afterwards (the tab's "Review ticked bundles").
     if request.form.get("analyze", "1") == "0":
         return jsonify({"path": result["path"], "size": result.get("size")})
     run_id = start_analyze_run(BUNDLE_ANALYZE_PLACEHOLDER_TARGET, result["path"], "1h", None, 10, 5, 7)
     if run_id is None:
         return jsonify({"error": "An analysis is already running for this bundle."}), 409
     return jsonify({"path": result["path"], "size": result.get("size"), "run_id": run_id})
+
+
+@app.route("/bundle/upload/finish", methods=["POST"])
+def bundle_upload_finish_route():
+    """Last part of a split bundle is in -- the EM checks the count and gzip header and
+    renames the joined file into the uploads directory."""
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    join_name = os.path.basename(request.form.get("join_name", ""))
+    try:
+        count = int(request.form.get("part_count", ""))
+    except ValueError:
+        return jsonify({"error": "Part count must be a number."}), 400
+    try:
+        result = finish_bundle_parts(join_name, count)
+    except ForescoutClientError as e:
+        return jsonify({"error": str(e)}), 400
+    _log_activity(
+        "bundle_uploaded", username=session.get("username"), filename=join_name, size=result.get("size"),
+        parts=count,
+    )
+    return jsonify({"path": result["path"], "size": result.get("size")})
+
+
+@app.route("/bundle/upload/abort", methods=["POST"])
+def bundle_upload_abort_route():
+    """A part failed -- throw the half-joined file away on the EM."""
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    join_name = os.path.basename(request.form.get("join_name", ""))
+    try:
+        abort_bundle_parts(join_name)
+    except ForescoutClientError as e:
+        return jsonify({"error": str(e)}), 400
+    _log_activity("bundle_part_upload_aborted", username=session.get("username"), filename=join_name)
+    return jsonify({"ok": True})
 
 
 @app.route("/bundle/uploads", methods=["GET"])
@@ -2820,15 +2916,14 @@ def bundle_uploads_route():
         return jsonify({"error": str(e)}), 502
 
 
-@app.route("/bundle/correlate", methods=["POST"])
-def bundle_correlate_route():
+@app.route("/bundle/review", methods=["POST"])
+def bundle_review_route():
     """
-    Upload & Review Bundle tab -- David's ask, 2026-09-17: analyse several
-    tech-support bundles together offline (an EM bundle plus its appliance
-    bundle(s)) to pull out what ties the systems together, first target
-    being an appliance that keeps disconnecting from its EM. Starts a
-    background run; the tab polls /api/analyze_run/<id> like every other
-    analyze.
+    Upload & Review Bundle tab's single "Review ticked bundles" button --
+    see start_review_run. (Was /bundle/correlate, correlation only, from
+    David's 2026-09-17 ask: several bundles analysed together offline, an EM
+    bundle plus its appliance bundle(s).) Starts a background run; the tab
+    polls /api/analyze_run/<id> like every other analyze.
     """
     if not _check_csrf():
         return jsonify({"error": "Session expired -- please refresh and try again."}), 403
@@ -2842,12 +2937,12 @@ def bundle_correlate_route():
     except ValueError:
         return jsonify({"error": "Gap, context and rows must be numbers."}), 400
     _log_activity(
-        "bundle_correlate", username=session.get("username"), bundles=[os.path.basename(p) for p in paths],
+        "bundle_review", username=session.get("username"), bundles=[os.path.basename(p) for p in paths],
         gap=gap, context=context, top_n=top_n,
     )
-    run_id = start_correlate_run(paths, gap, context, top_n)
+    run_id = start_review_run(paths, gap, context, top_n)
     if run_id is None:
-        return jsonify({"error": "A correlate run is already going for this selection."}), 409
+        return jsonify({"error": "A review is already running for this selection."}), 409
     return jsonify({"run_id": run_id})
 
 

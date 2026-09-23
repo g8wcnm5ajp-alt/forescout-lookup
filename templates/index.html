@@ -729,17 +729,17 @@
             <p class="hint">Review tech-support bundles this app never built itself -- a customer's own
                 <code>.tgz</code>/<code>.tar.gz</code>, sent in some other way. Pick one or several (an EM bundle
                 plus its appliance bundle(s) from the same incident); they are uploaded straight to this EM.
-                Then tick the ones that belong together and <strong>Correlate</strong>: clocks are lined up,
+                Then tick the ones that belong together and <strong>Review ticked bundles</strong> -- one report: clocks are lined up,
                 the EM&harr;appliance disconnect timeline is rebuilt from both sides' Trace logs, and every log,
                 stats and database-info file is swept for performance problems and system errors. The report
                 opens with ranked <strong>Findings</strong> -- runaway processes and JVM heap starvation, plugin
                 queue backlogs with when they started and what cleared them, hosts brought back online after a
                 switch link-down trap (and by which plugin on which appliance), plugins re-asserting online state,
                 learn-event forwarding loops, clock steps, tracing that was started too late. Works on a single
-                bundle too. Nothing is unpacked to disk. <strong>Analyze admissions</strong> on a single bundle is the same
-                admission analysis as the Tech Support tab's own Analyze button.</p>
+                bundle too. <strong>Split bundles</strong>: pick every part together (e.g. <code>x.tgz_part_aa</code>, <code>_part_ab</code>, ... or <code>x.tgz.001</code>, <code>.002</code>, ...) -- they are put in order, sent one at a time and joined back into <code>x.tgz</code> on the EM. The report's second part is the admission analysis for each ticked bundle -- the same analysis as
+                the Tech Support tab's own Analyze button.</p>
             <div class="tree-filter-row">
-                <input type="file" id="upload-bundle-file" accept=".tgz,.tar.gz" multiple>
+                <input type="file" id="upload-bundle-file" multiple>
                 <button type="button" id="upload-bundle-btn">Upload</button>
             </div>
             <div class="hint" id="upload-bundle-status"></div>
@@ -756,7 +756,7 @@
                 <label>Gap &ge; <input type="number" id="correlate-gap" value="150" min="30" max="86400" style="width:5rem;"> s</label>
                 <label>Context &plusmn; <input type="number" id="correlate-context" value="120" min="10" max="3600" style="width:5rem;"> s</label>
                 <label>Rows <input type="number" id="correlate-top" value="10" min="1" max="200" style="width:4rem;"></label>
-                <button type="button" id="upload-correlate-btn">Correlate ticked bundles</button>
+                <button type="button" id="upload-correlate-btn">Review ticked bundles</button>
             </div>
             <div class="hint" id="upload-run-status"></div>
             <div id="upload-output-tools" style="display:none; margin:0.5rem 0;">
@@ -2773,6 +2773,10 @@
                        "Per-home-server, per-NAS, per-hour and reject tables"]
                     : d.kind === "roaming"
                     ? ["Stream the bundle once looking for this device: " + d.bundle]
+                    : d.kind === "review"
+                    ? ["Part 1 -- findings, correlation and host/label checks over " + (d.bundles || []).length + " bundle(s), streamed (nothing unpacked)"]
+                        .concat((d.bundles || []).map((n, i) => "Part 2." + (i + 1) + " -- admission analysis: " + n + " (unpacked to /tmp, removed after)"))
+                        .map((s, i) => i === (d.phase || 0) ? "<strong>&#9654; " + s + "</strong>" : (i < (d.phase || 0) ? "&#10003; " + s : s))
                     : d.kind === "correlate"
                     ? ["Stream each bundle once (nothing is unpacked to disk): " + d.bundle,
                        "Identify each bundle (EM / appliance, node ID) and line the clocks up",
@@ -3298,10 +3302,10 @@
     <script>
         // Upload & Review Bundle tab -- one or several bundles are uploaded
         // straight to the EM (sequentially, /bundle/upload with analyze=0),
-        // listed from /bundle/uploads, then either correlated together
-        // (/bundle/correlate -> bundle-correlate.py on the EM) or run one at a
-        // time through the same admission analyze as the Tech Support tab's own
-        // Analyze button. Both ride the shared /api/analyze_run/<id> poller.
+        // listed from /bundle/uploads, then reviewed with one button
+        // (/bundle/review: bundle-correlate.py over the ticked bundles, then the
+        // admission analysis per bundle, one report). Rides the shared
+        // /api/analyze_run/<id> poller.
         (function () {
             const fileInput = document.getElementById("upload-bundle-file");
             const uploadBtn = document.getElementById("upload-bundle-btn");
@@ -3317,7 +3321,7 @@
             const downloadLink = document.getElementById("upload-output-download");
             if (!fileInput) return; // panel not on this page
 
-            const ticked = new Set();      // paths ticked for Correlate -- survives a list refresh
+            const ticked = new Set();      // paths ticked for Review -- survives a list refresh
             const identity = {};           // path -> {role, nodeid, version} learned from a finished correlate run
             let busy = false;
             let lastBundles = [];          // last list from the EM -- lets a finished run repaint the Role column at once
@@ -3342,7 +3346,7 @@
                 rowsEl.innerHTML = bundles.map(b => {
                     const id = identity[b.path];
                     const who = id ? esc(id.role) + " " + esc(id.nodeid) + (id.version ? " (v" + esc(id.version) + ")" : "")
-                                   : "<span class=\"muted\">shown after a Correlate run</span>";
+                                   : "<span class=\"muted\">shown after a review</span>";
                     const when = new Date(b.mtime * 1000).toISOString().replace("T", " ").slice(0, 16);
                     return "<tr data-path=\"" + esc(b.path) + "\">" +
                         "<td><input type=\"checkbox\" class=\"upload-bundle-tick\"" + (ticked.has(b.path) ? " checked" : "") + "></td>" +
@@ -3350,7 +3354,6 @@
                         "<td>" + Math.max(1, Math.round(b.size / 1048576)) + " MB</td>" +
                         "<td>" + when + "</td><td>" + who + "</td>" +
                         "<td style=\"white-space:nowrap;\">" +
-                        "<button type=\"button\" class=\"btn-small btn-secondary upload-bundle-analyze\">Analyze admissions</button> " +
                         "<button type=\"button\" class=\"btn-small btn-secondary upload-bundle-delete\">Delete</button></td></tr>";
                 }).join("");
                 allBox.checked = bundles.length > 0 && bundles.every(b => ticked.has(b.path));
@@ -3441,40 +3444,133 @@
                     .catch(err => { setBusy(false); runStatusEl.textContent = "Failed to start: " + err; });
             }
 
-            // one file at a time -- each is hundreds of MB, and the EM end writes them serially anyway
-            function uploadNext(files, index, failures) {
-                if (index >= files.length) {
+            // A bundle split into parts (David, 2026-09-23) -- `split -b 1G x.tgz x.tgz_part_`
+            // (x.tgz_part_aa/ab/ac), `split` with no separator (x.tgzaa), 7-Zip (x.tgz.001/.002),
+            // or x.tgz.part1/.part2. The parts are picked together with any whole bundles; this
+            // groups them by the bundle they rebuild and puts them in order.
+            const SPLIT_PART_RE = /^(.+?\.(?:tgz|tar\.gz))(?:[._-]?part[._-]?|[._-])?([a-z]{1,4}|\d{1,4})$/i;
+            const BUNDLE_NAME_RE = /^[A-Za-z0-9_.\-]{1,120}\.(?:tgz|tar\.gz)$/;
+            const MAX_PART_BYTES = 2 * 1024 * 1024 * 1024;
+            const MAX_PARTS = 64;
+
+            function partValue(suffix) {
+                if (/^\d+$/.test(suffix)) return { kind: "digits", value: parseInt(suffix, 10), len: 0 };
+                let v = 0;
+                for (const c of suffix.toLowerCase()) v = v * 26 + (c.charCodeAt(0) - 97);
+                return { kind: "letters", value: v, len: suffix.length };
+            }
+
+            // -> { jobs: [{type: "whole", file} | {type: "split", name, parts: [File...]}], errors: [...] }
+            function planUploads(files) {
+                const jobs = [];
+                const errors = [];
+                const groups = new Map();
+                for (const file of files) {
+                    if (/\.(tgz|tar\.gz)$/i.test(file.name)) { jobs.push({ type: "whole", file: file }); continue; }
+                    const m = SPLIT_PART_RE.exec(file.name);
+                    if (!m) { errors.push(file.name + " -- not a .tgz/.tar.gz bundle or a recognised part of one"); continue; }
+                    if (!groups.has(m[1])) groups.set(m[1], []);
+                    groups.get(m[1]).push({ file: file, part: partValue(m[2]), suffix: m[2] });
+                }
+                for (const [name, parts] of groups) {
+                    if (!BUNDLE_NAME_RE.test(name)) { errors.push(name + " -- the bundle name may only use letters, digits, . - _"); continue; }
+                    if (parts.length < 2) { errors.push(name + " -- only one part picked (" + parts[0].file.name + "); pick every part together"); continue; }
+                    if (parts.length > MAX_PARTS) { errors.push(name + " -- more than " + MAX_PARTS + " parts"); continue; }
+                    const kinds = new Set(parts.map(p => p.part.kind + p.part.len));
+                    if (kinds.size > 1) { errors.push(name + " -- the parts' suffixes do not follow one numbering (" + parts.map(p => p.suffix).join(", ") + ")"); continue; }
+                    parts.sort((a, b) => a.part.value - b.part.value);
+                    const first = parts[0].part.value;
+                    const okStart = parts[0].part.kind === "letters" ? first === 0 : (first === 0 || first === 1);
+                    let gap = null;
+                    for (let i = 1; i < parts.length; i++) {
+                        if (parts[i].part.value !== first + i) { gap = parts[i - 1].suffix + " -> " + parts[i].suffix; break; }
+                    }
+                    if (!okStart) { errors.push(name + " -- the first part is missing (lowest picked is " + parts[0].suffix + ")"); continue; }
+                    if (gap) { errors.push(name + " -- a part is missing or duplicated between " + gap); continue; }
+                    const big = parts.find(p => p.file.size > MAX_PART_BYTES || p.file.size === 0);
+                    if (big) { errors.push(name + " -- part " + big.file.name + " is empty or over the 2048MB upload limit"); continue; }
+                    jobs.push({ type: "split", name: name, parts: parts.map(p => p.file) });
+                }
+                return { jobs: jobs, errors: errors };
+            }
+
+            function postForm(url, fields) {
+                const formData = new FormData();
+                formData.set("csrf_token", CSRF_TOKEN);
+                for (const k in fields) formData.set(k, fields[k]);
+                return fetch(url, { method: "POST", body: formData }).then(r => r.json());
+            }
+
+            function jobLabel(job) {
+                return job.type === "whole" ? job.file.name : job.name + " (" + job.parts.length + " parts)";
+            }
+
+            // one upload at a time -- each is hundreds of MB, and the EM end writes them serially anyway
+            function uploadNext(jobs, index, failures, earlier) {
+                if (index >= jobs.length) {
                     uploadBtn.disabled = false;
                     uploadBtn.textContent = "Upload";
                     fileInput.value = "";
-                    statusEl.textContent = (files.length - failures.length) + " of " + files.length + " uploaded." +
-                        (failures.length ? " Failed: " + failures.join("; ") : "");
+                    const all = failures.concat(earlier);
+                    statusEl.textContent = (jobs.length - failures.length) + " of " + jobs.length + " uploaded." +
+                        (all.length ? " Failed: " + all.join("; ") : "");
                     refreshList();
                     return;
                 }
-                const file = files[index];
-                statusEl.textContent = "Uploading " + (index + 1) + " of " + files.length + ": " + file.name +
-                    " (" + Math.round(file.size / 1048576) + "MB) to the EM…";
-                const formData = new FormData();
-                formData.set("csrf_token", CSRF_TOKEN);
-                formData.set("analyze", "0");
-                formData.set("bundle", file);
-                fetch("/bundle/upload", { method: "POST", body: formData })
-                    .then(r => r.json())
-                    .then(d => {
-                        if (d.error) failures.push(file.name + " -- " + d.error);
-                        else ticked.add(d.path);
-                        uploadNext(files, index + 1, failures);
+                const job = jobs[index];
+                const prefix = "Uploading " + (index + 1) + " of " + jobs.length + ": ";
+                const next = () => uploadNext(jobs, index + 1, failures, earlier);
+                if (job.type === "whole") {
+                    statusEl.textContent = prefix + job.file.name + " (" + Math.round(job.file.size / 1048576) + "MB) to the EM…";
+                    postForm("/bundle/upload", { analyze: "0", bundle: job.file })
+                        .then(d => { if (d.error) failures.push(job.file.name + " -- " + d.error); else ticked.add(d.path); next(); })
+                        .catch(err => { failures.push(job.file.name + " -- " + err); next(); });
+                    return;
+                }
+                const count = job.parts.length;
+                const fail = msg => {
+                    failures.push(jobLabel(job) + " -- " + msg);
+                    postForm("/bundle/upload/abort", { join_name: job.name }).catch(() => {}).then(next);
+                };
+                function sendPart(i) {
+                    if (i >= count) {
+                        statusEl.textContent = prefix + job.name + " -- joining " + count + " parts on the EM…";
+                        postForm("/bundle/upload/finish", { join_name: job.name, part_count: String(count) })
+                            .then(d => { if (d.error) fail(d.error); else { ticked.add(d.path); next(); } })
+                            .catch(err => fail(String(err)));
+                        return;
+                    }
+                    const part = job.parts[i];
+                    statusEl.textContent = prefix + job.name + " part " + (i + 1) + " of " + count + ": " + part.name +
+                        " (" + Math.round(part.size / 1048576) + "MB) to the EM…";
+                    postForm("/bundle/upload", {
+                        analyze: "0", bundle: part, join_name: job.name,
+                        part_index: String(i), part_count: String(count), part_size: String(part.size),
                     })
-                    .catch(err => { failures.push(file.name + " -- " + err); uploadNext(files, index + 1, failures); });
+                        .then(d => { if (d.error) fail("part " + (i + 1) + " (" + part.name + "): " + d.error); else sendPart(i + 1); })
+                        .catch(err => fail("part " + (i + 1) + " (" + part.name + "): " + err));
+                }
+                // a scrambled order or a wrong first part would only show up at analysis time --
+                // catch it before sending gigabytes: part 1 of a .tgz starts with the gzip magic bytes
+                job.parts[0].slice(0, 2).arrayBuffer().then(buf => {
+                    const b = new Uint8Array(buf);
+                    if (b[0] !== 0x1f || b[1] !== 0x8b) {
+                        failures.push(jobLabel(job) + " -- " + job.parts[0].name + " does not start like a .tgz, so it is not the first part");
+                        next();
+                        return;
+                    }
+                    sendPart(0);
+                }).catch(err => { failures.push(jobLabel(job) + " -- " + err); next(); });
             }
 
             uploadBtn.addEventListener("click", () => {
                 const files = Array.from(fileInput.files);
-                if (!files.length) { window.alert("Choose one or more bundle files first."); return; }
+                if (!files.length) { window.alert("Choose one or more bundle files (or every part of a split bundle) first."); return; }
+                const plan = planUploads(files);
+                if (!plan.jobs.length) { statusEl.textContent = "Nothing to upload. " + plan.errors.join("; "); return; }
                 uploadBtn.disabled = true;
                 uploadBtn.textContent = "Uploading…";
-                uploadNext(files, 0, []);
+                uploadNext(plan.jobs, 0, [], plan.errors);
             });
 
             allBox.addEventListener("change", () => {
@@ -3495,10 +3591,7 @@
                 if (!tr) return;
                 const path = tr.dataset.path;
                 const name = path.split("/").pop();
-                if (ev.target.classList.contains("upload-bundle-analyze")) {
-                    startRun("/techsupport/analyze", new URLSearchParams({ path: path, csrf_token: CSRF_TOKEN }),
-                        name.replace(/\.(tgz|tar\.gz)$/, "") + "-admissions.txt");
-                } else if (ev.target.classList.contains("upload-bundle-delete")) {
+                if (ev.target.classList.contains("upload-bundle-delete")) {
                     if (!window.confirm("Delete " + name + " off the EM? This cannot be undone.")) return;
                     fetch("/bundle/upload/cleanup", { method: "POST", body: new URLSearchParams({ path: path, csrf_token: CSRF_TOKEN }) })
                         .then(r => r.json())
@@ -3553,14 +3646,14 @@
             })();
 
             correlateBtn.addEventListener("click", () => {
-                if (!ticked.size) { window.alert("Tick the bundles that belong together -- an EM bundle and its appliance bundle(s)."); return; }
+                if (!ticked.size) { window.alert("Tick the bundle(s) to review -- one bundle, or an EM bundle and its appliance bundle(s) together."); return; }
                 const formData = new URLSearchParams();
                 formData.set("csrf_token", CSRF_TOKEN);
                 Array.from(ticked).forEach(p => formData.append("path", p));
                 formData.set("gap", document.getElementById("correlate-gap").value || "150");
                 formData.set("context", document.getElementById("correlate-context").value || "120");
                 formData.set("top_n", document.getElementById("correlate-top").value || "10");
-                startRun("/bundle/correlate", formData, "bundle-correlation-" + new Date().toISOString().slice(0, 16).replace(/[:T]/g, "") + ".txt");
+                startRun("/bundle/review", formData, "bundle-review-" + new Date().toISOString().slice(0, 16).replace(/[:T]/g, "") + ".txt");
             });
 
             refreshList();
