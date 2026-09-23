@@ -10,7 +10,7 @@ that key is allowed to run; every call here maps to one of its verbs
 techsupportpreview, techsupportcollect, techsupportwindowappliance,
 techsupportempreview, techsupportem, techsupportlogtail, techsupportlogclear,
 policytree, lastchecked, matched, history, rawfields, arplist, appliances,
-runshowerrors) and gets back one line of JSON.
+runshowerrors, cleanupscan, cleanuppreview, cleanuprun) and gets back one line of JSON.
 """
 import json
 import os
@@ -61,7 +61,7 @@ def valid_target(target):
     return bool(TARGET_RE.match(target or ""))
 
 
-def _run_verb(verb_command, timeout):
+def _run_verb(verb_command, timeout, input=None):
     if not os.path.isfile(SSH_KEY_PATH):
         raise ForescoutClientError(
             f"SSH key not found at {SSH_KEY_PATH} -- the container's key volume isn't mounted correctly."
@@ -71,7 +71,7 @@ def _run_verb(verb_command, timeout):
         "-o", "ConnectTimeout=10", "-i", SSH_KEY_PATH, f"root@{EM_HOST}", verb_command,
     ]
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, input=input)
     except subprocess.TimeoutExpired:
         raise ForescoutClientError(f"Request to the EM timed out after {timeout}s.")
     except FileNotFoundError:
@@ -603,6 +603,77 @@ def run_show_errors(target, duration, timeout=1200):
     return _run_verb(f"runshowerrors {target} {duration}", timeout=timeout)
 
 
+# Clean Up tab -- see webapp-query.py's own "Clean Up tab" block for what
+# each verb runs. The pick-your-own file selection goes over stdin as
+# JSON (file names can hold spaces/quotes a space-separated verb line
+# can't carry); the EM re-validates every path. cleanup_run needs the
+# digest its own cleanup_preview returned -- the EM refuses to run
+# anything that isn't exactly what was previewed.
+CLEANUP_IDS_RE = re.compile(r"^[a-z_]{2,30}(?:,[a-z_]{2,30})*$")
+CLEANUP_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def cleanup_scan(target, timeout=960):
+    if not valid_target(target):
+        raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
+    return _run_verb(f"cleanupscan {target}", timeout=timeout)
+
+
+def _cleanup_args(target, item_ids, files):
+    if not valid_target(target):
+        raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
+    ids = ",".join(item_ids or [])
+    if not CLEANUP_IDS_RE.match(ids):
+        raise ForescoutClientError("Select at least one clean-up item.")
+    return ids, json.dumps({"files": files or {}})
+
+
+def cleanup_preview(target, item_ids, files=None, timeout=45):
+    ids, payload = _cleanup_args(target, item_ids, files)
+    return _run_verb(f"cleanuppreview {target} {ids}", timeout=timeout, input=payload)
+
+
+def cleanup_run(target, item_ids, files, digest, timeout=1900):
+    ids, payload = _cleanup_args(target, item_ids, files)
+    if not CLEANUP_DIGEST_RE.match(digest or ""):
+        raise ForescoutClientError("Preview the commands first.")
+    return _run_verb(f"cleanuprun {target} {ids} {digest}", timeout=timeout, input=payload)
+
+
+# Admission Rate tab (eyeSight Admission TAP control) -- see webapp-query.py's admtap* docstrings.
+ADMTAP_DIGEST_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def admtap_status(target, timeout=180):
+    if not valid_target(target):
+        raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
+    return _run_verb(f"admtapstatus {target}", timeout=timeout)
+
+
+def admtap_preview(target, values, timeout=45):
+    if not valid_target(target):
+        raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
+    if not isinstance(values, dict) or not values:
+        raise ForescoutClientError("Nothing to change.")
+    return _run_verb(f"admtappreview {target}", timeout=timeout, input=json.dumps({"values": values}))
+
+
+def admtap_apply(target, values, digest, timeout=400):
+    if not valid_target(target):
+        raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
+    if not ADMTAP_DIGEST_RE.match(digest or ""):
+        raise ForescoutClientError("Preview the settings first.")
+    return _run_verb(f"admtapapply {target} {digest}", timeout=timeout, input=json.dumps({"values": values}))
+
+
+def admtap_restart(target, digest, timeout=1000):
+    if not valid_target(target):
+        raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
+    if not ADMTAP_DIGEST_RE.match(digest or ""):
+        raise ForescoutClientError("Preview the settings first.")
+    return _run_verb(f"admtaprestart {target} {digest}", timeout=timeout)
+
+
 # Live Analyze tab (High Admission Root-Cause Tracing) -- see
 # webapp-query.py's own pluginlist/analyzeadm/pluginlogszip docstrings
 # for what each actually runs on the EM side.
@@ -804,6 +875,30 @@ def bundle_roaming(path, key, timeout=1900):
     if not ROAM_KEY_RE.match(key or ""):
         raise ForescoutClientError("Enter a MAC address (aa:bb:cc:dd:ee:ff or aabbccddeeff) or an IPv4 address.")
     return _run_verb(f"bundleroam {path} {key}", timeout=timeout)
+
+
+def radius_live(target, start_epoch, end_epoch, timeout=960):
+    """RADIUS log analysis of a live EM/appliance for a time window -- see webapp-query.py's do_radiuslive.
+    Returns {"output": text, "findings": [...], "summary": {...}}."""
+    if not valid_target(target):
+        raise ForescoutClientError(f"'{target}' is not a valid target.")
+    if not (isinstance(start_epoch, int) and isinstance(end_epoch, int) and 0 < start_epoch < end_epoch):
+        raise ForescoutClientError("Invalid time window.")
+    return _run_verb(f"radiuslive {target} {start_epoch}:{end_epoch}", timeout=timeout)
+
+
+def radius_bundle(path, timeout=1900):
+    """RADIUS log analysis of a bundle on the EM (radius-analyze.py --bundle). Same three accepted path shapes as analyze_admission."""
+    if not (BUNDLE_PATH_RE.match(path or "") or UPLOAD_PATH_RE.match(path or "") or MANUAL_STAGING_PATH_RE.match(path or "")):
+        raise ForescoutClientError(f"'{path}' is not a recognized tech-support bundle path.")
+    return _run_verb(f"radiusbundle {path}", timeout=timeout)
+
+
+def radius_file(text, timeout=960):
+    """RADIUS log analysis of an uploaded/pasted log; the text goes to the EM over the verb's stdin."""
+    if not text or not text.strip():
+        raise ForescoutClientError("The log is empty.")
+    return _run_verb("radiusfile", timeout=timeout, input=text)
 
 
 def correlate_bundles(paths, gap=150, context=120, top_n=10, timeout=3700):

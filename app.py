@@ -22,12 +22,14 @@ from flask import Flask, Response, jsonify, redirect, render_template, request, 
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from forescout_client import (
-    CASE_REF_RE, COMPANY_NAME_RE, LEVEL_RE, ForescoutClientError, analyze_admission, arp_list,
+    CASE_REF_RE, COMPANY_NAME_RE, LEVEL_RE, ForescoutClientError, admtap_apply, admtap_preview, admtap_restart, admtap_status,
+    analyze_admission, arp_list,
+    cleanup_preview, cleanup_run, cleanup_scan,
     build_techsupport_em, build_techsupport_window_appliance, clear_lookup_debug_log, clear_techsupport_log,
     bundle_roaming, collect_techsupport, correlate_bundles, debug_set_appliance, delete_techsupport_bundle, delete_uploaded_bundle,
     download_plugin_logs_zip, download_techsupport_bundle, get_admin_cidr, hostinfo, last_checked, list_appliances,
     list_plugins, list_uploaded_bundles, lookup, matched_rules, policy_history, policy_tree, preview_techsupport,
-    preview_techsupport_em, raw_fields, roaming, run_show_errors, set_admin_cidr, tail_lookup_debug_log,
+    preview_techsupport_em, radius_bundle, radius_file, radius_live, raw_fields, roaming, run_show_errors, set_admin_cidr, tail_lookup_debug_log,
     tail_techsupport_log, trace_defaults, trace_list, trace_set, upload_bundle, valid_cidr, valid_ip,
     valid_target,
 )
@@ -45,7 +47,7 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.5.6"
+APP_VERSION = "1.8.0"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
@@ -866,6 +868,35 @@ def start_correlate_run(paths, gap, context, top_n):
     def _worker():
         try:
             result = correlate_bundles(paths, gap=gap, context=context, top_n=top_n)
+            _update_analyze_run(run_id, status="complete", finished_at=int(time.time()), result=result)
+        except ForescoutClientError as e:
+            _update_analyze_run(run_id, status="failed", finished_at=int(time.time()), error=str(e))
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return run_id
+
+
+def start_radius_run(source, label, fn):
+    """RADIUS log analysis (David, 2026-09-22) -- one background run shape for all three
+    inputs (a live target + window, a bundle on the EM, an uploaded/pasted log); fn is the
+    forescout_client call that does it. Tracked and polled like every other analyze run
+    (kind "radius")."""
+    run_key = f"radius:{source}"
+    run_id = f"{int(time.time() * 1000)}-{os.urandom(3).hex()}"
+    with _analyze_runs_lock:
+        runs = _load_analyze_runs()
+        if any(r["key"] == run_key and r["status"] == "running" for r in runs):
+            return None
+        runs.append({
+            "id": run_id, "key": run_key, "kind": "radius", "target": label,
+            "bundle": label, "status": "running",
+            "started_at": int(time.time()), "finished_at": None, "result": None, "error": None,
+        })
+        _save_analyze_runs(runs)
+
+    def _worker():
+        try:
+            result = fn()
             _update_analyze_run(run_id, status="complete", finished_at=int(time.time()), result=result)
         except ForescoutClientError as e:
             _update_analyze_run(run_id, status="failed", finished_at=int(time.time()), error=str(e))
@@ -1807,6 +1838,252 @@ def api_appliance_run_kill(run_id):
     return jsonify({"ok": True})
 
 
+# ---------------------------------------------------------------------
+# Clean Up tab (David, 2026-09-21) -- free disk space on the EM /
+# appliances ahead of an upgrade. Scan (read-only) -> Preview (the exact
+# commands, per box) -> go-ahead -> Run. David's rule: "show which
+# commands will be run, and get a go ahead" -- enforced here, not just
+# in the page: /cleanup/run takes only a preview id (single use, 10 min
+# life) plus an explicit confirm, never a list of items, and the EM then
+# refuses anything whose commands don't hash to what that preview
+# showed. Jobs live in memory (same as lookup runs): a scan result can
+# list thousands of files, and a restart mid-run kills the SSH command
+# underneath it anyway. Every preview/run lands in the activity log;
+# the EM keeps its own cleanup-audit.log of each command + exit code.
+# ---------------------------------------------------------------------
+CLEANUP_PREVIEW_TTL = 600
+CLEANUP_JOB_KEEP = 2 * 3600
+_cleanup_lock = threading.Lock()
+_cleanup_jobs = {}
+_cleanup_previews = {}
+
+
+def _cleanup_expire_locked():
+    now = time.time()
+    for jid in [j for j, v in _cleanup_jobs.items() if v["finished_at"] and now - v["finished_at"] > CLEANUP_JOB_KEEP]:
+        del _cleanup_jobs[jid]
+    for pid in [p for p, v in _cleanup_previews.items() if now - v["created"] > CLEANUP_PREVIEW_TTL]:
+        del _cleanup_previews[pid]
+
+
+def start_cleanup_job(kind, target, fn):
+    """One clean-up job (scan or run) per box at a time -- returns None if one is already going there."""
+    job_id = f"{int(time.time() * 1000)}-{os.urandom(3).hex()}"
+    with _cleanup_lock:
+        _cleanup_expire_locked()
+        if any(j["target"] == target and j["status"] == "running" for j in _cleanup_jobs.values()):
+            return None
+        _cleanup_jobs[job_id] = {
+            "id": job_id, "kind": kind, "target": target, "status": "running",
+            "started_at": int(time.time()), "finished_at": None, "result": None, "error": None,
+        }
+
+    def _worker():
+        try:
+            result, error = fn(), None
+        except ForescoutClientError as e:
+            result, error = None, str(e)
+        with _cleanup_lock:
+            _cleanup_jobs[job_id].update(
+                status="failed" if error else "complete", finished_at=int(time.time()), result=result, error=error)
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return job_id
+
+
+@app.route("/cleanup/scan", methods=["POST"])
+def cleanup_scan_route():
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    targets = [k[len("include_appliance_"):] for k, v in request.form.items()
+               if k.startswith("include_appliance_") and v == "1"]
+    if not targets or not all(valid_target(t) for t in targets):
+        return jsonify({"error": "Select at least one EM / appliance."}), 400
+    _log_activity("cleanup_scan", targets=targets)
+    started, skipped = [], []
+    for t in targets:
+        job_id = start_cleanup_job("scan", t, lambda t=t: cleanup_scan(t))
+        if job_id:
+            started.append({"target": t, "job_id": job_id, "kind": "scan"})
+        else:
+            skipped.append(t)
+    return jsonify({"jobs": started, "skipped": skipped})
+
+
+@app.route("/api/cleanup_job/<job_id>", methods=["GET"])
+def api_cleanup_job(job_id):
+    with _cleanup_lock:
+        job = _cleanup_jobs.get(job_id)
+        if job is None:
+            return jsonify({"error": "unknown job id"}), 404
+        return jsonify(job)
+
+
+@app.route("/api/cleanup_jobs/active", methods=["GET"])
+def api_cleanup_jobs_active():
+    """Jobs still going -- so a page reload picks a running scan/clean up back up instead of losing it."""
+    with _cleanup_lock:
+        return jsonify({"jobs": [{"target": j["target"], "job_id": j["id"], "kind": j["kind"]}
+                                 for j in _cleanup_jobs.values() if j["status"] == "running"]})
+
+
+@app.route("/cleanup/preview", methods=["POST"])
+def cleanup_preview_route():
+    """selection = {"<target>": {"items": [...], "files": {"sel_tmp": [...]}}}. Read-only: asks the EM for
+    the exact commands each box would run and parks them under a preview id. Nothing is executed."""
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    try:
+        selection = json.loads(request.form.get("selection", ""))
+    except ValueError:
+        selection = None
+    if not isinstance(selection, dict) or not selection:
+        return jsonify({"error": "Nothing selected to clean up."}), 400
+    boxes = []
+    try:
+        for target, sel in selection.items():
+            items, files = sel.get("items") or [], sel.get("files") or {}
+            if not items:
+                continue
+            data = cleanup_preview(target, items, files)
+            boxes.append({"target": target, "is_em": data.get("is_em", False), "items": items, "files": files,
+                          "steps": data["steps"], "digest": data["digest"]})
+    except (ForescoutClientError, AttributeError) as e:
+        return jsonify({"error": str(e)}), 400
+    if not boxes:
+        return jsonify({"error": "Nothing selected to clean up."}), 400
+    preview_id = secrets.token_hex(16)
+    with _cleanup_lock:
+        _cleanup_expire_locked()
+        _cleanup_previews[preview_id] = {"created": time.time(), "boxes": boxes}
+    _log_activity("cleanup_preview", boxes=[{"target": b["target"], "commands": [s["command"] for s in b["steps"]]}
+                                            for b in boxes])
+    return jsonify({"preview_id": preview_id, "expires_in": CLEANUP_PREVIEW_TTL,
+                    "boxes": [{"target": b["target"], "is_em": b["is_em"], "steps": b["steps"]} for b in boxes]})
+
+
+@app.route("/cleanup/run", methods=["POST"])
+def cleanup_run_route():
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    if request.form.get("confirm") != "yes":
+        return jsonify({"error": "Tick the go-ahead box first."}), 400
+    with _cleanup_lock:
+        _cleanup_expire_locked()
+        preview = _cleanup_previews.pop(request.form.get("preview_id", ""), None)
+    if preview is None:
+        return jsonify({"error": "That preview has expired or was already used -- preview the commands again."}), 400
+    busy = {r["target"] for r in get_active_appliance_runs()}
+    started, skipped = [], []
+    for b in preview["boxes"]:
+        job_id = None if b["target"] in busy else start_cleanup_job(
+            "run", b["target"], lambda b=b: cleanup_run(b["target"], b["items"], b["files"], b["digest"]))
+        if job_id:
+            started.append({"target": b["target"], "job_id": job_id, "kind": "run"})
+        else:
+            skipped.append(b["target"])
+    _log_activity("cleanup_run", started=[s["target"] for s in started], skipped=skipped,
+                  boxes=[{"target": b["target"], "commands": [s["command"] for s in b["steps"]]}
+                         for b in preview["boxes"]])
+    return jsonify({"jobs": started, "skipped": skipped})
+
+
+# ---- Admission Rate tab (David, 2026-09-23): eyeSight's Admission TAP control. Same shape as Clean Up:
+# a read-only status, a preview that parks the exact commands under a single-use id, an apply that only
+# accepts that id + the go-ahead tick, and -- separately, never bundled -- the service restart the
+# change needs to take effect. All ride the clean-up job tracker (one job per box at a time).
+@app.route("/admission/status", methods=["POST"])
+def admission_status_route():
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    target = (request.form.get("target") or "").strip()
+    if not target or not valid_target(target):
+        return jsonify({"error": "Select a target."}), 400
+    job_id = start_cleanup_job("admtap_status", target, lambda: admtap_status(target))
+    if job_id is None:
+        return jsonify({"error": f"Something is already running on {target}."}), 409
+    return jsonify({"job_id": job_id})
+
+
+@app.route("/admission/preview", methods=["POST"])
+def admission_preview_route():
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    target = (request.form.get("target") or "").strip()
+    try:
+        values = json.loads(request.form.get("values", ""))
+    except ValueError:
+        values = None
+    if not target or not valid_target(target):
+        return jsonify({"error": "Select a target."}), 400
+    if not isinstance(values, dict) or not values:
+        return jsonify({"error": "Change at least one setting."}), 400
+    try:
+        data = admtap_preview(target, values)
+    except ForescoutClientError as e:
+        return jsonify({"error": str(e)}), 400
+    preview_id = secrets.token_hex(16)
+    with _cleanup_lock:
+        _cleanup_expire_locked()
+        _cleanup_previews[preview_id] = {"created": time.time(), "admtap": True, "target": target, "values": values,
+                                         "steps": data["steps"], "digest": data["digest"]}
+    _log_activity("admission_preview", username=session.get("username"), target=target,
+                  commands=[s["command"] for s in data["steps"]])
+    return jsonify({"preview_id": preview_id, "expires_in": CLEANUP_PREVIEW_TTL, "target": target, "is_em": data.get("is_em"),
+                    "steps": data["steps"], "note": data.get("note"), "restart_command": data.get("restart_command")})
+
+
+@app.route("/admission/apply", methods=["POST"])
+def admission_apply_route():
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    if request.form.get("confirm") != "yes":
+        return jsonify({"error": "Tick the go-ahead box first."}), 400
+    with _cleanup_lock:
+        _cleanup_expire_locked()
+        preview = _cleanup_previews.get(request.form.get("preview_id", ""))
+        if preview is not None and preview.get("admtap") and not preview.get("applied"):
+            preview["applied"] = True  # single use for apply; the same preview still authorises the restart below
+        else:
+            preview = None
+    if preview is None:
+        return jsonify({"error": "That preview has expired or was already used -- preview the settings again."}), 400
+    target = preview["target"]
+    job_id = start_cleanup_job("admtap_apply", target,
+                               lambda: admtap_apply(target, preview["values"], preview["digest"]))
+    if job_id is None:
+        return jsonify({"error": f"Something is already running on {target}."}), 409
+    _log_activity("admission_apply", username=session.get("username"), target=target,
+                  commands=[s["command"] for s in preview["steps"]])
+    return jsonify({"job_id": job_id, "target": target})
+
+
+@app.route("/admission/restart", methods=["POST"])
+def admission_restart_route():
+    """The disruptive half: `fstool service restart` on the target. Needs the same preview id (already
+    applied), its own go-ahead tick, and the target name typed back -- never runs from the apply call."""
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    if request.form.get("confirm") != "yes":
+        return jsonify({"error": "Tick the restart go-ahead box first."}), 400
+    pid = request.form.get("preview_id", "")
+    with _cleanup_lock:
+        _cleanup_expire_locked()
+        preview = _cleanup_previews.get(pid)
+        if preview is None or not preview.get("admtap") or not preview.get("applied"):
+            return jsonify({"error": "Apply the settings first (or the preview has expired)."}), 400
+        target = preview["target"]
+        if (request.form.get("typed_target") or "").strip() != target:
+            return jsonify({"error": f"Type the target name exactly ({target}) to confirm the restart."}), 400
+        # only now is the preview consumed -- a refused request above leaves it usable
+        _cleanup_previews.pop(pid, None)
+    job_id = start_cleanup_job("admtap_restart", target, lambda: admtap_restart(target, preview["digest"]))
+    if job_id is None:
+        return jsonify({"error": f"Something is already running on {target}."}), 409
+    _log_activity("admission_restart", username=session.get("username"), target=target)
+    return jsonify({"job_id": job_id, "target": target})
+
+
 @app.route("/api/plugins/<target>", methods=["GET"])
 def api_plugins(target):
     """Installed plugins on target alone -- drives the Live Analyze tab's plugin checklist/debug
@@ -2588,6 +2865,77 @@ def bundle_roaming_route():
     run_id = start_bundle_roaming_run(path, key)
     if run_id is None:
         return jsonify({"error": "That lookup is already running."}), 409
+    return jsonify({"run_id": run_id})
+
+
+RADIUS_WINDOWS = {"15m": 900, "1h": 3600, "6h": 6 * 3600, "24h": 86400, "3d": 3 * 86400, "7d": 7 * 86400}
+RADIUS_UPLOAD_MAX = 200 * 1024 * 1024
+
+
+@app.route("/radius/live", methods=["POST"])
+def radius_live_route():
+    """Live Analyze tab, RADIUS box: analyse a live EM/appliance's radiusd.log for the last N."""
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    target = (request.form.get("target") or "").strip()
+    window = request.form.get("window") or "24h"
+    if not target or not valid_target(target):
+        return jsonify({"error": "Select a target."}), 400
+    if window not in RADIUS_WINDOWS:
+        return jsonify({"error": "Pick a window."}), 400
+    end = int(time.time())
+    start = end - RADIUS_WINDOWS[window]
+    _log_activity("radius_live", username=session.get("username"), target=target, window=window)
+    run_id = start_radius_run(f"live:{target}", f"{target} (last {window})", lambda: radius_live(target, start, end))
+    if run_id is None:
+        return jsonify({"error": "A RADIUS analysis is already running for this target."}), 409
+    return jsonify({"run_id": run_id})
+
+
+@app.route("/radius/bundle", methods=["POST"])
+def radius_bundle_route():
+    """Upload & Review tab: RADIUS analysis of one bundle already on the EM."""
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    path = (request.form.get("path") or "").strip()
+    if not path:
+        return jsonify({"error": "Pick a bundle."}), 400
+    _log_activity("radius_bundle", username=session.get("username"), bundle=os.path.basename(path))
+    run_id = start_radius_run(f"bundle:{path}", os.path.basename(path), lambda: radius_bundle(path))
+    if run_id is None:
+        return jsonify({"error": "A RADIUS analysis is already running for this bundle."}), 409
+    return jsonify({"run_id": run_id})
+
+
+@app.route("/radius/file", methods=["POST"])
+def radius_file_route():
+    """Upload & Review tab: RADIUS analysis of a radiusd.log the user uploads or pastes -- the
+    text goes to the EM over the verb's stdin, nothing is stored."""
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    f = request.files.get("logfile")
+    text = ""
+    label = "pasted log"
+    if f is not None and f.filename:
+        data = f.stream.read(RADIUS_UPLOAD_MAX + 1)
+        if len(data) > RADIUS_UPLOAD_MAX:
+            return jsonify({"error": "That file is over 200 MB -- analyse it from a tech-support bundle or live instead."}), 400
+        if data[:2] == b"\x1f\x8b":
+            import gzip as _gzip
+            try:
+                data = _gzip.decompress(data)
+            except OSError:
+                return jsonify({"error": "That .gz could not be decompressed."}), 400
+        text = data.decode("utf-8", "replace")
+        label = os.path.basename(f.filename)
+    else:
+        text = request.form.get("text") or ""
+    if not text.strip():
+        return jsonify({"error": "Paste some log lines or choose a file."}), 400
+    _log_activity("radius_file", username=session.get("username"), label=label, bytes=len(text))
+    run_id = start_radius_run(f"file:{session.get('username')}:{int(time.time())}", label, lambda: radius_file(text))
+    if run_id is None:
+        return jsonify({"error": "A RADIUS analysis is already running."}), 409
     return jsonify({"run_id": run_id})
 
 

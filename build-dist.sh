@@ -53,8 +53,8 @@ rm -rf "$PKG_DIR"
 mkdir -p "$PKG_DIR"
 cp "${DIR}/Deploy.sh" "${DIR}/Remove.sh" "$PKG_DIR/"
 cp "${DIR}/README-Deploy.md" "${PKG_DIR}/README.md"
-cp "${DIR}/webapp-query.py" "${DIR}/high-admission-trace.sh" "${DIR}/bundle-correlate.py" "$PKG_DIR/"
-echo "Staged Deploy.sh, Remove.sh, README.md, webapp-query.py, high-admission-trace.sh, bundle-correlate.py"
+cp "${DIR}/webapp-query.py" "${DIR}/high-admission-trace.sh" "${DIR}/bundle-correlate.py" "${DIR}/radius-analyze.py" "$PKG_DIR/"
+echo "Staged Deploy.sh, Remove.sh, README.md, webapp-query.py, high-admission-trace.sh, bundle-correlate.py, radius-analyze.py"
 
 echo
 echo "=== 3. Exporting the image ==="
@@ -75,7 +75,7 @@ if os.path.exists(zip_path):
     os.remove(zip_path)
 
 # Scripts that need +x once unzipped on the EM (a real Linux box).
-EXECUTABLE_NAMES = {"Deploy.sh", "Remove.sh", "webapp-query.py", "high-admission-trace.sh", "bundle-correlate.py"}
+EXECUTABLE_NAMES = {"Deploy.sh", "Remove.sh", "webapp-query.py", "high-admission-trace.sh", "bundle-correlate.py", "radius-analyze.py"}
 
 with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
     for name in sorted(os.listdir(src)):

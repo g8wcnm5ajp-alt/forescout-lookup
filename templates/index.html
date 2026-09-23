@@ -36,6 +36,8 @@
             <button type="button" class="page-tab-btn" data-page-tab-target="analyze">Live Analyze{% if active_analyze_runs %} <span class="page-tab-badge">{{ active_analyze_runs|length }}</span>{% endif %}</button>
             <button type="button" class="page-tab-btn" data-page-tab-target="upload">Upload &amp; Review Bundle</button>
             <button type="button" class="page-tab-btn" data-page-tab-target="templates">Templates</button>
+            <button type="button" class="page-tab-btn" data-page-tab-target="cleanup">Clean Up</button>
+            <button type="button" class="page-tab-btn" data-page-tab-target="admission">Admission Rate</button>
             <button type="button" class="page-tab-btn" data-page-tab-target="help">Help</button>
         </div>
 
@@ -432,6 +434,161 @@
         </div>
         </section>
 
+        <section class="page-tab-panel page-tab-panel-hidden" data-page-tab-panel="admission">
+        <div class="card actions" id="admission-panel">
+            <h3>Admission Rate <span class="muted">(eyeSight Admission TAP control -- the throttle behind "the property just doesn't update")</span></h3>
+            <p class="hint" style="margin-top:0">eyeSight protects the network from being spammed with active queries when
+                endpoints admit too often. An appliance enters the <strong>TAP control state</strong> once it has seen more than
+                100 admission events in 1 hour, or 1,000 in 10 hours, across all endpoints. While in that state, any single host
+                with 5 or more admission events of one type (offline&rarr;online, new IP, wireless, &hellip;) within 10 hours has
+                further events of that type <strong>ignored</strong> -- its actively-resolved properties (SNMP, WMI, Windows
+                manageability, &hellip;) stop being rechecked, which reads as a policy that "works but the property does not
+                update" until the host is deleted. Those thresholds were sized for the networks of twenty years ago; this tab shows
+                the state and lets you adjust them, carefully.</p>
+            <div class="tree-filter-row">
+                <label class="tree-filter-toggle">Target
+                    <select id="admission-target"><option value="">-- pick appliance/EM --</option></select>
+                </label>
+                <button type="button" id="admission-load-btn">Load status &amp; settings</button>
+                <button type="button" id="admission-clear-btn" class="btn-secondary">Clear</button>
+                <span class="hint" id="admission-status" style="margin:0"></span>
+            </div>
+        </div>
+
+        <div id="admission-results" style="display:none;">
+        <div class="card actions">
+            <h3>Status <span class="muted" id="admission-status-target"></span></h3>
+            <div id="admission-tap-summary"></div>
+            <div id="admission-tap-hourly"></div>
+            <p class="hint">From the box's own <code>stats/today.log</code>: <code>adm.tap.active</code> is written once a
+                minute; <code>adm.tap.accept.&lt;type&gt;</code> / <code>adm.tap.discard.&lt;type&gt;</code> count admission events the
+                engine rechecked or <strong>ignored</strong>, per type. Which individual hosts are currently throttled lives only in
+                engine memory -- no command exposes it, so it is not shown here. To watch it live on the box:
+                <code>cat /usr/local/forescout/stats/today.log | egrep 'adm.tap.active' | tss print</code></p>
+        </div>
+
+        <div class="card actions">
+            <h3>Settings <span class="muted">(read with <code>fstool get_property</code>; blank = built-in default)</span></h3>
+            <table id="admission-settings-table">
+                <thead><tr><th>Setting</th><th>Property</th><th>Current</th><th>Default</th><th>New value</th></tr></thead>
+                <tbody id="admission-settings-body"></tbody>
+            </table>
+            <p class="hint">Leave "New value" empty to keep the current value; type <code>default</code> to remove an override.
+                The engine reads these <strong>once at start</strong>: after applying, nothing changes until the CounterACT
+                service on that box is restarted (step 3 below). Test on one appliance before rolling out -- a threshold set too
+                high means a flapping host really can spam its properties' active queries.</p>
+            <div class="tree-filter-row">
+                <button type="button" id="admission-preview-btn">1. Preview commands</button>
+                <button type="button" id="admission-defaults-btn" class="btn-small btn-secondary">Fill "default" everywhere</button>
+                <span class="hint" id="admission-preview-status" style="margin:0"></span>
+            </div>
+        </div>
+
+        <div class="card actions" id="admission-preview-card" style="display:none;">
+            <h3>Commands that will be run on <span id="admission-preview-target"></span></h3>
+            <pre id="admission-preview-body" class="analyze-output analyze-output-mono" style="display:block;"></pre>
+            <p class="hint" id="admission-preview-note"></p>
+            <div class="tree-filter-row">
+                <label class="tree-filter-toggle"><input type="checkbox" id="admission-confirm-checkbox">
+                    I have read the commands above and want them run now</label>
+                <button type="button" id="admission-apply-btn" disabled>2. Apply settings</button>
+                <span class="hint" id="admission-apply-status" style="margin:0"></span>
+            </div>
+            <div id="admission-apply-result"></div>
+        </div>
+
+        <div class="card actions" id="admission-restart-card" style="display:none;">
+            <h3>3. Restart the CounterACT service on <span id="admission-restart-target"></span></h3>
+            <p class="hint"><strong>This restarts CounterACT on that box</strong> (<code>fstool service restart</code>): policy
+                evaluation, plugins and RADIUS/802.1X on that appliance stop for the duration (typically a few minutes) and every
+                open Console session to it is dropped. The settings applied above only take effect after it. Do it in a change
+                window; never on an EM during business hours unless you mean it.</p>
+            <div class="tree-filter-row">
+                <label class="tree-filter-toggle">Type the target name to confirm
+                    <input type="text" id="admission-restart-typed" style="width:18em" autocomplete="off"></label>
+                <label class="tree-filter-toggle"><input type="checkbox" id="admission-restart-checkbox">
+                    I understand this restarts CounterACT on that box</label>
+                <button type="button" id="admission-restart-btn" disabled>Restart service</button>
+                <span class="hint" id="admission-restart-status" style="margin:0"></span>
+            </div>
+        </div>
+        </div>
+        </section>
+
+        <section class="page-tab-panel page-tab-panel-hidden" data-page-tab-panel="cleanup">
+        <div class="card actions" id="cleanup-panel">
+            <h3>Clean Up <span class="muted">(free disk space on the EM / appliances ahead of an upgrade)</span></h3>
+            <p class="hint" style="margin-top:0">Three steps, nothing is deleted until the last one:
+                <strong>1. Scan</strong> (read-only -- what is there and how big) &rarr;
+                <strong>2. Preview commands</strong> (the exact commands, per box) &rarr;
+                <strong>3. Go-ahead and run</strong>.</p>
+            <p class="hint" id="cleanup-status">Loading appliances…</p>
+            <div class="tree-filter-row" style="margin-bottom:0.5rem;">
+                <button type="button" id="cleanup-select-online-btn" class="btn-small btn-secondary">Select all online</button>
+                <button type="button" id="cleanup-deselect-all-btn" class="btn-small btn-secondary">Deselect all</button>
+            </div>
+            <div class="tree-filter-row" id="cleanup-checkbox-row"></div>
+            <div class="tree-filter-row">
+                <button type="button" id="cleanup-scan-btn">1. Scan selected</button>
+                <button type="button" id="cleanup-clear-btn" class="btn-secondary">Clear results</button>
+            </div>
+            <p class="hint">The scan searches the whole filesystem for backup and installer files, so allow up to a
+                few minutes per box. Boxes are scanned at the same time.</p>
+        </div>
+
+        <div id="cleanup-results"></div>
+
+        <div class="card actions" id="cleanup-preview-bar" style="display:none;">
+            <div class="tree-filter-row">
+                <button type="button" id="cleanup-preview-btn">2. Preview commands</button>
+                <span class="hint" id="cleanup-selection-summary" style="margin:0"></span>
+            </div>
+        </div>
+
+        <div class="card actions" id="cleanup-preview-card" style="display:none;">
+            <h3>Commands that will be run</h3>
+            <div id="cleanup-preview-body"></div>
+            <div class="tree-filter-row">
+                <label class="tree-filter-toggle"><input type="checkbox" id="cleanup-confirm-checkbox">
+                    I have read these commands and want them run on the boxes shown.</label>
+            </div>
+            <div class="tree-filter-row">
+                <button type="button" id="cleanup-run-btn" disabled>3. Run clean up</button>
+                <button type="button" id="cleanup-cancel-btn" class="btn-secondary">Cancel</button>
+            </div>
+            <p class="hint">Deleted files cannot be brought back. Change any tick above and this preview is thrown
+                away -- you preview again before anything runs. A preview is good for 10 minutes.</p>
+        </div>
+
+        <div id="cleanup-run-results"></div>
+
+        <div class="card">
+            <h3>Last resort <span class="muted">(not run from this app -- by hand only)</span></h3>
+            <p class="hint" style="margin-top:0">If the steps above have not freed enough space, <strong>raise a
+                Forescout support case first</strong> -- something more fundamental is likely wrong. These are listed for
+                reference only; each one stops a service or throws data away, so they are deliberately not buttons.</p>
+            <table>
+                <tr><th>Command</th><th>What it does</th></tr>
+                <tr><td><code>fstool data_reset npsources</code></td><td>Truncates all the logs. Restarts the appliance
+                    service (causes failover) -- one appliance at a time, never with <code>fstool oneach</code>.</td></tr>
+                <tr><td><code>fstool data_reset all</code></td><td>Resets all data. Individual appliances only, as a last
+                    resort. <strong>Never run this on the EM.</strong></td></tr>
+                <tr><td><code>psql -c 'truncate eval_status'</code></td><td>Removes every policy evaluation; everything is
+                    re-evaluated from scratch, which is likely to take many hours. Check its size first with
+                    <code>fstool db diskspace | grep public.eval_status</code>.</td></tr>
+                <tr><td><code>fstool db rescue</code></td><td>Full database rebuild. Stops the CounterACT service straight
+                    away (no prompt), truncates <code>source_log</code>, dumps every table to temporary disk space, drops
+                    and restores each one -- <strong>a table whose dump fails is dropped for good</strong> -- and only at the
+                    end asks whether to start the service again. Needs free disk space to work, so it is riskiest on the
+                    very box that is short of it.</td></tr>
+            </table>
+            <p class="hint">Files that will not delete even as root are usually owned by another user: find the owner
+                with <code>ls -al</code>, switch to it (e.g. <code>su - -s/bin/bash _fsservice</code>), delete, then
+                <code>exit</code>. Free space reported by <code>df</code> can take a few minutes to catch up after a
+                delete.</p>
+        </div>
+        </section>
+
         <section class="page-tab-panel page-tab-panel-hidden" data-page-tab-panel="analyze">
         <div class="card no-print">
             <h3>Host info <span class="muted">(raw <code>fstool hostinfo</code>, downloaded as .txt)</span></h3>
@@ -539,6 +696,31 @@
             </div>
             <pre id="analyze-output" class="analyze-output" style="display:none;"></pre>
         </div>
+        <div class="card no-print" id="radius-live-card">
+            <h3>RADIUS Log Analysis <span class="muted">(live, from the RADIUS plugin's own radiusd.log)</span></h3>
+            <p class="hint">Reads the target's <code>log/plugin/dot1x/radiusd*.log</code> for the window (the analysis runs on
+                that box; only the report comes back) and reports ranked <strong>Findings</strong> in plain English: home
+                servers not answering / marked zombie (with who was affected), unknown NAS clients, shared-secret
+                mismatches, BlastRADIUS warnings, EAP-TLS certificate/CA problems, ntlm_auth and MS-CHAP failures,
+                restart loops, thread-pool exhaustion -- then per-home-server, per-NAS, per-hour and reject tables.
+                Uses the target picked in <strong>1. Target</strong> above.</p>
+            <div class="tree-filter-row">
+                <label class="tree-filter-toggle">Window
+                    <select id="radius-live-window">
+                        <option value="15m">last 15 min</option><option value="1h">last hour</option>
+                        <option value="6h">last 6 hours</option><option value="24h" selected>last 24 hours</option>
+                        <option value="3d">last 3 days</option><option value="7d">last 7 days</option>
+                    </select>
+                </label>
+                <button type="button" id="radius-live-btn">Analyse RADIUS log</button>
+                <span class="hint" id="radius-live-status"></span>
+            </div>
+            <div id="radius-live-tools" style="display:none; margin:0.5rem 0;">
+                <a href="#" id="radius-live-download" class="btn-small btn-secondary">Download report (.txt)</a>
+                <button type="button" id="radius-live-clear" class="btn-small btn-secondary">Clear results</button>
+            </div>
+            <pre id="radius-live-output" class="analyze-output analyze-output-mono" style="display:none;"></pre>
+        </div>
         </section>
 
         <section class="page-tab-panel page-tab-panel-hidden" data-page-tab-panel="upload">
@@ -597,6 +779,34 @@
             <p class="hint">Only as complete as the logs in the bundle: trap-driven MAC add/remove on switch ports, plugin learn events, trace learn events and wireless client clears. At baseline debug the Switch plugin does not log every admission, so this can be sparse unless keyed debug was on.</p>
             <div id="upload-roaming-graph" class="roaming-graph tree-graphic-container" style="display:none;"></div>
             <div id="upload-roaming-body"></div>
+        </div>
+        <div class="card no-print" id="radius-review-card">
+            <h3>RADIUS Log Analysis <span class="muted">(from a bundle, an uploaded radiusd.log, or pasted lines)</span></h3>
+            <p class="hint">Same analysis as the Live Analyze tab's RADIUS box, offline. A bundle is streamed for its
+                <code>log/plugin/dot1x/radiusd*.log</code> files (nothing unpacked); an uploaded file or pasted text is
+                analysed directly and not kept on the EM. Plain FreeRADIUS <code>-X</code> output works too.</p>
+            <div class="tree-filter-row" id="radius-bundle-row" style="display:none;">
+                <label class="tree-filter-toggle">Bundle</label>
+                <select id="radius-bundle-select" style="min-width:22em;"></select>
+                <button type="button" id="radius-bundle-btn">Analyse bundle</button>
+            </div>
+            <div class="tree-filter-row">
+                <label class="tree-filter-toggle">Log file</label>
+                <input type="file" id="radius-file-input" accept=".log,.txt,.gz">
+                <button type="button" id="radius-file-btn">Analyse file</button>
+            </div>
+            <div class="tree-filter-row">
+                <textarea id="radius-paste" rows="5" style="width:100%; font-family:monospace; font-size:0.8rem;" placeholder="...or paste radiusd.log lines here"></textarea>
+            </div>
+            <div class="tree-filter-row">
+                <button type="button" id="radius-paste-btn">Analyse pasted lines</button>
+                <span class="hint" id="radius-review-status"></span>
+            </div>
+            <div id="radius-review-tools" style="display:none; margin:0.5rem 0;">
+                <a href="#" id="radius-review-download" class="btn-small btn-secondary">Download report (.txt)</a>
+                <button type="button" id="radius-review-clear" class="btn-small btn-secondary">Clear results</button>
+            </div>
+            <pre id="radius-review-output" class="analyze-output analyze-output-mono" style="display:none;"></pre>
         </div>
         </section>
 
@@ -2096,6 +2306,287 @@
     </script>
 
     <script>
+        // Clean Up tab (David, 2026-09-21). Scan (read-only) -> Preview the
+        // exact commands -> go-ahead tick -> Run. The server enforces the
+        // order too: /cleanup/run only takes a preview id, and the EM
+        // refuses commands that differ from what that preview showed. Any
+        // change to a tick throws the current preview away, so what runs
+        // is always what is on screen.
+        (function () {
+            const panel = document.getElementById("cleanup-panel");
+            if (!panel) return;
+            const status = document.getElementById("cleanup-status");
+            const checkboxRow = document.getElementById("cleanup-checkbox-row");
+            const scanBtn = document.getElementById("cleanup-scan-btn");
+            const results = document.getElementById("cleanup-results");
+            const previewBar = document.getElementById("cleanup-preview-bar");
+            const previewBtn = document.getElementById("cleanup-preview-btn");
+            const summary = document.getElementById("cleanup-selection-summary");
+            const previewCard = document.getElementById("cleanup-preview-card");
+            const previewBody = document.getElementById("cleanup-preview-body");
+            const confirmBox = document.getElementById("cleanup-confirm-checkbox");
+            const runBtn = document.getElementById("cleanup-run-btn");
+            const cancelBtn = document.getElementById("cleanup-cancel-btn");
+            const runResults = document.getElementById("cleanup-run-results");
+
+            const GROUPS = [
+                ["first", "Do first"],
+                ["second", "Do second -- review before deleting (some may be needed for the upgrade)"],
+                ["select", "Pick individual files -- nothing here is deleted unless you tick the file itself"],
+            ];
+            let previewId = null;
+            let cardSeq = 0;
+            const cards = {};   // target -> card element (one per box, scan and run each)
+
+            function esc(s) {
+                return (s === null || s === undefined ? "" : s).toString()
+                    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+            }
+            function fmtBytes(n) {
+                if (n === null || n === undefined) return "";
+                const units = ["B", "KB", "MB", "GB", "TB"];
+                let i = 0;
+                while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+                return (i === 0 ? n : n.toFixed(n >= 100 ? 0 : 1)) + " " + units[i];
+            }
+            function post(url, fields) {
+                const body = new URLSearchParams();
+                body.set("csrf_token", CSRF_TOKEN);
+                Object.keys(fields).forEach(k => body.set(k, fields[k]));
+                return fetch(url, { method: "POST", body: body }).then(r => r.text()).then(t => {
+                    try { return JSON.parse(t); }
+                    catch (e) { return { error: "The app did not answer properly -- your session may have expired. Refresh the page and try again." }; }
+                });
+            }
+
+            fetch("/api/appliances").then(r => r.json()).then(d => {
+                if (d.error) { status.textContent = "error: " + d.error; return; }
+                const list = d.appliances || [];
+                status.textContent = list.filter(a => a.online).length + " of " + list.length +
+                    " online -- tick the boxes to work on (none are ticked for you).";
+                checkboxRow.innerHTML = list.map(a => (
+                    "<label class=\"tree-filter-toggle\"><input type=\"checkbox\" class=\"cleanup-target-cb\" data-target=\"" +
+                    esc(a.address) + "\"" + (a.online ? "" : " disabled") + ">" + esc(a.address) +
+                    (a.is_em ? " (EM)" : "") + (a.online ? "" : " (offline)") + "</label>"
+                )).join("");
+            }).catch(err => { status.textContent = "failed to load: " + err; });
+
+            document.getElementById("cleanup-select-online-btn").addEventListener("click", () => {
+                checkboxRow.querySelectorAll(".cleanup-target-cb:not(:disabled)").forEach(cb => { cb.checked = true; });
+            });
+            document.getElementById("cleanup-deselect-all-btn").addEventListener("click", () => {
+                checkboxRow.querySelectorAll(".cleanup-target-cb").forEach(cb => { cb.checked = false; });
+            });
+
+            function cardFor(container, target, prefix) {
+                const key = prefix + target;
+                if (!cards[key]) {
+                    const el = document.createElement("div");
+                    el.className = "card";
+                    el.id = "cleanup-card-" + (++cardSeq);
+                    container.appendChild(el);
+                    cards[key] = el;
+                }
+                return cards[key];
+            }
+
+            function fileList(item) {
+                if (!item.files || !item.files.length) return "";
+                const more = item.count > item.files.length
+                    ? "<p class=\"hint\">Showing the " + item.files.length + " biggest of " + item.count + ".</p>" : "";
+                return "<details class=\"data-section\"><summary>Show files</summary><table>" +
+                    item.files.map(f => "<tr><td>" + esc(f.path) + "</td><td>" + fmtBytes(f.bytes) + "</td></tr>").join("") +
+                    "</table>" + more + "</details>";
+            }
+
+            function renderScan(target, r) {
+                const card = cardFor(results, target, "scan:");
+                let html = "<h3>" + esc(target) + (r.is_em ? " (EM)" : "") + " <span class=\"muted\">scan</span></h3>";
+                if (r.busy && r.busy.length) {
+                    html += "<p class=\"error\">An fstool tech-support build is running on this box -- a clean up here " +
+                        "will be refused until it has finished.</p>";
+                }
+                html += "<pre class=\"command-preview\">" + esc(r.df) + "</pre>";
+                GROUPS.forEach(g => {
+                    const items = r.items.filter(i => i.group === g[0]);
+                    html += "<h4 class=\"diag-section-heading\">" + esc(g[1]) + "</h4>";
+                    if (g[0] === "select") {
+                        items.forEach(i => {
+                            html += "<details class=\"data-section\"><summary>" + esc(i.label) + " -- " + i.count +
+                                " file(s), " + fmtBytes(i.bytes) + "</summary><p class=\"hint\">" + esc(i.note) + "</p>";
+                            if (!i.files.length) { html += "<p class=\"hint\">No files directly in this folder.</p>"; }
+                            else {
+                                html += "<table><tr><th></th><th>File</th><th>Size</th></tr>" + i.files.map(f => (
+                                    "<tr><td><input type=\"checkbox\" class=\"cleanup-file-cb\" data-target=\"" + esc(target) +
+                                    "\" data-item=\"" + esc(i.id) + "\" data-path=\"" + esc(f.path) + "\"></td><td>" +
+                                    esc(f.path) + "</td><td>" + fmtBytes(f.bytes) + "</td></tr>")).join("") + "</table>";
+                                if (i.count > i.files.length) {
+                                    html += "<p class=\"hint\">Showing the " + i.files.length + " biggest of " + i.count + ".</p>";
+                                }
+                            }
+                            html += "</details>";
+                        });
+                        return;
+                    }
+                    html += "<table><tr><th></th><th>Item</th><th>Found</th><th>Size</th></tr>" + items.map(i => (
+                        "<tr><td><input type=\"checkbox\" class=\"cleanup-item-cb\" data-target=\"" + esc(target) +
+                        "\" data-item=\"" + esc(i.id) + "\"" + (i.count ? "" : " disabled") + "></td><td>" + esc(i.label) +
+                        (i.note ? "<br><span class=\"muted\">" + esc(i.note) + "</span>" : "") + fileList(i) + "</td><td>" +
+                        (i.table ? (i.count ? "table" : "not found") : i.count) + "</td><td>" +
+                        (i.table ? esc(i.size_text || "") : fmtBytes(i.bytes)) + "</td></tr>")).join("") + "</table>";
+                });
+                html += "<details class=\"data-section\"><summary>Where the space is (files over 500 MB, biggest folders under /usr)</summary>" +
+                    (r.big_files.length ? "<table>" + r.big_files.map(f => "<tr><td>" + esc(f.path) + "</td><td>" +
+                        fmtBytes(f.bytes) + "</td></tr>").join("") + "</table>" : "<p class=\"hint\">No files over 500 MB.</p>") +
+                    "<pre class=\"command-preview\">" + esc(r.top_usr_dirs) + "</pre></details>";
+                card.innerHTML = html;
+                refreshSelection();
+            }
+
+            function renderRun(target, r) {
+                const card = cardFor(runResults, target, "run:");
+                let html = "<h3>" + esc(target) + " <span class=\"muted\">clean up " + (r.ok ? "finished" : "did not finish") + "</span></h3>";
+                if (r.incomplete) html += "<p class=\"error\">" + esc(r.incomplete) + "</p>";
+                html += "<table><tr><th>Command</th><th>Exit</th><th>Output</th></tr>" + r.steps.map(s => (
+                    "<tr><td><code>" + esc(s.command) + "</code></td><td>" + (s.ran ? esc(s.rc) : "not run") + "</td><td><pre class=\"command-preview\">" +
+                    esc(s.output || "") + "</pre></td></tr>")).join("") + "</table>" +
+                    "<h4 class=\"diag-section-heading\">Free space before</h4><pre class=\"command-preview\">" + esc(r.df_before) + "</pre>" +
+                    "<h4 class=\"diag-section-heading\">Free space after</h4><pre class=\"command-preview\">" + esc(r.df_after) + "</pre>" +
+                    "<p class=\"hint\">Free space can take a few minutes to catch up. Scan again to see what is left.</p>";
+                card.innerHTML = html;
+            }
+
+            function poll(job) {
+                fetch("/api/cleanup_job/" + job.job_id).then(r => r.json()).then(j => {
+                    const container = job.kind === "scan" ? results : runResults;
+                    if (j.error && !j.status) {
+                        cardFor(container, job.target, job.kind + ":").innerHTML =
+                            "<h3>" + esc(job.target) + "</h3><p class=\"error\">Lost track of this job (the app was restarted?). Scan again.</p>";
+                        return;
+                    }
+                    if (j.status === "running") { setTimeout(() => poll(job), 3000); return; }
+                    if (j.status === "failed") {
+                        cardFor(container, job.target, job.kind + ":").innerHTML =
+                            "<h3>" + esc(job.target) + "</h3><p class=\"error\">" + esc(j.error) + "</p>";
+                        return;
+                    }
+                    if (job.kind === "scan") renderScan(job.target, j.result);
+                    else {
+                        renderRun(job.target, j.result);
+                        const stale = cards["scan:" + job.target];
+                        if (stale) stale.innerHTML = "<h3>" + esc(job.target) + "</h3><p class=\"hint\">Clean up ran on this box -- scan it again to see what is left.</p>";
+                        refreshSelection();
+                    }
+                }).catch(() => setTimeout(() => poll(job), 5000));
+            }
+
+            function track(jobs) {
+                jobs.forEach(job => {
+                    cardFor(job.kind === "scan" ? results : runResults, job.target, job.kind + ":").innerHTML =
+                        "<h3>" + esc(job.target) + "</h3><p class=\"hint\"><span class=\"spinner\"></span>" +
+                        (job.kind === "scan" ? "Scanning (read-only)…" : "Running the clean up…") + "</p>";
+                    poll(job);
+                });
+            }
+
+            fetch("/api/cleanup_jobs/active").then(r => r.json()).then(d => track(d.jobs || [])).catch(() => {});
+
+            scanBtn.addEventListener("click", () => {
+                const checked = Array.from(checkboxRow.querySelectorAll(".cleanup-target-cb:checked"));
+                if (!checked.length) { window.alert("Tick at least one EM / appliance."); return; }
+                const fields = {};
+                checked.forEach(cb => { fields["include_appliance_" + cb.dataset.target] = "1"; });
+                dropPreview();
+                scanBtn.disabled = true;
+                post("/cleanup/scan", fields).then(d => {
+                    scanBtn.disabled = false;
+                    if (d.error) { window.alert(d.error); return; }
+                    track(d.jobs || []);
+                    if (d.skipped && d.skipped.length) window.alert("Already busy with a clean-up job, skipped: " + d.skipped.join(", "));
+                }).catch(err => { scanBtn.disabled = false; window.alert("Failed to start: " + err); });
+            });
+
+            function selection() {
+                const sel = {};
+                const box = t => (sel[t] = sel[t] || { items: [], files: {} });
+                results.querySelectorAll(".cleanup-item-cb:checked").forEach(cb => box(cb.dataset.target).items.push(cb.dataset.item));
+                results.querySelectorAll(".cleanup-file-cb:checked").forEach(cb => {
+                    const b = box(cb.dataset.target);
+                    if (!b.files[cb.dataset.item]) { b.files[cb.dataset.item] = []; b.items.push(cb.dataset.item); }
+                    b.files[cb.dataset.item].push(cb.dataset.path);
+                });
+                return sel;
+            }
+
+            function dropPreview() {
+                previewId = null;
+                previewCard.style.display = "none";
+                previewBody.innerHTML = "";
+                confirmBox.checked = false;
+                runBtn.disabled = true;
+            }
+
+            function refreshSelection() {
+                const sel = selection();
+                const boxes = Object.keys(sel);
+                const hasScan = !!results.querySelector(".cleanup-item-cb, .cleanup-file-cb");
+                previewBar.style.display = hasScan ? "block" : "none";
+                const n = boxes.reduce((a, t) => a + sel[t].items.length, 0);
+                summary.textContent = n ? n + " item(s) ticked across " + boxes.length + " box(es)." : "Nothing ticked yet.";
+                previewBtn.disabled = !n;
+            }
+
+            results.addEventListener("change", () => { dropPreview(); refreshSelection(); });
+            cancelBtn.addEventListener("click", dropPreview);
+
+            // Clear results (David, 2026-09-21: "so that I can see fresh scan
+            // results"). Page-only -- nothing is sent to any box. A card whose
+            // job is still running (it still shows the spinner) stays, so a
+            // scan or clean up in flight is never lost track of.
+            document.getElementById("cleanup-clear-btn").addEventListener("click", () => {
+                Object.keys(cards).forEach(key => {
+                    if (cards[key].querySelector(".spinner")) return;
+                    cards[key].remove();
+                    delete cards[key];
+                });
+                dropPreview();
+                refreshSelection();
+            });
+            confirmBox.addEventListener("change", () => { runBtn.disabled = !(confirmBox.checked && previewId); });
+
+            previewBtn.addEventListener("click", () => {
+                dropPreview();
+                previewBtn.disabled = true;
+                post("/cleanup/preview", { selection: JSON.stringify(selection()) }).then(d => {
+                    previewBtn.disabled = false;
+                    if (d.error) { window.alert(d.error); return; }
+                    previewId = d.preview_id;
+                    previewBody.innerHTML = d.boxes.map(b => {
+                        const notes = Array.from(new Set(b.steps.map(s => s.note).filter(Boolean)));
+                        return "<h4 class=\"diag-section-heading\">On " + esc(b.target) + (b.is_em ? " (EM)" : "") + " -- " +
+                            b.steps.length + " command(s)</h4><pre class=\"command-preview\">" +
+                            esc(b.steps.map(s => s.command).join("\n")) + "</pre>" +
+                            notes.map(n => "<p class=\"hint\">" + esc(n) + "</p>").join("");
+                    }).join("");
+                    previewCard.style.display = "block";
+                    previewCard.scrollIntoView({ behavior: "smooth", block: "start" });
+                }).catch(err => { previewBtn.disabled = false; window.alert("Preview failed: " + err); });
+            });
+
+            runBtn.addEventListener("click", () => {
+                if (!previewId || !confirmBox.checked) return;
+                const id = previewId;
+                dropPreview();
+                post("/cleanup/run", { preview_id: id, confirm: "yes" }).then(d => {
+                    if (d.error) { window.alert(d.error); return; }
+                    track(d.jobs || []);
+                    if (d.skipped && d.skipped.length) window.alert("Busy with another job, NOT cleaned: " + d.skipped.join(", "));
+                }).catch(err => window.alert("Failed to start: " + err));
+            });
+        })();
+    </script>
+
+    <script>
         // Live Analyze "Host info" download (David, 2026-09-18): fetch first so an EM-side error
         // shows on the page instead of a broken download, then hand the file to the browser.
         (function () {
@@ -2275,7 +2766,12 @@
             // precise ETA or per-step state we don't have.
             window.renderAnalyzeProgress = function (d) {
                 const elapsed = Math.max(0, Math.round((Date.now() - d.started_at * 1000) / 1000));
-                const steps = d.kind === "roaming"
+                const steps = d.kind === "radius"
+                    ? ["Read the RADIUS plugin's radiusd.log for " + d.bundle + " (on the box that holds it, or streamed from the bundle)",
+                       "Pair every proxied request with its reply / timeout; home servers, zombies, response window",
+                       "Unknown clients, shared-secret mismatches, BlastRADIUS, EAP-TLS certificate chain, ntlm_auth / MS-CHAP, restarts",
+                       "Per-home-server, per-NAS, per-hour and reject tables"]
+                    : d.kind === "roaming"
                     ? ["Stream the bundle once looking for this device: " + d.bundle]
                     : d.kind === "correlate"
                     ? ["Stream each bundle once (nothing is unpacked to disk): " + d.bundle,
@@ -2428,6 +2924,251 @@
             }
             window.printGraphContainer(container, btn.dataset.title || "Graph");
         });
+
+        // Admission Rate tab (2026-09-23): eyeSight's Admission TAP control -- status + settings, then
+        // preview -> go-ahead -> apply, and the separate service restart the change needs.
+        (function () {
+            const targetSel = document.getElementById("admission-target");
+            const statusEl = document.getElementById("admission-status");
+            const results = document.getElementById("admission-results");
+            const previewCard = document.getElementById("admission-preview-card");
+            const restartCard = document.getElementById("admission-restart-card");
+            const confirmBox = document.getElementById("admission-confirm-checkbox");
+            const applyBtn = document.getElementById("admission-apply-btn");
+            const restartBox = document.getElementById("admission-restart-checkbox");
+            const restartTyped = document.getElementById("admission-restart-typed");
+            const restartBtn = document.getElementById("admission-restart-btn");
+            let preview = null;      // {preview_id, target}
+            let settings = [];
+            function esc(t) { return String(t === null || t === undefined ? "" : t).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+            function fmtTs(ts) { return ts ? new Date(ts * 1000).toLocaleString() : "-"; }
+
+            fetch("/api/appliances").then(r => r.json()).then(d => {
+                (d.appliances || []).forEach(a => {
+                    const o = document.createElement("option");
+                    o.value = a.address; o.textContent = a.address + (a.is_em ? " (EM)" : "") + (a.online ? "" : " (offline)");
+                    o.disabled = !a.online;
+                    targetSel.appendChild(o);
+                });
+            }).catch(() => {});
+
+            function pollJob(jobId, onDone, statusNode, label) {
+                const t0 = Date.now();
+                (function tick() {
+                    fetch("/api/cleanup_job/" + jobId).then(r => r.json()).then(j => {
+                        if (j.error && !j.status) { statusNode.textContent = "error: " + j.error; onDone(null, j.error); return; }
+                        if (j.status === "running") {
+                            statusNode.innerHTML = "<span class=\"spinner\"></span>" + esc(label) + " (" + Math.round((Date.now() - t0) / 1000) + "s)";
+                            setTimeout(tick, 2000); return;
+                        }
+                        if (j.status === "failed") { statusNode.textContent = "Failed: " + (j.error || "unknown error"); onDone(null, j.error); return; }
+                        statusNode.textContent = "";
+                        onDone(j.result, null);
+                    }).catch(() => setTimeout(tick, 2000));
+                })();
+            }
+            function start(url, body, statusNode, label, onDone) {
+                fetch(url, { method: "POST", body: body }).then(r => r.json()).then(d => {
+                    if (d.error) { statusNode.textContent = "Failed: " + d.error; onDone(null, d.error); return; }
+                    pollJob(d.job_id, onDone, statusNode, label);
+                }).catch(err => { statusNode.textContent = "Failed: " + err; onDone(null, String(err)); });
+            }
+
+            function renderStatus(d) {
+                document.getElementById("admission-status-target").textContent = "(" + d.target + (d.is_em ? ", EM" : "") + ")";
+                const tap = d.tap || {};
+                const pct = tap.minutes_sampled ? Math.round(1000 * tap.minutes_active / tap.minutes_sampled) / 10 : null;
+                const acc = Object.entries(tap.accept || {}).sort((a, b) => b[1] - a[1]);
+                const dis = Object.entries(tap.discard || {}).sort((a, b) => b[1] - a[1]);
+                const accTot = acc.reduce((a, b) => a + b[1], 0), disTot = dis.reduce((a, b) => a + b[1], 0);
+                document.getElementById("admission-tap-summary").innerHTML =
+                    "<div class=\"kv-grid\">" +
+                    "<div><strong>TAP control active now</strong></div><div>" + (tap.active_now === null || tap.active_now === undefined ? "unknown (no adm.tap.active sample today)" :
+                        (tap.active_now ? "<span class=\"badge-warn\">TRUE</span>" : "<span class=\"badge-ok\">false</span>") + " <span class=\"muted\">at " + esc(fmtTs(tap.active_at)) + "</span>") + "</div>" +
+                    "<div><strong>Active today</strong></div><div>" + (pct === null ? "-" : pct + "% of " + tap.minutes_sampled + " sampled minutes (" + tap.minutes_active + " min)") + "</div>" +
+                    "<div><strong>Admissions rechecked (accept)</strong></div><div>" + accTot + (acc.length ? " -- " + acc.map(([k, v]) => esc(k) + " " + v).join(", ") : "") + "</div>" +
+                    "<div><strong>Admissions ignored (discard)</strong></div><div>" + (disTot ? "<span class=\"badge-warn\">" + disTot + "</span> -- " + dis.map(([k, v]) => esc(k) + " " + v).join(", ") : "0 -- nothing throttled today") + "</div>" +
+                    "<div><strong>Service</strong></div><div>" + esc((d.service || "").split("\n")[0]) + "</div>" +
+                    "</div>";
+                const hours = tap.hourly || [];
+                document.getElementById("admission-tap-hourly").innerHTML = hours.length ? (
+                    "<table style=\"margin-top:0.5rem;\"><thead><tr><th>Hour</th><th>TAP active</th><th>Rechecked</th><th>Ignored</th></tr></thead><tbody>" +
+                    hours.map(h => "<tr" + (h.discard ? " class=\"row-warn\"" : "") + "><td>" + esc(new Date(h.hour * 1000).toLocaleString([], {month: "short", day: "numeric", hour: "2-digit", minute: "2-digit"})) + "</td><td>" +
+                        (h.minutes ? Math.round(100 * h.active / h.minutes) + "% (" + h.active + "/" + h.minutes + " min)" : "-") + "</td><td>" + h.accept + "</td><td>" + h.discard + "</td></tr>").join("") +
+                    "</tbody></table>") : "<p class=\"hint\">No adm.tap.* samples in today.log yet.</p>";
+                settings = d.settings || [];
+                document.getElementById("admission-settings-body").innerHTML = settings.map(p =>
+                    "<tr><td><strong>" + esc(p.label) + "</strong><div class=\"hint\" style=\"margin:0\">" + esc(p.help) + "</div></td>" +
+                    "<td><code>" + esc(p.key) + "</code></td>" +
+                    "<td>" + esc(p.value) + (p.overridden ? " <span class=\"muted\">(set)</span>" : " <span class=\"muted\">(default)</span>") + "</td>" +
+                    "<td>" + esc(p.default) + "</td>" +
+                    "<td><input type=\"text\" class=\"admission-new\" data-key=\"" + esc(p.key) + "\" placeholder=\"" + (p.kind === "bool" ? "true / false" : p.kind === "intlist" ? "e.g. " + esc(p.default) : "number") + "\" style=\"width:11em\" autocomplete=\"off\"></td></tr>"
+                ).join("");
+                results.style.display = "";
+            }
+
+            document.getElementById("admission-load-btn").addEventListener("click", () => {
+                const target = targetSel.value;
+                if (!target) { window.alert("Pick a target."); return; }
+                preview = null; previewCard.style.display = "none"; restartCard.style.display = "none";
+                const fd = new URLSearchParams(); fd.set("csrf_token", CSRF_TOKEN); fd.set("target", target);
+                start("/admission/status", fd, statusEl, "Reading settings and today.log on " + target, (res) => { if (res) renderStatus(res); });
+            });
+            document.getElementById("admission-clear-btn").addEventListener("click", () => {
+                results.style.display = "none"; previewCard.style.display = "none"; restartCard.style.display = "none";
+                statusEl.textContent = ""; preview = null;
+            });
+            document.getElementById("admission-defaults-btn").addEventListener("click", () => {
+                document.querySelectorAll(".admission-new").forEach(i => { i.value = "default"; });
+            });
+
+            function newValues() {
+                const values = {};
+                document.querySelectorAll(".admission-new").forEach(i => { const v = i.value.trim(); if (v) values[i.dataset.key] = v; });
+                return values;
+            }
+            document.getElementById("admission-preview-btn").addEventListener("click", () => {
+                const target = targetSel.value;
+                const values = newValues();
+                const st = document.getElementById("admission-preview-status");
+                if (!target) { window.alert("Pick a target."); return; }
+                if (!Object.keys(values).length) { st.textContent = "Enter at least one new value."; return; }
+                st.textContent = "Previewing…";
+                const fd = new URLSearchParams(); fd.set("csrf_token", CSRF_TOKEN); fd.set("target", target); fd.set("values", JSON.stringify(values));
+                fetch("/admission/preview", { method: "POST", body: fd }).then(r => r.json()).then(d => {
+                    if (d.error) { st.textContent = "Failed: " + d.error; return; }
+                    st.textContent = "";
+                    preview = { preview_id: d.preview_id, target: d.target };
+                    document.getElementById("admission-preview-target").textContent = d.target + (d.is_em ? " (EM)" : "");
+                    document.getElementById("admission-preview-body").textContent = d.steps.map(s => s.command).join("\n") + "\n\n# then, separately (step 3):\n" + d.restart_command;
+                    document.getElementById("admission-preview-note").textContent = d.note || "";
+                    document.getElementById("admission-apply-result").innerHTML = "";
+                    confirmBox.checked = false; applyBtn.disabled = true;
+                    previewCard.style.display = ""; restartCard.style.display = "none";
+                }).catch(err => { st.textContent = "Failed: " + err; });
+            });
+            confirmBox.addEventListener("change", () => { applyBtn.disabled = !confirmBox.checked; });
+
+            applyBtn.addEventListener("click", () => {
+                if (!preview) return;
+                const st = document.getElementById("admission-apply-status");
+                applyBtn.disabled = true;
+                const fd = new URLSearchParams(); fd.set("csrf_token", CSRF_TOKEN); fd.set("preview_id", preview.preview_id); fd.set("confirm", "yes");
+                start("/admission/apply", fd, st, "Applying on " + preview.target, (res, err) => {
+                    if (!res) { applyBtn.disabled = !confirmBox.checked; return; }
+                    const rows = (res.steps || []).map(s => "<tr" + (s.rc === 0 ? "" : " class=\"row-warn\"") + "><td><code>" + esc(s.command) + "</code></td><td>" + (s.ran ? "rc=" + s.rc : "did not run") + "</td><td><pre style=\"margin:0;white-space:pre-wrap\">" + esc(s.output) + "</pre></td></tr>").join("");
+                    const after = (res.after || []).map(a => esc(a.key) + " = " + esc(a.value) + (a.overridden ? "" : " (default)")).join("<br>");
+                    document.getElementById("admission-apply-result").innerHTML =
+                        "<p class=\"hint\">" + (res.ok ? "All commands ran (rc=0)." : "Some commands did not complete -- check the output.") + (res.incomplete ? " " + esc(res.incomplete) : "") + "</p>" +
+                        "<table><thead><tr><th>Command</th><th>Result</th><th>Output</th></tr></thead><tbody>" + rows + "</tbody></table>" +
+                        "<p class=\"hint\"><strong>Stored values now:</strong><br>" + after + "</p>" +
+                        "<p class=\"hint\"><strong>Not yet in effect</strong> -- the engine reads these at start. Restart the service (step 3) when you are ready.</p>";
+                    st.textContent = "Applied.";
+                    document.getElementById("admission-restart-target").textContent = preview.target;
+                    restartTyped.value = ""; restartBox.checked = false; restartBtn.disabled = true;
+                    restartCard.style.display = "";
+                });
+            });
+            function restartReady() { restartBtn.disabled = !(restartBox.checked && preview && restartTyped.value.trim() === preview.target); }
+            restartBox.addEventListener("change", restartReady);
+            restartTyped.addEventListener("input", restartReady);
+            restartBtn.addEventListener("click", () => {
+                if (!preview) return;
+                if (!window.confirm("Restart the CounterACT service on " + preview.target + " now?")) return;
+                const st = document.getElementById("admission-restart-status");
+                restartBtn.disabled = true;
+                const fd = new URLSearchParams(); fd.set("csrf_token", CSRF_TOKEN); fd.set("preview_id", preview.preview_id); fd.set("confirm", "yes"); fd.set("typed_target", restartTyped.value.trim());
+                start("/admission/restart", fd, st, "Restarting CounterACT on " + preview.target + " -- waiting for it to come back", (res, err) => {
+                    if (!res) { restartReady(); return; }
+                    st.textContent = (res.ok ? "Service is running again" : "Service did not report running") + " after " + res.seconds + "s: " + (res.status || "") + (res.incomplete ? " -- " + res.incomplete : "");
+                    preview = null;
+                });
+            });
+        })();
+
+        // RADIUS log analysis (2026-09-22): one runner for the Live Analyze box (a live target) and the
+        // Upload & Review box (bundle / file / paste). Background run, polled like every other analyze.
+        (function () {
+            function wire(prefix, buttons) {
+                const statusEl = document.getElementById(prefix + "-status");
+                const outputEl = document.getElementById(prefix + "-output");
+                const toolsEl = document.getElementById(prefix + "-tools");
+                const dl = document.getElementById(prefix + "-download");
+                let lastText = "", lastName = "radius-analysis.txt";
+                function setBusy(b) { buttons.forEach(id => { const el = document.getElementById(id); if (el) el.disabled = b; }); }
+                function poll(runId) {
+                    fetch("/api/analyze_run/" + runId)
+                        .then(r => r.json())
+                        .then(d => {
+                            if (d.error && !d.status) { statusEl.textContent = "error: " + d.error; setBusy(false); return; }
+                            if (d.status === "running") { statusEl.innerHTML = window.renderAnalyzeProgress(d); setTimeout(() => poll(runId), 3000); return; }
+                            setBusy(false);
+                            if (d.status === "failed") { statusEl.textContent = "Failed: " + (d.error || "unknown error"); return; }
+                            const n = (d.result && d.result.findings) ? d.result.findings.length : 0;
+                            const worst = n ? d.result.findings[0].severity.toUpperCase() : "";
+                            statusEl.textContent = "Done in " + Math.max(1, d.finished_at - d.started_at) + "s -- " +
+                                (n ? n + " finding(s), most serious: " + worst : "nothing wrong found") + ".";
+                            lastText = (d.result && d.result.output) || "(no output)";
+                            lastName = "radius-analysis-" + String(d.bundle || "log").replace(/[^A-Za-z0-9._-]+/g, "_").slice(0, 60) + ".txt";
+                            outputEl.textContent = lastText;
+                            outputEl.style.display = "block";
+                            toolsEl.style.display = "block";
+                        })
+                        .catch(() => { setTimeout(() => poll(runId), 3000); });
+                }
+                function start(url, body) {
+                    setBusy(true);
+                    outputEl.style.display = "none"; toolsEl.style.display = "none";
+                    statusEl.textContent = "Starting...";
+                    fetch(url, { method: "POST", body: body })
+                        .then(r => r.json())
+                        .then(d => { if (d.error) { setBusy(false); statusEl.textContent = "Failed to start: " + d.error; return; } poll(d.run_id); })
+                        .catch(err => { setBusy(false); statusEl.textContent = "Failed to start: " + err; });
+                }
+                dl.addEventListener("click", e => {
+                    e.preventDefault();
+                    const blob = new Blob([lastText], { type: "text/plain" });
+                    const a = document.createElement("a");
+                    a.href = URL.createObjectURL(blob); a.download = lastName;
+                    document.body.appendChild(a); a.click(); a.remove();
+                    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+                });
+                document.getElementById(prefix + "-clear").addEventListener("click", () => {
+                    outputEl.textContent = ""; outputEl.style.display = "none"; toolsEl.style.display = "none"; statusEl.textContent = "";
+                });
+                return start;
+            }
+
+            const liveStart = wire("radius-live", ["radius-live-btn"]);
+            document.getElementById("radius-live-btn").addEventListener("click", () => {
+                const target = document.getElementById("analyze-target-select").value;
+                if (!target) { window.alert("Pick a target in '1. Target' first."); return; }
+                const fd = new URLSearchParams();
+                fd.set("csrf_token", CSRF_TOKEN); fd.set("target", target);
+                fd.set("window", document.getElementById("radius-live-window").value);
+                liveStart("/radius/live", fd);
+            });
+
+            const reviewStart = wire("radius-review", ["radius-bundle-btn", "radius-file-btn", "radius-paste-btn"]);
+            document.getElementById("radius-bundle-btn").addEventListener("click", () => {
+                const path = document.getElementById("radius-bundle-select").value;
+                if (!path) { window.alert("Upload a bundle first."); return; }
+                const fd = new URLSearchParams(); fd.set("csrf_token", CSRF_TOKEN); fd.set("path", path);
+                reviewStart("/radius/bundle", fd);
+            });
+            document.getElementById("radius-file-btn").addEventListener("click", () => {
+                const f = document.getElementById("radius-file-input").files[0];
+                if (!f) { window.alert("Choose a log file first."); return; }
+                const fd = new FormData(); fd.set("csrf_token", CSRF_TOKEN); fd.set("logfile", f);
+                reviewStart("/radius/file", fd);
+            });
+            document.getElementById("radius-paste-btn").addEventListener("click", () => {
+                const text = document.getElementById("radius-paste").value;
+                if (!text.trim()) { window.alert("Paste some radiusd.log lines first."); return; }
+                const fd = new FormData(); fd.set("csrf_token", CSRF_TOKEN); fd.set("text", text);
+                reviewStart("/radius/file", fd);
+            });
+        })();
 
         // Roaming graph + table renderer (shared by the IP Lookup section and the Upload & Review
         // view). data = {nodes:[{kind,label,sub,count,seconds,first_display,last_display,still_connected}],
@@ -2618,6 +3359,12 @@
                 const keep = roamSel.value;
                 roamSel.innerHTML = bundles.map(b => "<option value=\"" + esc(b.path) + "\"" + (b.path === keep ? " selected" : "") + ">" + esc(b.name) + "</option>").join("");
                 document.getElementById("upload-roaming-card").style.display = bundles.length ? "" : "none";
+                const radSel = document.getElementById("radius-bundle-select");
+                if (radSel) {
+                    const keepR = radSel.value;
+                    radSel.innerHTML = bundles.map(b => "<option value=\"" + esc(b.path) + "\"" + (b.path === keepR ? " selected" : "") + ">" + esc(b.name) + "</option>").join("");
+                    document.getElementById("radius-bundle-row").style.display = bundles.length ? "" : "none";
+                }
             }
 
             function refreshList() {

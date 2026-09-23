@@ -61,6 +61,9 @@ BUNDLED_HAT_SCRIPT="${DIR}/high-admission-trace.sh"
 # EM's own python3. Same arrangement: redeploying the file is the upgrade.
 CORRELATE_SCRIPT="/root/scripts/webapp-query/bundle-correlate.py"
 BUNDLED_CORRELATE_SCRIPT="${DIR}/bundle-correlate.py"
+# radius-analyze.py (RADIUS Log Analysis on the Live Analyze and Upload & Review tabs)
+RADIUS_SCRIPT="/root/scripts/webapp-query/radius-analyze.py"
+BUNDLED_RADIUS_SCRIPT="${DIR}/radius-analyze.py"
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "Must be run as root." >&2
@@ -114,9 +117,12 @@ cp "$BUNDLED_HAT_SCRIPT" "$HAT_SCRIPT"
 chmod 755 "$HAT_SCRIPT"
 cp "$BUNDLED_CORRELATE_SCRIPT" "$CORRELATE_SCRIPT"
 chmod 755 "$CORRELATE_SCRIPT"
+cp "$BUNDLED_RADIUS_SCRIPT" "$RADIUS_SCRIPT"
+chmod 755 "$RADIUS_SCRIPT"
 echo "Installed webapp-query.py at $WEBAPP_QUERY_WRAPPER"
 echo "Installed high-admission-trace.sh at $HAT_SCRIPT"
 echo "Installed bundle-correlate.py at $CORRELATE_SCRIPT"
+echo "Installed radius-analyze.py at $RADIUS_SCRIPT"
 
 mkdir -p "$KEY_DIR"
 if [ ! -f "$KEY_FILE" ]; then

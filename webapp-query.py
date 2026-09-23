@@ -276,6 +276,7 @@ client-activity-log.sh and documented in Host Connection Detail
 Analysis.
 """
 import concurrent.futures
+import hashlib
 import html
 import json
 import os
@@ -4039,6 +4040,75 @@ def do_bundleroam(path, key):
     print(json.dumps(result))
 
 
+RADIUS_SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "radius-analyze.py")
+RADIUS_MAX_UPLOAD = 200 * 1024 * 1024
+
+
+def _read_radius_script():
+    if not os.path.isfile(RADIUS_SCRIPT_PATH):
+        fail(f"{RADIUS_SCRIPT_PATH} not found on this EM -- redeploy this app to install it.")
+    with open(RADIUS_SCRIPT_PATH) as f:
+        return f.read()
+
+
+def _emit_radius_result(out, err, rc, what):
+    if rc != 0:
+        fail((err or out or f"radius-analyze exited {rc}").strip()[-3000:])
+    try:
+        result = json.loads(out)
+    except json.JSONDecodeError:
+        fail(f"radius-analyze returned something unexpected ({what}): {out[:300]}")
+    print(json.dumps(result))
+
+
+def do_radiuslive(target, start_epoch, end_epoch):
+    """
+    RADIUS log analysis of a live box (David, 2026-09-22: "bake in a Radius log
+    analysis") -- radius-analyze.py reads that box's own
+    /usr/local/forescout/log/plugin/dot1x/radiusd*.log for the window and returns
+    ranked findings. The script runs WHERE THE LOG IS: on the EM as a file, on an
+    appliance by piping its text over stdin (`python3 - --live ...`, the same
+    trick high-admission-trace.sh uses with `bash -s`) -- a live radiusd.log is
+    tens of MB and stays put; only the report comes back.
+    """
+    mode, appliance = resolve_target(target)
+    if mode is None:
+        fail(f"'{target}' is not a known EM or managed appliance")
+    if not (isinstance(start_epoch, int) and isinstance(end_epoch, int) and 0 < start_epoch < end_epoch):
+        fail("invalid time window")
+    args = ["--live", "--json", "--since", str(start_epoch), "--until", str(end_epoch)]
+    if mode == "em":
+        out, err, rc = run([sys.executable, RADIUS_SCRIPT_PATH, *args], timeout=900)
+    else:
+        remote_cmd = "python3 - " + " ".join(shlex.quote(a) for a in args)
+        out, err, rc = ssh_appliance(appliance, remote_cmd, timeout=900, input=_read_radius_script())
+    _emit_radius_result(out, err, rc, target)
+
+
+def do_radiusbundle(path):
+    """RADIUS log analysis of a tech-support bundle on this EM (radius-analyze.py --bundle: streamed, nothing unpacked)."""
+    if not _is_safe_analyze_bundle_path(path):
+        fail(f"'{path}' is not a known tech-support bundle path.")
+    if not os.path.isfile(path):
+        fail(f"'{path}' does not exist on this EM.")
+    out, err, rc = run([sys.executable, RADIUS_SCRIPT_PATH, "--bundle", path, "--json"], timeout=1800)
+    _emit_radius_result(out, err, rc, os.path.basename(path))
+
+
+def do_radiusfile():
+    """RADIUS log analysis of a log a user uploaded or pasted -- the text arrives on this
+    verb's stdin (no size-limited argument, no file left on the EM) and goes straight
+    to radius-analyze.py --file -."""
+    data = sys.stdin.buffer.read(RADIUS_MAX_UPLOAD + 1)
+    if len(data) > RADIUS_MAX_UPLOAD:
+        fail(f"log is larger than {RADIUS_MAX_UPLOAD // (1024 * 1024)} MB -- analyse it from a tech-support bundle or live instead")
+    if not data.strip():
+        fail("the log is empty")
+    out, err, rc = run([sys.executable, RADIUS_SCRIPT_PATH, "--file", "-", "--json"], timeout=900,
+                       input=data.decode("utf-8", "replace"))
+    _emit_radius_result(out, err, rc, "uploaded log")
+
+
 PLUGIN_NAME_ONLY_RE = r"[a-z][a-z0-9_]{1,40}"
 
 
@@ -4244,6 +4314,571 @@ def do_run_show_errors(target, duration):
     }))
 
 
+# ---------------------------------------------------------------------
+# Clean Up tab (David, 2026-09-21) -- frees disk space on the EM or a
+# managed appliance ahead of an upgrade, from David's own clean-up
+# command list (vault note "Clean Up"). Three verbs:
+#   cleanupscan    read-only: what each item would remove and how big
+#   cleanuppreview read-only: the exact commands a run would execute,
+#                  plus a digest of them
+#   cleanuprun     executes -- only when handed the digest of a preview
+#                  whose commands match what it is about to run, so
+#                  what the user was shown is what runs (David: "show
+#                  which commands will be run, and get a go ahead").
+# The browser only ever sends item ids (and, for the pick-your-own
+# folders, file paths that are re-validated here) -- every command
+# string comes from CLEANUP_ITEMS below, never from the request.
+# Appliances are reached over ssh_appliance like every other verb, not
+# `fstool oneach` (David's call).
+#
+# Deliberate differences from the hand-run commands in the note:
+#  - globs are quoted and file items carry -type f;
+#  - anything under /tmp/hat-* (this app's own uploaded/unpacked
+#    bundles) and log/shared/case (this app's own case bundles -- on
+#    this platform /shared/shared IS /usr/local/forescout/log/shared,
+#    confirmed live) is left alone;
+#  - the whole-filesystem finds skip /proc, /sys, /dev, /run and
+#    /var/lib/docker;
+#  - logArchive and logs/prev are emptied (-mindepth 1), the folder
+#    itself stays;
+#  - /tmp/snapshot* and /tmp/tomcat* keep find's own -delete on
+#    purpose: it cannot remove a non-empty directory, which is what
+#    protects the running tomcat's live work directory ("Directory not
+#    empty" is expected there);
+#  - a run is refused while an `fstool tech-support` is building on the
+#    box (its snapshot lives in /tmp/snapshot*);
+#  - fstool data_reset / db rescue / truncate eval_status are NOT here
+#    at all -- reference text in the UI only.
+# ---------------------------------------------------------------------
+CLEANUP_MARK = "##CLEANUP##"
+CLEANUP_ROOT_EXCLUDES = ("! -path '/proc/*' ! -path '/sys/*' ! -path '/dev/*' ! -path '/run/*' "
+                         "! -path '/var/lib/docker/*'")
+CLEANUP_SHARED_LOG = "/usr/local/forescout/log/shared/"
+CLEANUP_BIG_FILE = "+500M"
+CLEANUP_MAX_LISTED = 200        # files listed per item (biggest first); count/total always cover everything
+CLEANUP_MAX_SELECTED = 500
+CLEANUP_IDS_RE = r"[a-z_]{2,30}(?:,[a-z_]{2,30})*"
+CLEANUP_DIGEST_RE = r"[0-9a-f]{64}"
+
+
+def _cu_find(where, match, extra=""):
+    """A clean-up item whose scan and delete are the same `find`, differing only in the action."""
+    base = f"find {where} {match}{(' ' + extra) if extra else ''}"
+    return {"scan": base + " -printf '%s\\t%p\\n'", "delete": base + " -delete"}
+
+
+def _cu_root(ext):
+    item = _cu_find("/", f"-type f -name '*.{ext}'", CLEANUP_ROOT_EXCLUDES)
+    item["root_ext"] = "." + ext     # scanned in the one shared whole-filesystem pass, not its own
+    return item
+
+
+CLEANUP_ITEMS = [
+    dict(id="tmp_snapshot", group="first", label="/tmp snapshot files (snapshot*)",
+         note="\"Directory not empty\" errors are expected and harmless.",
+         **_cu_find("/tmp/", "-name 'snapshot*'", "! -path '/tmp/hat-*'")),
+    dict(id="tmp_tomcat", group="first", label="/tmp temporary tomcat files (tomcat*)",
+         note="\"Directory not empty\" errors are expected and harmless -- the running tomcat's own folder stays.",
+         **_cu_find("/tmp/", "-name 'tomcat*'", "! -path '/tmp/hat-*'")),
+    dict(id="tmp_archives", group="first", label="/tmp zipped archives (*.tar.gz, *.tgz) -- typically installers",
+         note="This app's own uploaded bundles (/tmp/hat-*) are left alone.",
+         **_cu_find("/tmp/", "-type f \\( -name '*.tar.gz' -o -name '*.tgz' \\)", "! -path '/tmp/hat-*'")),
+    dict(id="fsb", group="first", label="Full System Backup files (*.fsb)",
+         note="Normally only on the EM; the kept copies live on the jump servers.", **_cu_root("fsb")),
+    dict(id="rollback", group="first", label="Rollback files (/usr/src/rollback/)", note="",
+         scan="du -sb /usr/src/rollback/* 2>/dev/null", delete="rm -fr /usr/src/rollback/*"),
+    dict(id="shared_archives", group="first", label="Installer archives in log/shared (*.tar.gz, *.tgz)",
+         note="This app's own case bundles (log/shared/case) are left alone -- delete those from the Tech Support tab.",
+         **_cu_find(CLEANUP_SHARED_LOG, "-type f \\( -name '*.tar.gz' -o -name '*.tgz' \\)",
+                    f"! -path '{CLEANUP_SHARED_LOG}case/*'")),
+    dict(id="tomcat_txt", group="first", label="Tomcat log text files (log/tomcat/*.txt)", note="",
+         **_cu_find("/usr/local/forescout/log/tomcat/", "-type f -name '*.txt'")),
+    dict(id="tomcat_archive", group="first", label="Tomcat log archives (log/tomcat/log/logArchive)", note="",
+         **_cu_find("/usr/local/forescout/log/tomcat/log/logArchive/", "-mindepth 1")),
+    dict(id="apache_prev", group="first", label="Apache previous logs (/usr/local/apache2/logs/prev)", note="",
+         **_cu_find("/usr/local/apache2/logs/prev/", "-mindepth 1")),
+
+    dict(id="fpi", group="second", label="Module/plugin installer files (*.fpi)",
+         note="Keep any that the upgrade itself needs.", **_cu_root("fpi")),
+    dict(id="fsp", group="second", label="Upgrade installer files (*.fsp)",
+         note="Keep the one you are about to upgrade with.", **_cu_root("fsp")),
+    dict(id="fslog_txt", group="second", label="/fslog/*.txt", note="Some may be useful -- review first.",
+         **_cu_find("/fslog/", "-maxdepth 1 -type f -name '*.txt'")),
+    dict(id="fslog_log", group="second", label="/fslog/*.log", note="Some may be useful -- review first.",
+         **_cu_find("/fslog/", "-maxdepth 1 -type f -name '*.log'")),
+    dict(id="fslog_engine", group="second", label="/fslog/engine.log.*", note="",
+         **_cu_find("/fslog/", "-maxdepth 1 -type f -name 'engine.log.*'")),
+    dict(id="fslog_webreports", group="second", label="/fslog/webreports_nodeid.*", note="",
+         **_cu_find("/fslog/", "-maxdepth 1 -type f -name 'webreports_nodeid.*'")),
+    dict(id="fslog_watchdog", group="second", label="/fslog/watch_dog.log.*", note="",
+         **_cu_find("/fslog/", "-maxdepth 1 -type f -name 'watch_dog.log.*'")),
+    dict(id="shared_txt", group="second", label="Shared system log text files (log/shared/*.txt)",
+         note="Some may be useful -- review first.",
+         **_cu_find(CLEANUP_SHARED_LOG, "-type f -name '*.txt'", f"! -path '{CLEANUP_SHARED_LOG}case/*'")),
+    dict(id="source_log", group="second", label="Database table source_log (host / policy logging)",
+         note="Empties the whole table. The service keeps running.",
+         scan="fstool db diskspace 2>/dev/null | grep public.source_log",
+         delete="psql -c 'truncate source_log'", table=True),
+
+    dict(id="sel_shared", group="select", label="/shared/ -- pick files", select_dir="/shared",
+         note="Engineers keep scripts and upgrade files here -- only tick what you are certain about."),
+    dict(id="sel_sharedshared", group="select", label="/shared/shared/ -- pick files", select_dir="/shared/shared",
+         note="Same as /shared/ -- tech-support .tgz bundles here are normally safe to delete."),
+    dict(id="sel_tmp", group="select", label="/tmp/ -- pick files", select_dir="/tmp",
+         note="Last resort -- take guidance from Forescout support before removing anything here."),
+]
+CLEANUP_BY_ID = {i["id"]: i for i in CLEANUP_ITEMS}
+
+
+def _cu_exec(mode, appliance, script, timeout, input=None):
+    return (run(["bash", "-c", script], timeout=timeout, input=input) if mode == "em"
+            else ssh_appliance(appliance, script, timeout=timeout, input=input))
+
+
+def _cu_sections(text):
+    """{name: body} for a script whose parts are each introduced by an `echo ##CLEANUP##<name>##` line."""
+    parts = re.split(rf"^{re.escape(CLEANUP_MARK)}([A-Za-z0-9_:\-]+)##\n?", text, flags=re.M)
+    return dict(zip(parts[1::2], parts[2::2]))
+
+
+def _cu_size_lines(body):
+    rows = []
+    for line in body.splitlines():
+        size, sep, path = line.partition("\t")
+        if sep and size.isdigit() and path:
+            rows.append((int(size), path))
+    return rows
+
+
+def _cu_summary(rows):
+    rows = sorted(rows, reverse=True)
+    return {
+        "count": len(rows), "bytes": sum(s for s, _ in rows),
+        "files": [{"path": p, "bytes": s} for s, p in rows[:CLEANUP_MAX_LISTED]],
+    }
+
+
+CLEANUP_DF = "df -hP -x tmpfs -x devtmpfs -x efivarfs -x overlay 2>/dev/null"
+# "fstool ... tech-support", not bare "tech-support": this app's own container is named
+# forescout-tech-support-collector, and a `docker exec` into it matched the bare word (seen live).
+CLEANUP_BUSY = "pgrep -af '[f]stool.*tech-support' 2>/dev/null"
+
+
+def do_cleanup_scan(target):
+    """Read-only. One round trip to the box: free space, whether a tech-support build is running,
+    what every clean-up item would remove (count, total, biggest files), the pick-your-own folders'
+    files, source_log's size, files over 500MB and the ten biggest folders under /usr."""
+    mode, appliance = resolve_target(target)
+    if mode is None:
+        fail(f"'{target}' is not a known EM or managed appliance")
+
+    lines = [f"echo '{CLEANUP_MARK}df##'; {CLEANUP_DF}", f"echo '{CLEANUP_MARK}busy##'; {CLEANUP_BUSY}"]
+    root_names = []
+    for item in CLEANUP_ITEMS:
+        if item.get("root_ext"):
+            root_names.append(f"-name '*{item['root_ext']}'")
+        elif item.get("select_dir"):
+            lines.append(f"echo '{CLEANUP_MARK}item:{item['id']}##'; "
+                         f"find {item['select_dir']}/ -maxdepth 1 -type f -printf '%s\\t%p\\n' 2>/dev/null")
+        else:
+            lines.append(f"echo '{CLEANUP_MARK}item:{item['id']}##'; {item['scan']} 2>/dev/null")
+    lines.append(f"echo '{CLEANUP_MARK}root##'; find / -type f \\( {' -o '.join(root_names)} -o "
+                 f"-size {CLEANUP_BIG_FILE} \\) {CLEANUP_ROOT_EXCLUDES} -printf '%D:%i\\t%s\\t%p\\n' 2>/dev/null")
+    lines.append(f"echo '{CLEANUP_MARK}du##'; du -xh /usr/* 2>/dev/null | sort -hr | head -10")
+    out, err, rc = _cu_exec(mode, appliance, "\n".join(lines), timeout=900)
+    sections = _cu_sections(out)
+    if "df" not in sections:
+        fail(f"Scan of {target} returned nothing usable ({(err or '').strip()[:300] or 'rc=' + str(rc)})")
+
+    # The same file shows up once per bind mount (confirmed live: one .fsb under /fslog, /shared/log
+    # AND /usr/local/forescout/log) -- counted once, by device:inode, or the totals come out tripled.
+    seen, root_body = set(), []
+    for line in sections.get("root", "").splitlines():
+        inode, sep, rest = line.partition("\t")
+        if sep and inode not in seen:
+            seen.add(inode)
+            root_body.append(rest)
+    root_rows = _cu_size_lines("\n".join(root_body))
+    items = []
+    for item in CLEANUP_ITEMS:
+        entry = {"id": item["id"], "group": item["group"], "label": item["label"], "note": item.get("note", ""),
+                 "selectable": bool(item.get("select_dir")), "table": bool(item.get("table"))}
+        if item.get("table"):
+            m = re.search(r"\|\s*(.+?)\s*$", sections.get(f"item:{item['id']}", "").strip())
+            entry.update(count=1 if m else 0, bytes=None, size_text=m.group(1) if m else None, files=[])
+        elif item.get("root_ext"):
+            entry.update(_cu_summary([r for r in root_rows if r[1].endswith(item["root_ext"])]))
+        else:
+            entry.update(_cu_summary(_cu_size_lines(sections.get(f"item:{item['id']}", ""))))
+        items.append(entry)
+
+    big = sorted((r for r in root_rows if r[0] >= 500 * 1024 * 1024), reverse=True)[:50]
+    print(json.dumps({
+        "target": target, "is_em": mode == "em", "df": sections["df"].rstrip(),
+        "busy": [l for l in sections.get("busy", "").splitlines() if l.strip()],
+        "items": items, "big_files": [{"path": p, "bytes": s} for s, p in big],
+        "top_usr_dirs": sections.get("du", "").rstrip(),
+    }))
+
+
+def _cu_read_selection():
+    """{item_id: [path, ...]} from stdin JSON -- the pick-your-own files. Every path is re-checked here:
+    a plain name directly inside that item's own folder, no control characters, nothing nested."""
+    raw = sys.stdin.read(1_000_000) if not sys.stdin.isatty() else ""
+    if not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        fail("Selected-files list is not valid JSON.")
+    selection = {}
+    for item_id, paths in (data.get("files") or {}).items():
+        item = CLEANUP_BY_ID.get(item_id)
+        if not item or not item.get("select_dir") or not isinstance(paths, list):
+            fail(f"'{item_id}' does not take a file selection.")
+        if len(paths) > CLEANUP_MAX_SELECTED:
+            fail(f"Too many files selected for {item['label']} (max {CLEANUP_MAX_SELECTED} per run).")
+        prefix = item["select_dir"] + "/"
+        for p in paths:
+            name = p[len(prefix):] if isinstance(p, str) and p.startswith(prefix) else ""
+            if (not name or "/" in name or name in (".", "..") or len(p) > 400
+                    or any(ord(c) < 32 or ord(c) == 127 for c in p)):
+                fail(f"'{p}' is not a file directly inside {prefix}")
+        selection[item_id] = sorted(set(paths))
+    return selection
+
+
+def _cu_steps(ids_csv, selection):
+    """The ordered commands a run executes, built only from CLEANUP_ITEMS (+ the validated selection).
+    cleanuppreview and cleanuprun both call this, so the two can only differ if the request differs --
+    and the digest catches that."""
+    steps = []
+    for item_id in ids_csv.split(","):
+        item = CLEANUP_BY_ID.get(item_id)
+        if item is None:
+            fail(f"'{item_id}' is not a clean-up item.")
+        if item.get("select_dir"):
+            for p in selection.get(item_id, []):
+                q = shlex.quote(p)
+                steps.append({"id": item_id, "label": item["label"], "note": "",
+                              "command": f"[ -f {q} -a ! -L {q} ] && rm -f -- {q}"})
+        else:
+            steps.append({"id": item_id, "label": item["label"], "note": item.get("note", ""),
+                          "command": item["delete"]})
+    if not steps:
+        fail("Nothing selected to clean up.")
+    return steps
+
+
+def _cu_digest(target, steps):
+    return hashlib.sha256("\n".join([target] + [s["command"] for s in steps]).encode()).hexdigest()
+
+
+CLEANUP_AUDIT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cleanup-audit.log")
+
+
+def _cu_audit(line):
+    """Every clean-up run, with each command and its exit code, kept next to this script on the EM."""
+    try:
+        with open(CLEANUP_AUDIT_PATH, "a") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()) + " " + line + "\n")
+    except OSError:
+        pass
+
+
+def do_cleanup_preview(target, ids_csv):
+    mode, appliance = resolve_target(target)
+    if mode is None:
+        fail(f"'{target}' is not a known EM or managed appliance")
+    steps = _cu_steps(ids_csv, _cu_read_selection())
+    print(json.dumps({"target": target, "is_em": mode == "em", "steps": steps,
+                      "digest": _cu_digest(target, steps)}))
+
+
+def do_cleanup_run(target, ids_csv, digest):
+    mode, appliance = resolve_target(target)
+    if mode is None:
+        fail(f"'{target}' is not a known EM or managed appliance")
+    steps = _cu_steps(ids_csv, _cu_read_selection())
+    if _cu_digest(target, steps) != digest:
+        fail("Refused: these are not the commands that were previewed. Preview again, then run.")
+
+    bout, berr, brc = _cu_exec(mode, appliance, CLEANUP_BUSY, timeout=30)
+    if bout.strip():
+        fail(f"Refused: an fstool tech-support build is running on {target} (its snapshot lives in /tmp). "
+             "Run the clean up once it has finished.")
+
+    lines = [f"echo '{CLEANUP_MARK}before##'; {CLEANUP_DF}"]
+    for n, s in enumerate(steps):
+        lines.append(f"echo '{CLEANUP_MARK}step:{n}##'; ( {s['command']} ) 2>&1; r=$?; echo; "
+                     f"echo \"{CLEANUP_MARK}rc:{n}##$r\"")
+    lines.append(f"sync; echo '{CLEANUP_MARK}after##'; {CLEANUP_DF}")
+    t0 = time.time()
+    out, err, rc = _cu_exec(mode, appliance, "\n".join(lines), timeout=1800)
+    sections = _cu_sections(out)
+    results = []
+    for n, s in enumerate(steps):
+        ran = f"step:{n}" in sections
+        step_rc = (sections.get(f"rc:{n}", "").strip() or None) if ran else None
+        results.append({**s, "ran": ran, "rc": int(step_rc) if step_rc and step_rc.lstrip("-").isdigit() else None,
+                        "output": sections.get(f"step:{n}", "").strip()[-4000:]})
+    _cu_audit(f"cleanup on {target}: {len(steps)} command(s), {int(time.time() - t0)}s -- "
+                  + "; ".join(f"{r['command']} => rc={r['rc']}" for r in results))
+    print(json.dumps({
+        "target": target, "ok": all(r["ran"] for r in results), "steps": results,
+        "df_before": sections.get("before", "").rstrip(), "df_after": sections.get("after", "").rstrip(),
+        # NOT named "error": forescout_client._run_verb treats any reply carrying an "error" key as a
+        # failed call -- a null one turned two real, successful runs into a red "None" box (2026-09-21).
+        "incomplete": None if "after" in sections else ((err or "").strip()[:300] or "the run did not finish"),
+    }))
+
+
+
+# ---------------------------------------------------------------------------
+# Admission Rate tab (David, 2026-09-23): eyeSight's Admission TAP control --
+# the engine-side throttle that stops re-checking a host's properties once it
+# has seen too many admission events (see the vault's "Admission TAP" write-
+# up). Properties and defaults are exactly what forescout.jar's
+# forescout.common.networkpolicy.engine.FSAdmTap reads at class init
+# (verified from the bytecode 2026-09-23 on the lab EM):
+#   fs.adm.tap.enabled                 true         master switch
+#   fs.adm.activity.thresh.counts      100,1000     appliance-wide admissions ...
+#   fs.adm.activity.thresh.sec.periods 3600,36000   ... over these windows -> adm.tap.active
+#   fs.adm.tap.count                   5            per host: this many of one type ...
+#   fs.adm.tap.period.sec              36000        ... in this window -> that type ignored for the host
+#   fs.adm.tap.purge.period.sec        3600         per-host history purge period
+# They are static finals: `fstool set_property` stores a value (the supported
+# path -- local.properties, pushed to the live engine when it is up) but the
+# engine only reads it at start, so a change needs `fstool service restart` on
+# that box. Status comes from stats/today.log: adm.tap.active once a minute and
+# adm.tap.accept.<type> / adm.tap.discard.<type> counters -- discard is exactly
+# "admissions this appliance ignored". Which HOSTS are currently throttled lives
+# only in engine memory (no CLI exposes it), so that is not claimed here.
+#
+#   admtapstatus  <target>            read-only: settings + today.log stats
+#   admtappreview <target>            values on stdin -> exact commands + digest
+#   admtapapply   <target> <digest>   values on stdin, refused unless they hash to the preview
+#   admtaprestart <target> <digest>   fstool service restart, refused unless the digest matches
+# ---------------------------------------------------------------------------
+ADMTAP_PROPS = [
+    {"key": "fs.adm.tap.enabled", "default": "true", "kind": "bool", "label": "Admission TAP control enabled",
+     "help": "Master switch for the whole mechanism. Off = every admission event triggers the normal property recheck, however often it happens."},
+    {"key": "fs.adm.activity.thresh.counts", "default": "100,1000", "kind": "intlist", "label": "Appliance-wide admission thresholds (counts)",
+     "help": "The appliance enters the TAP control state when it has seen at least this many admission events, across ALL endpoints, within the matching window below. Two values, checked independently (default 100 and 1,000)."},
+    {"key": "fs.adm.activity.thresh.sec.periods", "default": "3600,36000", "kind": "intlist", "label": "Appliance-wide windows (seconds)",
+     "help": "The windows for the counts above, in seconds (default 3600 = 1 h and 36000 = 10 h). Same number of values as the counts."},
+    {"key": "fs.adm.tap.count", "default": "5", "kind": "int", "label": "Per-host repeated admissions",
+     "help": "While TAP control is active: once ONE host has this many admission events of the SAME type (offline->online, new IP, wireless, ...) inside the per-host window, further events of that type are ignored for it -- its actively-resolved properties (SNMP, WMI, ...) stop being rechecked. Default 5."},
+    {"key": "fs.adm.tap.period.sec", "default": "36000", "kind": "int", "label": "Per-host window (seconds)",
+     "help": "The window for the per-host count, in seconds (default 36000 = 10 h)."},
+    {"key": "fs.adm.tap.purge.period.sec", "default": "3600", "kind": "int", "label": "Per-host history purge period (seconds)",
+     "help": "How often the engine drops expired per-host admission history (default 3600 = 1 h). Rarely worth changing."},
+]
+ADMTAP_BY_KEY = {p["key"]: p for p in ADMTAP_PROPS}
+ADMTAP_KEY_RE = r"fs\.adm\.(?:tap\.(?:enabled|count|period\.sec|purge\.period\.sec)|activity\.thresh\.(?:counts|sec\.periods))"
+ADMTAP_VALUE_RE = re.compile(r"^(?:true|false|\d{1,9}(?:,\d{1,9}){0,7})$")
+ADMTAP_DIGEST_RE = r"[0-9a-f]{64}"
+ADMTAP_MARK = "##ADMTAP##"
+ADMTAP_STATS = "/usr/local/forescout/stats/today.log"
+ADMTAP_AUDIT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admission-rate-audit.log")
+
+
+def _admtap_audit(line):
+    try:
+        with open(ADMTAP_AUDIT_PATH, "a") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()) + " " + line + "\n")
+    except OSError:
+        pass
+
+
+def _admtap_resolve(target):
+    mode, appliance = resolve_target(target)
+    if mode is None:
+        fail(f"'{target}' is not a known EM or managed appliance")
+    return mode, appliance
+
+
+def do_admtap_status(target):
+    """Read-only: the six properties (fstool get_property; blank = default) and the day's
+    adm.tap.* stats from the box's own today.log."""
+    mode, appliance = _admtap_resolve(target)
+    keys = " ".join(p["key"] for p in ADMTAP_PROPS)
+    script = (f"echo '{ADMTAP_MARK}props##'; fstool get_property {keys} 2>/dev/null; "
+              f"echo '{ADMTAP_MARK}stats##'; grep -E ' adm\\.tap\\.' {ADMTAP_STATS} 2>/dev/null; "
+              f"echo '{ADMTAP_MARK}uptime##'; fstool service status 2>/dev/null | head -3; "
+              f"echo '{ADMTAP_MARK}now##'; date +%s")
+    out, err, rc = _cu_exec(mode, appliance, script, timeout=120)
+    sections = _cu_sections(out.replace(ADMTAP_MARK, CLEANUP_MARK))
+    if "props" not in sections:
+        fail(f"{target} returned nothing usable ({(err or '').strip()[:300] or 'rc=' + str(rc)})")
+    current = {}
+    for line in sections["props"].splitlines():
+        k, sep, v = line.partition("=")
+        if sep and k.strip() in ADMTAP_BY_KEY:
+            current[k.strip()] = v.strip()
+    settings = []
+    for p in ADMTAP_PROPS:
+        v = current.get(p["key"], "")
+        settings.append({**p, "value": v or p["default"], "overridden": bool(v), "raw": v})
+    # today.log lines: "p <epoch> cu <pid> adm.tap.<key> <value>" (a one-letter record marker first --
+    # confirmed on the lab EM 2026-09-23; `tss print` hides it, the raw file has it)
+    active_minutes, active_true, hourly = 0, 0, {}
+    accept, discard, purge = {}, {}, {}
+    last_active, last_ts = None, None
+    for line in sections.get("stats", "").splitlines():
+        parts = line.split()
+        idx = next((i for i, tok in enumerate(parts) if tok.startswith("adm.tap.")), None)
+        if idx is None or idx < 1 or idx + 1 >= len(parts):
+            continue
+        epoch = next((tok for tok in parts[:idx] if tok.isdigit() and len(tok) >= 9), None)
+        if epoch is None:
+            continue
+        ts, key, val = int(epoch), parts[idx], parts[idx + 1]
+        hour = ts - ts % 3600
+        h = hourly.setdefault(hour, {"active": 0, "minutes": 0, "accept": 0, "discard": 0})
+        if key == "adm.tap.active":
+            active_minutes += 1
+            h["minutes"] += 1
+            if val == "true":
+                active_true += 1
+                h["active"] += 1
+            last_active, last_ts = (val == "true"), ts
+        elif key.startswith("adm.tap.accept.") and val.isdigit():
+            accept[key[15:]] = accept.get(key[15:], 0) + int(val)
+            h["accept"] += int(val)
+        elif key.startswith("adm.tap.discard.") and val.isdigit():
+            discard[key[16:]] = discard.get(key[16:], 0) + int(val)
+            h["discard"] += int(val)
+        elif key.startswith("adm.tap.purge.") and val.isdigit():
+            purge[key[14:]] = purge.get(key[14:], 0) + int(val)
+    print(json.dumps({
+        "target": target, "is_em": mode == "em", "settings": settings,
+        "now": int((sections.get("now", "").strip() or "0") or 0),
+        "service": sections.get("uptime", "").strip()[:300],
+        "tap": {"active_now": last_active, "active_at": last_ts, "minutes_sampled": active_minutes, "minutes_active": active_true,
+                "accept": accept, "discard": discard, "purge": purge,
+                "hourly": [{"hour": h, **v} for h, v in sorted(hourly.items())]},
+    }))
+
+
+def _admtap_read_values():
+    """{key: value} from stdin JSON; every key must be one of the six, every value the right shape."""
+    raw = sys.stdin.read(100_000) if not sys.stdin.isatty() else ""
+    try:
+        data = json.loads(raw or "{}")
+    except ValueError:
+        fail("Settings are not valid JSON.")
+    values = {}
+    for k, v in (data.get("values") or {}).items():
+        p = ADMTAP_BY_KEY.get(k)
+        if p is None:
+            fail(f"'{k}' is not an Admission TAP setting.")
+        v = str(v).strip().replace(" ", "")
+        if v == "" or v == "default":
+            values[k] = None  # = remove the override
+            continue
+        if not ADMTAP_VALUE_RE.match(v):
+            fail(f"'{k}': '{v}' is not a valid value.")
+        if p["kind"] == "bool" and v not in ("true", "false"):
+            fail(f"'{k}' must be true or false.")
+        if p["kind"] == "int" and not (v.isdigit() and 1 <= int(v) <= 999_999_999):
+            fail(f"'{k}' must be a whole number of at least 1.")
+        if p["kind"] == "intlist" and not all(x.isdigit() and int(x) >= 1 for x in v.split(",")):
+            fail(f"'{k}' must be whole numbers of at least 1, comma-separated.")
+        values[k] = v
+    counts = values.get("fs.adm.activity.thresh.counts")
+    periods = values.get("fs.adm.activity.thresh.sec.periods")
+    if counts and periods and len(counts.split(",")) != len(periods.split(",")):
+        fail("The appliance-wide counts and windows must have the same number of values.")
+    return values
+
+
+def _admtap_steps(values):
+    steps = []
+    for k, v in values.items():
+        if v is None:
+            steps.append({"key": k, "value": None, "command": f"fstool remove_property {k}"})
+        else:
+            steps.append({"key": k, "value": v, "command": f"fstool set_property {k} {v}"})
+    return steps
+
+
+def _admtap_digest(target, steps):
+    return hashlib.sha256("\n".join([target] + [s["command"] for s in steps]).encode()).hexdigest()
+
+
+def do_admtap_preview(target):
+    mode, appliance = _admtap_resolve(target)
+    steps = _admtap_steps(_admtap_read_values())
+    if not steps:
+        fail("Nothing to change.")
+    print(json.dumps({"target": target, "is_em": mode == "em", "steps": steps, "digest": _admtap_digest(target, steps),
+                      "restart_command": "fstool service restart",
+                      "note": "The engine reads these once at start: nothing changes until the CounterACT service on "
+                              f"{target} is restarted."}))
+
+
+def do_admtap_apply(target, digest):
+    mode, appliance = _admtap_resolve(target)
+    steps = _admtap_steps(_admtap_read_values())
+    if not steps or _admtap_digest(target, steps) != digest:
+        fail("Refused: these are not the settings that were previewed. Preview again, then apply.")
+    lines = []
+    for n, st in enumerate(steps):
+        lines.append(f"echo '{ADMTAP_MARK}step:{n}##'; ( {st['command']} ) 2>&1; r=$?; echo; echo \"{ADMTAP_MARK}rc:{n}##$r\"")
+    keys = " ".join(p["key"] for p in ADMTAP_PROPS)
+    lines.append(f"echo '{ADMTAP_MARK}props##'; fstool get_property {keys} 2>/dev/null")
+    t0 = time.time()
+    out, err, rc = _cu_exec(mode, appliance, "\n".join(lines), timeout=300)
+    sections = _cu_sections(out.replace(ADMTAP_MARK, CLEANUP_MARK))
+    results = []
+    for n, st in enumerate(steps):
+        ran = f"step:{n}" in sections
+        step_rc = (sections.get(f"rc:{n}", "").strip() or None) if ran else None
+        results.append({**st, "ran": ran, "rc": int(step_rc) if step_rc and step_rc.lstrip("-").isdigit() else None,
+                        "output": sections.get(f"step:{n}", "").strip()[-1000:]})
+    after = {}
+    for line in sections.get("props", "").splitlines():
+        k, sep, v = line.partition("=")
+        if sep and k.strip() in ADMTAP_BY_KEY:
+            after[k.strip()] = v.strip()
+    _admtap_audit(f"apply on {target}: " + "; ".join(f"{r['command']} => rc={r['rc']}" for r in results) + f" ({int(time.time() - t0)}s)")
+    print(json.dumps({"target": target, "ok": all(r["ran"] and r["rc"] == 0 for r in results), "steps": results,
+                      "after": [{"key": p["key"], "value": after.get(p["key"]) or p["default"], "overridden": bool(after.get(p["key"]))} for p in ADMTAP_PROPS],
+                      "incomplete": None if "props" in sections else ((err or "").strip()[:300] or "the run did not finish"),
+                      "restart_required": True}))
+
+
+def do_admtap_restart(target, digest):
+    """`fstool service restart` on the target -- the disruptive half. Refused unless the caller hands over
+    the digest of the settings preview it belongs to (so a restart can never be requested on its own by a
+    stray call), and never bundled with apply."""
+    mode, appliance = _admtap_resolve(target)
+    if not re.fullmatch(ADMTAP_DIGEST_RE, digest or ""):
+        fail("Refused: no matching settings preview.")
+    _admtap_audit(f"service restart requested on {target} (settings digest {digest[:12]})")
+    t0 = time.time()
+    # A restart drops this very SSH session's sibling processes on an appliance; run it detached and
+    # report back once the service says it is up again (polled from here).
+    script = ("nohup sh -c 'fstool service restart' > /tmp/admtap-restart.log 2>&1 < /dev/null & "
+              "echo started")
+    out, err, rc = _cu_exec(mode, appliance, script, timeout=60)
+    if "started" not in out:
+        fail(f"Could not start the restart on {target}: {(err or out or '').strip()[:300]}")
+    status = ""
+    deadline = time.time() + 900
+    while time.time() < deadline:
+        time.sleep(15)
+        o, e, r = _cu_exec(mode, appliance, "fstool service status 2>/dev/null | head -1", timeout=30)
+        status = (o or "").strip()
+        if "running" in status.lower():
+            break
+    _admtap_audit(f"service restart on {target}: '{status}' after {int(time.time() - t0)}s")
+    print(json.dumps({"target": target, "ok": "running" in status.lower(), "status": status,
+                      "seconds": int(time.time() - t0),
+                      "incomplete": None if "running" in status.lower() else "the service did not report running within 15 minutes"}))
+
+
 def main():
     original = os.environ.get("SSH_ORIGINAL_COMMAND", "")
 
@@ -4326,6 +4961,17 @@ def main():
     )
     if m:
         return do_bundlecorrelate(m.group(1).split(","), int(m.group(2)), int(m.group(3)), int(m.group(4)))
+
+    m = re.fullmatch(rf"radiuslive ({TARGET_RE}) (\d{{9,11}}):(\d{{9,11}})", original.strip())
+    if m:
+        return do_radiuslive(m.group(1), int(m.group(2)), int(m.group(3)))
+
+    m = re.fullmatch(rf"radiusbundle ({_any_bundle})", original.strip())
+    if m:
+        return do_radiusbundle(m.group(1))
+
+    if original.strip() == "radiusfile":
+        return do_radiusfile()
 
     if original.strip() == "techsupportlogtail":
         return do_techsupport_log_tail()
@@ -4444,6 +5090,34 @@ def main():
     if m:
         return do_arplist(m.group(1))
 
+    m = re.fullmatch(rf"admtapstatus ({TARGET_RE})", original.strip())
+    if m:
+        return do_admtap_status(m.group(1))
+
+    m = re.fullmatch(rf"admtappreview ({TARGET_RE})", original.strip())
+    if m:
+        return do_admtap_preview(m.group(1))
+
+    m = re.fullmatch(rf"admtapapply ({TARGET_RE}) ({ADMTAP_DIGEST_RE})", original.strip())
+    if m:
+        return do_admtap_apply(m.group(1), m.group(2))
+
+    m = re.fullmatch(rf"admtaprestart ({TARGET_RE}) ({ADMTAP_DIGEST_RE})", original.strip())
+    if m:
+        return do_admtap_restart(m.group(1), m.group(2))
+
+    m = re.fullmatch(rf"cleanupscan ({TARGET_RE})", original.strip())
+    if m:
+        return do_cleanup_scan(m.group(1))
+
+    m = re.fullmatch(rf"cleanuppreview ({TARGET_RE}) ({CLEANUP_IDS_RE})", original.strip())
+    if m:
+        return do_cleanup_preview(m.group(1), m.group(2))
+
+    m = re.fullmatch(rf"cleanuprun ({TARGET_RE}) ({CLEANUP_IDS_RE}) ({CLEANUP_DIGEST_RE})", original.strip())
+    if m:
+        return do_cleanup_run(m.group(1), m.group(2), m.group(3))
+
     if original.strip() == "getadmincidr":
         return do_get_admin_cidr()
 
@@ -4473,6 +5147,9 @@ def main():
         "pluginlogszip <target> <plugin,...> <start>:<end> | "
         "bundleupload <filename> | bundleuploadcleanup <path> | bundleuploadlist | "
         "bundlecorrelate <path>[,<path>...] <gap_s> <context_s> <top_n> | bundleroam <path> <mac|ip> | "
+        "radiuslive <target> <start>:<end> | radiusbundle <path> | radiusfile (log on stdin) | "
+        "admtapstatus <target> | admtappreview <target> (values on stdin) | admtapapply <target> <digest> | admtaprestart <target> <digest> | "
+        "cleanupscan <target> | cleanuppreview <target> <item,...> | cleanuprun <target> <item,...> <digest> | "
         "getadmincidr | setadmincidr <cidr>)",
         code=2,
     )
