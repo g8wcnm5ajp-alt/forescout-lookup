@@ -1247,12 +1247,36 @@
                     return { ...node, children: kept };
                 }
                 if (node.type === "rule") {
-                    if (!node.enabled || !matchedSet.has(node.id)) return null;
+                    // An enabled policy stays if it matched itself OR any of its sub-rules did --
+                    // the EM's np_action / eval_status often carry only the sub-rule's id, and
+                    // v1.10.1 dropped those whole branches ("No matched, enabled policies"
+                    // despite 5 matched ids, 2026-09-28).
                     const kept = (node.children || []).filter(c => matchedSet.has(c.id));
+                    if (!node.enabled || !(matchedSet.has(node.id) || kept.length)) return null;
                     return { ...node, children: kept };
                 }
                 // inner_rule: no children, keep only if matched
                 return matchedSet.has(node.id) ? node : null;
+            }
+
+            // Why a filtered view came out empty although the EM returned matched ids:
+            // ids of disabled policies (or their sub-rules) vs ids not in the tree at all
+            // (a policy added / changed since the tree was loaded -- it refreshes every 5 min).
+            function explainEmpty() {
+                const where = new Map();   // id -> "enabled" | "disabled"
+                (function walk(node, policyEnabled) {
+                    if (node.type === "rule") policyEnabled = !!node.enabled;
+                    if (node.id != null && node.type !== "folder") where.set(String(node.id), policyEnabled ? "enabled" : "disabled");
+                    (node.children || []).forEach(c => walk(c, policyEnabled));
+                })(fullTree, true);
+                let disabled = 0, missing = 0;
+                const missingIds = [];
+                matchedSet.forEach(id => {
+                    const w = where.get(String(id));
+                    if (w === "disabled") disabled++;
+                    else if (w === undefined) { missing++; if (missingIds.length < 10) missingIds.push(String(id)); }
+                });
+                return { disabled, missing, missingIds };
             }
 
             // Graphic view -- David's ask, 2026-08-26, now the *only* tree view (the older
@@ -1350,8 +1374,18 @@
             function renderGraphic(tree) {
                 graphicContainer.textContent = "";
                 if (!tree) {
-                    graphicContainer.textContent = "No matched, enabled policies found for this host.";
-                    sendDiag({ stage: "renderGraphic_null_tree" });
+                    let msg = "No matched, enabled policies found for this host.";
+                    const why = matchedSet.size ? explainEmpty() : null;
+                    if (why && (why.disabled || why.missing)) {
+                        const parts = [];
+                        if (why.disabled) parts.push(why.disabled + " belong to disabled policies");
+                        if (why.missing) parts.push(why.missing + " aren't in the policy tree (a policy added or changed since the tree was loaded -- it refreshes every 5 minutes)");
+                        msg = matchedSet.size + " matched rule(s) in this window, but none can be shown: " + parts.join("; ") + ".";
+                    }
+                    graphicContainer.textContent = msg;
+                    sendDiag({ stage: "renderGraphic_null_tree", matched_set_size: matchedSet.size,
+                               disabled_count: why ? why.disabled : null, not_in_tree_count: why ? why.missing : null,
+                               not_in_tree_sample: why ? why.missingIds : null });
                     return;
                 }
                 try {

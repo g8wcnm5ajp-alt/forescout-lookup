@@ -18,7 +18,7 @@ import time
 import zipfile
 from datetime import datetime, timezone
 
-from flask import Flask, Response, jsonify, redirect, render_template, request, send_file, session, url_for
+from flask import Flask, Response, has_request_context, jsonify, redirect, render_template, request, send_file, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from forescout_client import (
@@ -48,11 +48,16 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.10.1"
+APP_VERSION = "1.10.2"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
-_tree_cache = {"tree": None}
+# The policy tree is cached in memory, but no longer for the life of the process: v1.10.1
+# kept its first copy for ever, so policies added / edited on the EM after this app started
+# never appeared and their matches couldn't be shown (2026-09-28). The EM side keeps its own
+# disk cache and only re-parses when nptree.xml / nprules.xml change, so a refetch is cheap.
+_tree_cache = {"tree": None, "fetched_at": 0}
+TREE_CACHE_TTL = 300
 
 # A pasted "IP,IP,IP..." could in principle fan out into an unbounded
 # number of SSH round trips through the EM -- capped as a sanity limit,
@@ -1039,6 +1044,45 @@ def _update_ts_run(run_id, **fields):
         _save_ts_runs(runs)
 
 
+# ---------------------------------------------------------------------
+# Runs cut off by a restart (2026-09-28): every background run is a thread in this one
+# process (`python app.py`, a single process -- see the Dockerfile), so after a restart
+# nothing can still be running. A run left "running" in its JSON store is one the restart
+# killed. It used to stay "running" for ever: shown as active, and -- through each store's
+# duplicate guard -- refusing a new run for the same host(s) / target. Marked failed at
+# start-up instead, with a clear reason, the same state the manual "kill stuck run" sets.
+# ---------------------------------------------------------------------
+def _run_stores():
+    return (
+        ("appliance runs", _load_runs, _save_runs, _runs_lock),
+        ("bundle analysis runs", _load_analyze_runs, _save_analyze_runs, _analyze_runs_lock),
+        ("tech-support runs", _load_ts_runs, _save_ts_runs, _ts_runs_lock),
+    )
+
+
+def _mark_interrupted_runs(now=None):
+    """Returns {store label: number of runs marked}; only call before any run can start."""
+    now = int(now or time.time())
+    marked = {}
+    for label, load, save, lock in _run_stores():
+        with lock:
+            runs = load()
+            n = 0
+            for r in runs:
+                if r.get("status") == "running":
+                    phase = f" (phase: {r['phase']})" if r.get("phase") not in (None, "", 0) else ""
+                    r.update(status="failed", finished_at=now,
+                             error=f"Interrupted: the app restarted at {_fmt_utc(now)} while this was running{phase}. "
+                                   "Start it again.")
+                    n += 1
+            if n:
+                save(runs)
+                marked[label] = n
+    if marked:
+        _log_activity("runs_interrupted", **{k.replace(" ", "_").replace("-", "_"): v for k, v in marked.items()})
+    return marked
+
+
 def _log_case_build(kind, key, case_ref, result, error):
     entry = {
         "logged_at": int(time.time()), "kind": kind, "key": key, "case_ref": case_ref,
@@ -1151,7 +1195,7 @@ def start_techsupport_run(
                         debug_set_appliance(t["target"], spec, case_ref=case_ref or "adhoc")
                         any_debug_enabled = True
                 if any_debug_enabled:
-                    _update_ts_run(run_id, phase="waiting")
+                    _update_ts_run(run_id, phase="waiting", waiting_until=int(time.time()) + minutes * 60)
                     time.sleep(minutes * 60)
                 _update_ts_run(run_id, phase="collecting")
                 # A much longer timeout than collect_techsupport's own
@@ -1268,8 +1312,9 @@ def _log_activity(action, **details):
     try:
         entry = {
             "logged_at": int(time.time()), "action": action,
-            "remote_addr": request.remote_addr,
-            "user_agent": request.headers.get("User-Agent", ""),
+            # also callable outside a request (the start-up sweep of interrupted runs)
+            "remote_addr": request.remote_addr if has_request_context() else "(app start-up)",
+            "user_agent": request.headers.get("User-Agent", "") if has_request_context() else "",
             **details,
         }
         with open(ACTIVITY_LOG_PATH, "a") as f:
@@ -1556,11 +1601,14 @@ def api_policy_tree():
     structure changes rarely, unlike the per-IP highlight, which is
     polled separately and cheaply via /api/lastchecked.
     """
-    if _tree_cache["tree"] is None:
+    if _tree_cache["tree"] is None or time.time() - _tree_cache["fetched_at"] > TREE_CACHE_TTL:
         try:
             _tree_cache["tree"] = policy_tree()
+            _tree_cache["fetched_at"] = time.time()
         except ForescoutClientError as e:
-            return jsonify({"error": str(e)}), 502
+            if _tree_cache["tree"] is None:
+                return jsonify({"error": str(e)}), 502
+            # a refresh failed: keep serving the last good tree rather than breaking the page
     return jsonify(_tree_cache["tree"])
 
 
@@ -2622,6 +2670,42 @@ def _redact_jsonl_username(path):
     return "\n".join(lines) + ("\n" if lines else "")
 
 
+def _strip_usernames(obj):
+    """Removes every "username" key at any depth (same reason as _redact_jsonl_username)."""
+    if isinstance(obj, dict):
+        return {k: _strip_usernames(v) for k, v in obj.items() if k != "username"}
+    if isinstance(obj, list):
+        return [_strip_usernames(v) for v in obj]
+    return obj
+
+
+def _running_runs_summary(now=None):
+    """One line per run still running, for description.txt -- what it is, since when, and
+    for a tech-support run in its debug window, when collection is due."""
+    now = int(now or time.time())
+    lines = []
+    for label, load, _save, lock in _run_stores():
+        with lock:
+            runs = [r for r in load() if r.get("status") == "running"]
+        for r in runs:
+            what = r.get("key") or r.get("target") or r.get("bundle") or r.get("id")
+            line = f"- {label}: {what}"
+            if r.get("case_ref"):
+                line += f" [case {r['case_ref']}]"
+            if r.get("started_at"):
+                line += f", started {_fmt_utc(r['started_at'])} ({(now - r['started_at']) // 60} min ago)"
+            if r.get("phase") not in (None, "", 0):
+                line += f", phase {r['phase']}"
+            if r.get("phase") == "waiting" and r.get("waiting_until"):
+                left = max(0, r["waiting_until"] - now) // 60
+                line += (f" -- debug window open until {_fmt_utc(r['waiting_until'])} ({left} min left), "
+                         "then it collects; the tech-support log shows nothing new until then")
+            if r.get("duration"):
+                line += f", duration {r['duration']}"
+            lines.append(line)
+    return lines
+
+
 @app.route("/api/support_log", methods=["POST"])
 def api_support_log():
     # JSON body, same reasoning as /api/client_debug_log above --
@@ -2645,11 +2729,23 @@ def api_support_log():
             "Issue description:",
             description or "(none provided)",
         ]
+        info_lines += ["", "Background runs at bundle time:"] + (_running_runs_summary() or ["(none running)"])
         zf.writestr("description.txt", _redact_secrets("\n".join(info_lines)))
 
         for src_path, arcname in _SUPPORT_LOG_LOCAL_FILES:
             if os.path.isfile(src_path):
                 zf.writestr(arcname, _redact_jsonl_username(src_path))
+        # Run status (2026-09-28): without it a tech-support run still in its debug window
+        # looked like an unfinished log.
+        for label, load, _save, lock in _run_stores():
+            with lock:
+                runs = load()
+            if runs:
+                arc = {"appliance runs": "appliance_runs.json", "bundle analysis runs": "analyze_runs.json",
+                       "tech-support runs": "techsupport_runs.json"}[label]
+                zf.writestr(arc, _redact_secrets(json.dumps(_strip_usernames(runs), indent=1)))
+        if os.path.isfile(CASE_LOG_PATH):
+            zf.writestr("case_log.jsonl", _redact_secrets(_redact_jsonl_username(CASE_LOG_PATH)))
 
         # Best-effort -- an SSH hiccup to the EM shouldn't block getting
         # the rest of the bundle back, same reasoning as the live-poll
@@ -3122,6 +3218,9 @@ def clear_log_section(section):
 
 
 if __name__ == "__main__":
+    _interrupted = _mark_interrupted_runs()
+    if _interrupted:
+        print(f"Marked runs cut off by the last restart as failed: {_interrupted}", flush=True)
     # HTTPS -- David's ask, 2026-08-26 (Phase C, the EM-hosted package):
     # only engaged when Deploy.sh mounts real certs and sets both env
     # vars (see SESSION_COOKIE_SECURE above, which keys off the same
