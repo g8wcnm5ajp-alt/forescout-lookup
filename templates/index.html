@@ -674,12 +674,6 @@
                         <option value="tap">TAP endpoints (who keeps it in Admission TAP)</option>
                     </select>
                 </label>
-                <label class="tree-filter-toggle">Run on
-                    <select id="analyze-scope">
-                        <option value="target">the target selected in 1.</option>
-                        <option value="all">all online appliances</option>
-                    </select>
-                </label>
                 <label class="tree-filter-toggle">Window
                     <input type="text" id="analyze-window" value="1h" style="width:5em">
                 </label>
@@ -2695,7 +2689,6 @@
             const runStatus = document.getElementById("analyze-run-status");
             const outputEl = document.getElementById("analyze-output");
             const reportSelect = document.getElementById("analyze-report");
-            const scopeSelect = document.getElementById("analyze-scope");
             const historyDaysInput = document.getElementById("analyze-history-days");
             if (!targetSelect) return; // panel not on this page
 
@@ -2722,6 +2715,14 @@
             function loadPlugins() {
                 const target = targetSelect.value;
                 pluginsList.innerHTML = "";
+                // "All online appliances" is for the reports only -- plugins, debug and plugin
+                // logs act on one box at a time.
+                const all = target === "all";
+                debugStartBtn.disabled = all;   // Stop stays usable -- it acts on the window already started
+                if (all) {
+                    pluginsStatus.textContent = "Plugins, debug and plugin logs work on one target -- pick a single one to use them. Run below runs the report on every online appliance.";
+                    return;
+                }
                 if (!target) return;
                 pluginsStatus.textContent = "Loading plugins…";
                 fetch("/api/plugins/" + encodeURIComponent(target))
@@ -2744,10 +2745,15 @@
                     if (d.error) { targetStatus.textContent = "error: " + d.error; return; }
                     const appliances = d.appliances || [];
                     targetStatus.textContent = appliances.length + " known target(s).";
-                    targetSelect.innerHTML = appliances.map(a => (
-                        "<option value=\"" + escapeHtml(a.address) + "\">" + escapeHtml(a.address) +
-                        (a.is_em ? " (EM)" : "") + (a.online ? "" : " (offline)") + "</option>"
-                    )).join("");
+                    const online = appliances.filter(a => a.online && !a.is_em).length;
+                    targetSelect.innerHTML =
+                        "<option value=\"all\">All online appliances (" + online + ") -- reports only</option>" +
+                        appliances.map(a => (
+                            "<option value=\"" + escapeHtml(a.address) + "\">" + escapeHtml(a.address) +
+                            (a.is_em ? " (EM)" : "") + (a.online ? "" : " (offline)") + "</option>"
+                        )).join("");
+                    // stay on a single target by default, as before -- "All" is picked on purpose
+                    if (appliances.length) targetSelect.value = appliances[0].address;
                     loadPlugins();
                 })
                 .catch(err => { targetStatus.textContent = "failed to load: " + err; });
@@ -2906,7 +2912,7 @@
             }
 
             runBtn.addEventListener("click", () => {
-                const target = scopeSelect.value === "all" ? "all" : targetSelect.value;
+                const target = targetSelect.value;
                 if (!target) { window.alert("Select a target."); return; }
                 const formData = new URLSearchParams();
                 formData.set("csrf_token", CSRF_TOKEN);
