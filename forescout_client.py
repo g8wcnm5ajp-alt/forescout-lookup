@@ -729,6 +729,27 @@ def analyze_admission(
     )
 
 
+TAP_WINDOW_RE = re.compile(r"^(?:\d{1,5}[smhd]|all)$")
+
+
+def analyze_tap(target, window="1h", top_n=10, history_days=7, timeout=950):
+    """
+    Runs high-admission-trace.sh's `tap` mode live against `target` -- which endpoints keep
+    it in Admission TAP control (see webapp-query.py's do_analyzetap). window also takes
+    "all" (the whole of today.log); history_days = daily stats files read for the TAP on/off
+    history (0 = today.log only). Background-thread caller, same as analyze_admission.
+    """
+    if not valid_target(target):
+        raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
+    if not TAP_WINDOW_RE.match(window or ""):
+        raise ForescoutClientError(f"'{window}' is not a valid window (expected e.g. 30m, 2h, 1d or all).")
+    if not (isinstance(top_n, int) and 1 <= top_n <= 200):
+        raise ForescoutClientError("'top_n' must be 1-200.")
+    if not (isinstance(history_days, int) and 0 <= history_days <= 31):
+        raise ForescoutClientError("'history_days' must be 0-31.")
+    return _run_verb(f"analyzetap {target} {window} {top_n} {history_days}", timeout=timeout)
+
+
 def download_plugin_logs_zip(target, plugins, start_epoch, end_epoch, timeout=300):
     """
     Streams a tar.gz of the named plugin(s)' raw log files, modified in

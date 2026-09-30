@@ -23,7 +23,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from forescout_client import (
     CASE_REF_RE, COMPANY_NAME_RE, LEVEL_RE, ForescoutClientError, admtap_apply, admtap_preview, admtap_restart, admtap_status,
-    analyze_admission, arp_list,
+    analyze_admission, analyze_tap, arp_list,
     cleanup_preview, cleanup_run, cleanup_scan,
     build_techsupport_em, build_techsupport_window_appliance, clear_lookup_debug_log, clear_techsupport_log,
     bundle_roaming, collect_techsupport, correlate_bundles, debug_set_appliance, delete_techsupport_bundle, delete_uploaded_bundle,
@@ -48,7 +48,7 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.10.2"
+APP_VERSION = "1.11.0"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
@@ -844,6 +844,94 @@ def start_analyze_run(target, bundle_path, window, switch_filter, top_n, spike_n
             _update_analyze_run(run_id, status="complete", finished_at=int(time.time()), result=result)
         except ForescoutClientError as e:
             _update_analyze_run(run_id, status="failed", finished_at=int(time.time()), error=str(e))
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return run_id
+
+
+LIVE_ANALYZE_ALL = "all"
+LIVE_REPORT_LABELS = {"adm": "Admission sources", "tap": "TAP endpoints"}
+
+
+def _run_live_report(report, target, params):
+    """One live high-admission-trace.sh report against one target -- `analyze` (admission
+    sources, switch/port/MAC) or `tap` (which endpoints keep it in Admission TAP control)."""
+    if report == "tap":
+        return analyze_tap(target, window=params["window"], top_n=params["top_n"], history_days=params["history_days"])
+    return analyze_admission(
+        target, window=params["window"], switch_filter=params["switch_filter"],
+        top_n=params["top_n"], spike_n=params["spike_n"], stale_days=params["stale_days"],
+    )
+
+
+def start_live_analyze_run(target, report, params):
+    """
+    Live Analyze tab's Run button (David, 2026-09-30 -- "add this to the app": the EM running
+    the admission reports across its appliances). report "adm" or "tap"; target one EM/appliance
+    address or LIVE_ANALYZE_ALL = every ONLINE managed appliance, one report section each, run in
+    turn (the same one-at-a-time, per-part-progress shape as the bundle review). An appliance
+    that fails is reported in its section and the rest still run; the run only fails if every
+    one did. Offline appliances are listed, not attempted. Same analyze_runs.json tracking and
+    /api/analyze_run/<id> polling as every other analyze run.
+    """
+    key = f"live:{report}:{target}"
+    run_id = f"{int(time.time() * 1000)}-{os.urandom(3).hex()}"
+    label = LIVE_REPORT_LABELS[report]
+    multi = target == LIVE_ANALYZE_ALL
+    with _analyze_runs_lock:
+        runs = _load_analyze_runs()
+        if any(r["key"] == key and r["status"] == "running" for r in runs):
+            return None
+        runs.append({
+            "id": run_id, "key": key, "kind": "multi" if multi else report, "report": report,
+            "target": "all online appliances" if multi else target, "bundle": None, "targets": [],
+            "phase": 0, "status": "running",
+            "started_at": int(time.time()), "finished_at": None, "result": None, "error": None,
+        })
+        _save_analyze_runs(runs)
+
+    def _worker():
+        if not multi:
+            try:
+                result = _run_live_report(report, target, params)
+                _update_analyze_run(run_id, status="complete", finished_at=int(time.time()), result=result)
+            except ForescoutClientError as e:
+                _update_analyze_run(run_id, status="failed", finished_at=int(time.time()), error=str(e))
+            return
+        try:
+            appliances = list_appliances().get("appliances") or []
+        except ForescoutClientError as e:
+            _update_analyze_run(run_id, status="failed", finished_at=int(time.time()),
+                                error=f"Could not list the appliances: {e}")
+            return
+        targets = [a["address"] for a in appliances if a.get("online") and not a.get("is_em")]
+        offline = [a["address"] for a in appliances if not a.get("online") and not a.get("is_em")]
+        if not targets:
+            _update_analyze_run(run_id, status="failed", finished_at=int(time.time()),
+                                error="No online managed appliances to run on."
+                                      + (f" Offline: {', '.join(offline)}." if offline else ""))
+            return
+        _update_analyze_run(run_id, targets=targets)
+        rule = "=" * 78
+        sections, failures = [], 0
+        for i, t in enumerate(targets):
+            _update_analyze_run(run_id, phase=i)
+            try:
+                body = _run_live_report(report, t, params).get("output") or "(no output)"
+            except ForescoutClientError as e:
+                failures += 1
+                body = f"FAILED: {e}"
+            sections.append(f"{rule}\n{i + 1}/{len(targets)} -- {label}: {t}\n{rule}\n\n{body}")
+        header = (f"{label} -- {len(targets)} online appliance(s): {', '.join(targets)}\n"
+                  + (f"Offline, not run: {', '.join(offline)}\n" if offline else "")
+                  + (f"{failures} of {len(targets)} FAILED -- see the section(s) marked FAILED below.\n" if failures else "")
+                  + "\n")
+        output = header + "\n\n".join(sections)
+        if failures == len(targets):
+            _update_analyze_run(run_id, status="failed", finished_at=int(time.time()),
+                                error="Every appliance failed:\n" + output[-3000:])
+        else:
+            _update_analyze_run(run_id, status="complete", finished_at=int(time.time()), result={"output": output})
 
     threading.Thread(target=_worker, daemon=True).start()
     return run_id
@@ -2245,18 +2333,31 @@ def do_analyze_run():
     bundle_path = request.form.get("bundle_path", "").strip() or None
     window = request.form.get("window", "1h").strip() or "1h"
     switch_filter = request.form.get("switch_filter", "").strip() or None
+    report = request.form.get("report", "adm").strip() or "adm"
     try:
         top_n = _int_form("top_n", 10, 1, 200)
         spike_n = _int_form("spike_n", 5, 0, 50)
         stale_days = _int_form("stale_days", 7, 0, 365)
+        history_days = _int_form("history_days", 7, 0, 31)
     except ValueError as e:
         return jsonify({"error": f"Invalid value for {e}."}), 400
     if not target:
         return jsonify({"error": "Select a target to analyze."}), 400
+    if report not in LIVE_REPORT_LABELS:
+        return jsonify({"error": "Unknown report type."}), 400
+    if bundle_path and (report != "adm" or target == LIVE_ANALYZE_ALL):
+        return jsonify({"error": "A bundle is analysed on its own -- admission sources, one bundle at a time."}), 400
     _log_activity(
         "analyze_run", username=session.get("username"), target=target, bundle=bundle_path, window=window,
+        report=report,
     )
-    run_id = start_analyze_run(target, bundle_path, window, switch_filter, top_n, spike_n, stale_days)
+    if bundle_path:
+        run_id = start_analyze_run(target, bundle_path, window, switch_filter, top_n, spike_n, stale_days)
+    else:
+        run_id = start_live_analyze_run(target, report, {
+            "window": window, "switch_filter": switch_filter, "top_n": top_n, "spike_n": spike_n,
+            "stale_days": stale_days, "history_days": history_days,
+        })
     if run_id is None:
         return jsonify({"error": "An analysis is already running for this target/bundle."}), 409
     return jsonify({"run_id": run_id})

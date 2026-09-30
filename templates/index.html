@@ -628,8 +628,8 @@
         <div class="card no-print">
             <h3>Live Analyze <span class="muted">(High Admission Root-Cause Tracing)</span></h3>
             <p class="hint">Pinpoints what's driving a high-admission appliance back to a switch/port/MAC (or
-                wireless), live against a target below -- see the Tech Support tab for analyzing an
-                already-built bundle instead.</p>
+                wireless), and which endpoints keep it in Admission TAP control -- live against one target or
+                every online appliance in turn. See the Tech Support tab for analyzing an already-built bundle instead.</p>
 
             <div class="analyze-columns">
                 <div class="analyze-col">
@@ -668,16 +668,35 @@
             <hr class="analyze-hr">
 
             <div class="tree-filter-row">
+                <label class="tree-filter-toggle">Report
+                    <select id="analyze-report">
+                        <option value="adm">Admission sources (switch/port/MAC)</option>
+                        <option value="tap">TAP endpoints (who keeps it in Admission TAP)</option>
+                    </select>
+                </label>
+                <label class="tree-filter-toggle">Run on
+                    <select id="analyze-scope">
+                        <option value="target">the target selected in 1.</option>
+                        <option value="all">all online appliances</option>
+                    </select>
+                </label>
                 <label class="tree-filter-toggle">Window
                     <input type="text" id="analyze-window" value="1h" style="width:5em">
                 </label>
-                <label class="tree-filter-toggle">Switch filter <span class="muted">(optional, comma-separated IPs)</span>
+                <label class="tree-filter-toggle analyze-adm-only">Switch filter <span class="muted">(optional, comma-separated IPs)</span>
                     <input type="text" id="analyze-switch-filter" style="width:16em">
                 </label>
-                <button type="button" id="analyze-run-btn">Run analyze</button>
+                <label class="tree-filter-toggle analyze-tap-only" style="display:none;">History days
+                    <input type="number" id="analyze-history-days" value="7" min="0" max="31" step="1" style="width:4em">
+                </label>
+                <button type="button" id="analyze-run-btn">Run</button>
             </div>
+            <p class="hint analyze-tap-only" style="display:none;">TAP endpoints: the TAP on/off history (today.log plus
+                the daily stats files), what pushed it in, admissions accepted vs ignored by type, and the hosts behind
+                them from the DHCP Classifier's learn callbacks, with hosts over the per-host threshold flagged. Window
+                also takes <code>all</code> (the whole of today.log).</p>
             <details style="margin-top:0.5rem;">
-                <summary class="hint" style="cursor:pointer;">Advanced (top-N / spike-N / stale-days)</summary>
+                <summary class="hint" style="cursor:pointer;">Advanced (top-N / spike-N / stale-days -- tap uses top-N only)</summary>
                 <div class="tree-filter-row" style="margin-top:0.5rem;">
                     <label class="tree-filter-toggle">Top-N switch/port/MAC rows
                         <input type="number" id="analyze-top-n" value="10" min="1" max="200" step="1" style="width:5em">
@@ -2675,7 +2694,20 @@
             const runBtn = document.getElementById("analyze-run-btn");
             const runStatus = document.getElementById("analyze-run-status");
             const outputEl = document.getElementById("analyze-output");
+            const reportSelect = document.getElementById("analyze-report");
+            const scopeSelect = document.getElementById("analyze-scope");
+            const historyDaysInput = document.getElementById("analyze-history-days");
             if (!targetSelect) return; // panel not on this page
+
+            // Report choice (2026-09-30): the switch filter / spike / stale settings only mean
+            // something to "Admission sources", history days only to "TAP endpoints".
+            function syncReportFields() {
+                const tap = reportSelect.value === "tap";
+                document.querySelectorAll(".analyze-adm-only").forEach(el => { el.style.display = tap ? "none" : ""; });
+                document.querySelectorAll(".analyze-tap-only").forEach(el => { el.style.display = tap ? "" : "none"; });
+            }
+            reportSelect.addEventListener("change", syncReportFields);
+            syncReportFields();
 
             function escapeHtml(s) {
                 return (s || "").toString().replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -2811,6 +2843,16 @@
                     ? ["Part 1 -- findings, correlation and host/label checks over " + (d.bundles || []).length + " bundle(s), streamed (nothing unpacked)"]
                         .concat((d.bundles || []).map((n, i) => "Part 2." + (i + 1) + " -- admission analysis: " + n + " (unpacked to /tmp, removed after)"))
                         .map((s, i) => i === (d.phase || 0) ? "<strong>&#9654; " + s + "</strong>" : (i < (d.phase || 0) ? "&#10003; " + s : s))
+                    : d.kind === "multi"
+                    ? (d.targets && d.targets.length
+                        ? d.targets.map(t => (d.report === "tap" ? "TAP endpoints: " : "Admission sources: ") + t)
+                            .map((s, i) => i === (d.phase || 0) ? "<strong>&#9654; " + s + "</strong>" : (i < (d.phase || 0) ? "&#10003; " + s : s))
+                        : ["Listing the online appliances (fstool oneach)"])
+                    : d.kind === "tap"
+                    ? ["TAP on/off history (adm.tap.active, today.log + daily stats files)",
+                       "What pushed it into TAP (admissions in the hour before each entry)",
+                       "Admissions by type, accepted vs ignored",
+                       "The endpoints behind them (DHCP Classifier learn callbacks), per-host threshold, IP<->MAC changes"]
                     : d.kind === "correlate"
                     ? ["Stream each bundle once (nothing is unpacked to disk): " + d.bundle,
                        "Identify each bundle (EM / appliance, node ID) and line the clocks up",
@@ -2850,7 +2892,7 @@
                             return;
                         }
                         runBtn.disabled = false;
-                        runBtn.textContent = "Run analyze";
+                        runBtn.textContent = "Run";
                         if (d.status === "failed") {
                             runStatus.textContent = "Failed: " + (d.error || "unknown error");
                             return;
@@ -2864,11 +2906,13 @@
             }
 
             runBtn.addEventListener("click", () => {
-                const target = targetSelect.value;
+                const target = scopeSelect.value === "all" ? "all" : targetSelect.value;
                 if (!target) { window.alert("Select a target."); return; }
                 const formData = new URLSearchParams();
                 formData.set("csrf_token", CSRF_TOKEN);
                 formData.set("target", target);
+                formData.set("report", reportSelect.value);
+                formData.set("history_days", historyDaysInput.value || "7");
                 formData.set("window", windowInput.value || "1h");
                 formData.set("switch_filter", switchFilterInput.value || "");
                 formData.set("top_n", topNInput.value || "10");
@@ -2884,7 +2928,7 @@
                     .then(d => {
                         if (d.error) {
                             runBtn.disabled = false;
-                            runBtn.textContent = "Run analyze";
+                            runBtn.textContent = "Run";
                             runStatus.textContent = "Failed to start: " + d.error;
                             return;
                         }
@@ -2893,7 +2937,7 @@
                     })
                     .catch(err => {
                         runBtn.disabled = false;
-                        runBtn.textContent = "Run analyze";
+                        runBtn.textContent = "Run";
                         runStatus.textContent = "Failed to start: " + err;
                     });
             });

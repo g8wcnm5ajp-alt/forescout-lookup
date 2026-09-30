@@ -229,6 +229,11 @@ Verbs (see the plan this was built from, forescout-lookup):
                             techsupportdownload/_cleanup) -- the script's
                             own text is piped in over stdin, not
                             deployed per-appliance
+    analyzetap <target> <window|all> <top_n> <history_days>
+                            runs high-admission-trace.sh's `tap` mode
+                            live against target: which endpoints keep it
+                            in Admission TAP control. Same stdin-piped
+                            script; plugin@<node id> decoded to names
     pluginlogszip <target> <plugin,...> <start>:<end>
                             tar.gz (raw bytes, BEGIN-BINARY) of the named
                             plugin(s)' own log directory, filtered to
@@ -4117,6 +4122,43 @@ def do_analyzeadm(target, bundle_path, window, switch_filter, top_n, spike_n, st
     print(json.dumps({"target": target, "bundle": bundle_path, "output": out}))
 
 
+# "plugin@<node id>" in tap's "raised by" output -- node ids decoded on the EM, which alone has
+# the reg table (an appliance running the script can only print the raw id).
+TAP_NODE_REF_RE = re.compile(r"@(-?\d+)\b")
+
+
+def do_analyzetap(target, window, top_n, history_days):
+    """
+    Runs high-admission-trace.sh's `tap` mode live against `target` (the EM or a managed
+    appliance): which endpoints keep that box in Admission TAP control -- TAP on/off history,
+    what pushed it in, admissions accepted vs ignored by type, and the hosts behind them from
+    the DHCP Classifier's learn callbacks. Same stdin-piped script as analyzeadm, nothing
+    deployed per appliance. The appliance only knows node ids, so every "plugin@<node id>" in
+    the output is rewritten here to that node's registered name (node 0 = this EM, the same
+    convention do_hostinfo's decoded copy uses).
+    """
+    script_text = _read_hat_script()
+    mode, appliance = resolve_target(target)
+    if mode is None:
+        fail(f"'{target}' is not a known EM or managed appliance")
+
+    args = ["tap", "-w", window, "-n", str(top_n), "-D", str(history_days)]
+    # tap reads today.log plus up to -D gzipped daily stats files -- a few seconds to a couple
+    # of minutes on a busy appliance; app.py runs this in a background thread and polls.
+    if mode == "em":
+        out, err, rc = run(["bash", "-s", "--", *args], timeout=900, input=script_text)
+    else:
+        remote_cmd = "bash -s -- " + " ".join(shlex.quote(a) for a in args)
+        out, err, rc = ssh_appliance(appliance, remote_cmd, timeout=900, input=script_text)
+    if rc != 0:
+        fail((err or out or f"tap exited {rc}").strip()[-4000:])
+
+    nodes = dict(get_node_map())
+    nodes["0"] = f"EM({EM_IP})"
+    out = TAP_NODE_REF_RE.sub(lambda m: "@" + nodes.get(m.group(1), m.group(1)), out)
+    print(json.dumps({"target": target, "output": out}))
+
+
 CORRELATE_SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bundle-correlate.py")
 MAX_CORRELATE_BUNDLES = 8
 
@@ -5070,6 +5112,10 @@ def main():
             None if m.group(4) == "-" else m.group(4), int(m.group(5)), int(m.group(6)), int(m.group(7)),
         )
 
+    m = re.fullmatch(rf"analyzetap ({TARGET_RE}) ({ANALYZE_WINDOW_RE}|all) (\d{{1,3}}) (\d{{1,2}})", original.strip())
+    if m:
+        return do_analyzetap(m.group(1), m.group(2), int(m.group(3)), int(m.group(4)))
+
     m = re.fullmatch(
         rf"pluginlogszip ({TARGET_RE}) ({PLUGIN_NAME_ONLY_RE}(?:,{PLUGIN_NAME_ONLY_RE})*) (\d{{1,10}}):(\d{{1,10}})",
         original.strip(),
@@ -5299,6 +5345,7 @@ def main():
         "arplist <ip> | appliances | runshowerrors <target> <N>m|h | "
         "pluginlist <target> | "
         "analyzeadm <target> <bundle|-> <window> <switch_filter|-> <top_n> <spike_n> <stale_days> | "
+        "analyzetap <target> <window|all> <top_n> <history_days> | "
         "pluginlogszip <target> <plugin,...> <start>:<end> | "
         "bundleupload <filename> | bundleuploadcleanup <path> | bundleuploadlist | "
         "bundlepartappend <filename> <index> <count> <size> | bundlepartfinish <filename> <count> | bundlepartabort <filename> | "

@@ -59,6 +59,16 @@
 #   dhclass plugin running for the endpoint part; without it the TAP and
 #   counter sections still work. Works live or on a bundle (-b).
 #
+#   -A (analyze/tap, run on the EM) -- the same report for one or more
+#   appliances without logging on to each: "-A all" (every appliance the
+#   EM knows, via `fstool oneach -g`), a comma list of IPs/hostnames, or
+#   a file with one per line. The EM copies this script to each appliance
+#   over its own root ssh trust (the one `fstool oneach` uses), runs it
+#   there with the same options, removes it again, and prints one block
+#   per appliance plus a summary. tap gets the EM's node-id -> name list
+#   passed along (-N), so "raised by" shows appliance names. An
+#   unreachable appliance is reported and skipped, not fatal.
+#
 #   collect -- builds a real Forescout tech-support bundle (`fstool
 #   tech-support -p sw --pack`) carrying everything `analyze` needs:
 #   a time-windowed excerpt of today.log, of sw_mac_track.log, and a
@@ -115,9 +125,9 @@
 #     itself, independent of the mac_ip-table-based stale flag above.
 #
 # Usage:
-#   ./high-admission-trace.sh analyze [-w <window>] [-k <switch-ip>[,<switch-ip>...]] [-n <top-N>] [-s <spike-N>] [-a <stale-days>] [-b <bundle.tgz|bundle-dir>]
+#   ./high-admission-trace.sh analyze [-w <window>] [-k <switch-ip>[,<switch-ip>...]] [-n <top-N>] [-s <spike-N>] [-a <stale-days>] [-b <bundle.tgz|bundle-dir> | -A <appliances>]
 #   ./high-admission-trace.sh live -k <switch-ip>[,<switch-ip>...] [-d <duration>]
-#   ./high-admission-trace.sh tap [-w <window>|all] [-n <top-N>] [-D <days>] [-N <nodes-file>] [-b <bundle.tgz|bundle-dir>]
+#   ./high-admission-trace.sh tap [-w <window>|all] [-n <top-N>] [-D <days>] [-N <nodes-file>] [-b <bundle.tgz|bundle-dir> | -A <appliances>]
 #   ./high-admission-trace.sh collect [-w <window>] [-c <case-ref>]
 #
 #   -w  How far back to look, e.g. 30m, 2h, 1d (analyze/collect/tap; default 1h;
@@ -139,11 +149,13 @@
 #   -N  tap mode: node-id -> appliance-name list, e.g. the EM's
 #       `psql -c "select node_id,name from reg"` output saved to a file.
 #       Live, the script tries that query itself (works on the EM)
+#   -A  analyze/tap, run on the EM: the appliance(s) to run it on -- "all",
+#       ip-or-host[,ip-or-host...], or a file with one per line
 #   -h  Show this help
 #
 set -euo pipefail
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 
 # Overridden below when -b points analyze at a bundle instead of this
 # live appliance -- everything else in the script reads through these
@@ -172,9 +184,9 @@ usage() {
 high-admission-trace.sh v${VERSION}
 
 Usage:
-  $0 analyze [-w <window>] [-k <switch-ip>[,<switch-ip>...]] [-n <top-N>] [-s <spike-N>] [-a <stale-days>] [-b <bundle.tgz|bundle-dir>]
+  $0 analyze [-w <window>] [-k <switch-ip>[,<switch-ip>...]] [-n <top-N>] [-s <spike-N>] [-a <stale-days>] [-b <bundle.tgz|bundle-dir> | -A <appliances>]
   $0 live -k <switch-ip>[,<switch-ip>...] [-d <duration>]
-  $0 tap [-w <window>|all] [-n <top-N>] [-D <days>] [-N <nodes-file>] [-b <bundle.tgz|bundle-dir>]
+  $0 tap [-w <window>|all] [-n <top-N>] [-D <days>] [-N <nodes-file>] [-b <bundle.tgz|bundle-dir> | -A <appliances>]
   $0 collect [-w <window>] [-c <case-ref>]
 
   analyze  Read-only: admission-source breakdown, top switch/port/MAC activity,
@@ -215,9 +227,14 @@ Usage:
   -D  tap: days of daily stats history for the TAP on/off history (default 7)
   -N  tap: node-id -> appliance-name file (the EM's "select node_id,name from reg"
       output); live, the script tries that query itself
+  -A  analyze/tap, run on the EM: run it on these appliances instead of this box --
+      "all" (every appliance the EM knows), ip-or-host[,ip-or-host...], or a file
+      with one per line. Uses the EM's root ssh trust to the appliances (as
+      'fstool oneach' does); one report block per appliance, then a summary.
   -h  Show this help
 
 analyze/live/collect (without -b) run ON the appliance itself, as root.
+analyze -A / tap -A run on the EM against its appliances.
 analyze -b / tap -b run anywhere -- no fstool/psql needed, just the bundle.
 USAGE
     exit 1
@@ -242,8 +259,11 @@ BUNDLE=""
 CASE_REF="high-admission-trace"
 NODES_FILE=""
 HISTORY_DAYS=7
+REMOTE_TARGETS=""
+REMOTE_ARGS=()   # every option except -A/-N, replayed on each appliance in -A mode
 
-while getopts "w:k:n:s:a:d:b:c:N:D:h" opt; do
+while getopts "w:k:n:s:a:d:b:c:N:D:A:h" opt; do
+    case "$opt" in A|N|h|\?) ;; *) REMOTE_ARGS+=("-$opt" "$OPTARG") ;; esac
     case "$opt" in
         w) WINDOW="$OPTARG" ;;
         k) SWITCH_FILTER="$OPTARG" ;;
@@ -255,6 +275,7 @@ while getopts "w:k:n:s:a:d:b:c:N:D:h" opt; do
         c) CASE_REF="$OPTARG" ;;
         N) NODES_FILE="$OPTARG" ;;
         D) HISTORY_DAYS="$OPTARG" ;;
+        A) REMOTE_TARGETS="$OPTARG" ;;
         h) usage ;;
         *) usage ;;
     esac
@@ -296,6 +317,97 @@ lookup_mac_ip() {
         psql -t -F'|' -c "SELECT '${mac}', ((ip>>24)&255)||'.'||((ip>>16)&255)||'.'||((ip>>8)&255)||'.'||(ip&255), to_char(to_timestamp(time/1000),'YYYY-MM-DD HH24:MI:SS'), (time/1000)::bigint FROM mac_ip WHERE mac='${mac}' ORDER BY time DESC LIMIT 1;" 2>/dev/null | head -1 || true
     fi
 }
+
+# ==================================================================
+# -A: run from the EM against one or more appliances
+# ==================================================================
+if [ -n "$REMOTE_TARGETS" ]; then
+    case "$MODE" in
+        analyze|tap) ;;
+        *) echo "Error: -A works with analyze and tap only -- live and collect change state on the appliance, run those there." >&2; exit 1 ;;
+    esac
+    if [ -n "$BUNDLE" ]; then
+        echo "Error: -A and -b don't mix -- -b analyses a bundle right here." >&2
+        exit 1
+    fi
+
+    # Same ssh behaviour as `fstool oneach`: the EM's root key, no prompts, no known_hosts churn.
+    SSH_OPTS=(-o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+    RWORK=$(mktemp -d /tmp/hat-remote.XXXXXX)
+    trap 'rm -rf "$RWORK"' EXIT
+
+    # The EM's appliance registry: node id | name | address | resolved IP -- for the block
+    # headers (a target given as an IP still finds its name) and for tap's -N list.
+    REG="$RWORK/reg.txt"
+    : > "$REG"
+    if command -v psql >/dev/null 2>&1; then
+        psql -t -A -F'|' -c "select node_id, name, coalesce(address, '') from reg" 2>/dev/null \
+            | while IFS='|' read -r id nm addr; do
+                [ -n "$id" ] || continue
+                rip=$(getent hosts "$addr" 2>/dev/null | awk '{ print $1; exit }' || true)
+                echo "$id|$nm|$addr|${rip:-$addr}"
+            done > "$REG" || true
+    fi
+
+    if [ "$REMOTE_TARGETS" = "all" ]; then
+        if ! command -v fstool >/dev/null 2>&1; then
+            echo "Error: -A all needs fstool -- run it on the EM (or name the appliances)." >&2
+            exit 1
+        fi
+        TARGET_LIST=$(fstool oneach -g </dev/null 2>/dev/null | tr ',' '\n' || true)
+    elif [ -f "$REMOTE_TARGETS" ]; then
+        TARGET_LIST=$(sed 's/#.*//' "$REMOTE_TARGETS" | tr ', \t\r' '\n\n\n\n')
+    else
+        TARGET_LIST=$(echo "$REMOTE_TARGETS" | tr ',' '\n')
+    fi
+    TARGET_LIST=$(echo "$TARGET_LIST" | awk 'NF && !seen[$1]++ { print $1 }')
+    if [ -z "$TARGET_LIST" ]; then
+        echo "Error: -A '$REMOTE_TARGETS' gave no appliances." >&2
+        exit 1
+    fi
+
+    NODES_OUT=""
+    if [ "$MODE" = "tap" ]; then
+        if [ -n "$NODES_FILE" ]; then
+            NODES_OUT="$NODES_FILE"
+        elif [ -s "$REG" ]; then
+            NODES_OUT="$RWORK/nodes.txt"
+            awk -F'|' '{ print $1 "|" $2 }' "$REG" > "$NODES_OUT"
+        fi
+    fi
+
+    SELF=$(readlink -f "$0")
+    RTAG="/tmp/hat-remote-$$"
+    OK_LIST=(); FAIL_LIST=()
+    echo "Running '$MODE' on: $(echo "$TARGET_LIST" | tr '\n' ' ')"
+    for t in $TARGET_LIST; do
+        nm=$(awk -F'|' -v t="$t" '$3 == t || $4 == t || $2 == t { print $2; exit }' "$REG")
+        echo
+        echo "################ appliance ${nm:-$t} ($t) -- $MODE ################"
+        if ! scp -q "${SSH_OPTS[@]}" "$SELF" "root@$t:$RTAG.sh" 2>"$RWORK/err"; then
+            echo "  FAILED: couldn't copy the script to $t -- $(head -1 "$RWORK/err")"
+            FAIL_LIST+=("$t (unreachable)")
+            continue
+        fi
+        RARGS=("${REMOTE_ARGS[@]}")
+        if [ -n "$NODES_OUT" ] && scp -q "${SSH_OPTS[@]}" "$NODES_OUT" "root@$t:$RTAG.nodes" 2>/dev/null; then
+            RARGS+=(-N "$RTAG.nodes")
+        fi
+        # The script and node list are removed on the appliance whatever the outcome.
+        RCMD="bash $RTAG.sh $(printf '%q ' "$MODE" "${RARGS[@]}"); rc=\$?; rm -f $RTAG.sh $RTAG.nodes; exit \$rc"
+        if ssh -n "${SSH_OPTS[@]}" "root@$t" "$RCMD"; then
+            OK_LIST+=("$t")
+        else
+            FAIL_LIST+=("$t (exit $?)")
+        fi
+    done
+
+    echo
+    echo "=== Summary: $MODE on ${#OK_LIST[@]} appliance(s) OK, ${#FAIL_LIST[@]} failed ==="
+    for t in "${OK_LIST[@]}"; do echo "  OK      $t"; done
+    for t in "${FAIL_LIST[@]}"; do echo "  FAILED  $t"; done
+    if [ "${#FAIL_LIST[@]}" -eq 0 ]; then exit 0; else exit 1; fi
+fi
 
 # ==================================================================
 # live mode
