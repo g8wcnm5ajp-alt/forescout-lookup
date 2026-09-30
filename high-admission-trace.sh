@@ -39,6 +39,26 @@
 #   always cleared on exit. Use this once `analyze` has narrowed down a
 #   suspect switch, for full port/VLAN confirmation and precise timing.
 #
+#   tap -- read-only. Which endpoints keep this appliance in Admission
+#   TAP control state (eyeSight's admission throttle: >100 admissions/h
+#   or >1,000/10 h appliance-wide turns it on; a host with 5+ admissions
+#   of one type in 10 h then has further ones of that type ignored, so
+#   its properties stop being rechecked -- see "Admission TAP Control" in
+#   the vault). Reports: the TAP on/off history from adm.tap.active (every
+#   daily stats file present, not just today), what pushed it into TAP
+#   (admissions in the hour before each entry), admissions by type with
+#   how many TAP accepted vs discarded, and -- the part switch logs can't
+#   give without debug -- the ENDPOINTS behind them, from the DHCP
+#   Classifier's plugin_learn_cb lines (every admission the engine hands
+#   dhclass: type, host IP/MAC, and the plugin@appliance that raised it,
+#   at no debug level). Flags hosts over the per-host threshold (i.e.
+#   being throttled) and any IP<->MAC pairing changes seen. Built on a
+#   real customer case (2026-09-29), where it named one thin client in a
+#   reboot loop as ~85% of an appliance's switch-port admissions and 11
+#   IP-less devices as a second appliance's whole idc flood. Needs the
+#   dhclass plugin running for the endpoint part; without it the TAP and
+#   counter sections still work. Works live or on a bundle (-b).
+#
 #   collect -- builds a real Forescout tech-support bundle (`fstool
 #   tech-support -p sw --pack`) carrying everything `analyze` needs:
 #   a time-windowed excerpt of today.log, of sw_mac_track.log, and a
@@ -97,9 +117,12 @@
 # Usage:
 #   ./high-admission-trace.sh analyze [-w <window>] [-k <switch-ip>[,<switch-ip>...]] [-n <top-N>] [-s <spike-N>] [-a <stale-days>] [-b <bundle.tgz|bundle-dir>]
 #   ./high-admission-trace.sh live -k <switch-ip>[,<switch-ip>...] [-d <duration>]
+#   ./high-admission-trace.sh tap [-w <window>|all] [-n <top-N>] [-D <days>] [-N <nodes-file>] [-b <bundle.tgz|bundle-dir>]
 #   ./high-admission-trace.sh collect [-w <window>] [-c <case-ref>]
 #
-#   -w  How far back to look, e.g. 30m, 2h, 1d (analyze/collect; default 1h)
+#   -w  How far back to look, e.g. 30m, 2h, 1d (analyze/collect/tap; default 1h;
+#       tap also takes "all"). In tap -b mode the window ends at the bundle's
+#       last today.log sample, not "now"
 #   -k  Switch IP(s), comma-separated (optional filter in analyze mode;
 #       required in live mode)
 #   -n  Top-N switch/port/MAC entries to report (analyze mode; default 10)
@@ -111,11 +134,16 @@
 #   -b  Analyze a bundle instead of this live appliance -- a .tgz (auto-
 #       extracted to a temp dir) or an already-unpacked bundle directory
 #   -c  Case reference / comment for the bundle (collect mode)
+#   -D  tap mode: days of daily stats history to read for the TAP on/off
+#       history (default 7; 0 = today.log only)
+#   -N  tap mode: node-id -> appliance-name list, e.g. the EM's
+#       `psql -c "select node_id,name from reg"` output saved to a file.
+#       Live, the script tries that query itself (works on the EM)
 #   -h  Show this help
 #
 set -euo pipefail
 
-VERSION="1.3.4"
+VERSION="1.4.0"
 
 # Overridden below when -b points analyze at a bundle instead of this
 # live appliance -- everything else in the script reads through these
@@ -132,6 +160,13 @@ MAC_IP_CSV=""   # only set in bundle mode -- live mode queries psql directly ins
 # this is every rotation found, fed to awk as multiple files at once.
 SW_PLUGIN_LOG_FILES=()
 
+# tap mode: dhclass plugin logs (per-endpoint admissions) and daily stats
+# files (stats/YYYY_MM_DD.gz = the PREVIOUS day's today.log, written at
+# midnight) -- found live below, or under the bundle in -b mode.
+DHCLASS_LOG_FILES=()
+STATS_DAILY_FILES=()
+BUNDLE_TMP=""   # set when -b extracted a .tgz to a temp dir (cleaned up on exit)
+
 usage() {
     cat <<USAGE
 high-admission-trace.sh v${VERSION}
@@ -139,6 +174,7 @@ high-admission-trace.sh v${VERSION}
 Usage:
   $0 analyze [-w <window>] [-k <switch-ip>[,<switch-ip>...]] [-n <top-N>] [-s <spike-N>] [-a <stale-days>] [-b <bundle.tgz|bundle-dir>]
   $0 live -k <switch-ip>[,<switch-ip>...] [-d <duration>]
+  $0 tap [-w <window>|all] [-n <top-N>] [-D <days>] [-N <nodes-file>] [-b <bundle.tgz|bundle-dir>]
   $0 collect [-w <window>] [-c <case-ref>]
 
   analyze  Read-only: admission-source breakdown, top switch/port/MAC activity,
@@ -151,13 +187,20 @@ Usage:
            sweet spot) on the given switch(es), waits out the window, then
            reports the real admission/trap lines captured. Debug is always
            cleared on exit.
+  tap      Read-only: which ENDPOINTS keep this appliance in Admission TAP
+           control -- TAP on/off history (adm.tap.active, all daily stats
+           files), what pushed it in, admissions by type accepted/discarded,
+           and the hosts behind them from the DHCP Classifier's learn
+           callbacks (type, IP/MAC, raising plugin@appliance), with hosts
+           over the per-host threshold and IP<->MAC changes flagged.
   collect  Builds a real tech-support bundle (-p sw --pack) with everything
            analyze needs attached: windowed today.log/sw_mac_track.log excerpts
            and a plain-text mac_ip export (none of these ship in a standard
            bundle by default; sw.log's full history already does). Hand the
-           resulting .tgz to `analyze -b` for offline/remote-site analysis.
+           resulting .tgz to 'analyze -b' for offline/remote-site analysis.
 
-  -w  How far back to look, e.g. 30m, 2h, 1d (analyze/collect; default 1h)
+  -w  How far back to look, e.g. 30m, 2h, 1d (analyze/collect/tap; default 1h;
+      tap also takes "all"; with -b the window ends at the bundle's last sample)
   -k  Switch IP(s), comma-separated (optional filter in analyze mode;
       required in live mode)
   -n  Top-N switch/port/MAC entries to report (analyze mode; default 10)
@@ -169,10 +212,13 @@ Usage:
   -b  Analyze a bundle instead of this live appliance -- a .tgz (auto-extracted
       to a temp dir) or an already-unpacked bundle directory
   -c  Case reference / comment for the bundle (collect mode)
+  -D  tap: days of daily stats history for the TAP on/off history (default 7)
+  -N  tap: node-id -> appliance-name file (the EM's "select node_id,name from reg"
+      output); live, the script tries that query itself
   -h  Show this help
 
 analyze/live/collect (without -b) run ON the appliance itself, as root.
-analyze -b runs anywhere -- no fstool/psql needed, just the bundle.
+analyze -b / tap -b run anywhere -- no fstool/psql needed, just the bundle.
 USAGE
     exit 1
 }
@@ -181,9 +227,9 @@ USAGE
 
 MODE="$1"; shift
 case "$MODE" in
-    analyze|live|collect) ;;
+    analyze|live|collect|tap) ;;
     -h|--help) usage ;;
-    *) echo "Error: unknown mode '$MODE' (expected 'analyze', 'live', or 'collect')" >&2; usage ;;
+    *) echo "Error: unknown mode '$MODE' (expected 'analyze', 'live', 'tap', or 'collect')" >&2; usage ;;
 esac
 
 WINDOW="1h"
@@ -194,8 +240,10 @@ STALE_DAYS=7
 DURATION="15m"
 BUNDLE=""
 CASE_REF="high-admission-trace"
+NODES_FILE=""
+HISTORY_DAYS=7
 
-while getopts "w:k:n:s:a:d:b:c:h" opt; do
+while getopts "w:k:n:s:a:d:b:c:N:D:h" opt; do
     case "$opt" in
         w) WINDOW="$OPTARG" ;;
         k) SWITCH_FILTER="$OPTARG" ;;
@@ -205,6 +253,8 @@ while getopts "w:k:n:s:a:d:b:c:h" opt; do
         d) DURATION="$OPTARG" ;;
         b) BUNDLE="$OPTARG" ;;
         c) CASE_REF="$OPTARG" ;;
+        N) NODES_FILE="$OPTARG" ;;
+        D) HISTORY_DAYS="$OPTARG" ;;
         h) usage ;;
         *) usage ;;
     esac
@@ -379,6 +429,7 @@ if [ -n "$BUNDLE" ]; then
         BUNDLE_ROOT="$BUNDLE"
     elif [ -f "$BUNDLE" ]; then
         BUNDLE_ROOT=$(mktemp -d /tmp/hat-unpack.XXXXXX)
+        BUNDLE_TMP="$BUNDLE_ROOT"
         echo "=== Unpacking $BUNDLE to $BUNDLE_ROOT ==="
         # Always clean this up on exit, success or failure -- confirmed
         # live this leaked multiple GB per run otherwise (an 867MB real
@@ -447,7 +498,15 @@ if [ -n "$BUNDLE" ]; then
         SW_PLUGIN_LOG_FILES+=("$f")
     done < <(find "$BUNDLE_ROOT" -path "*/usr/local/forescout/log/plugin/sw/sw*.log" 2>/dev/null | sort)
 
-    echo "Bundle sources found: today.log=${TODAY_LOG:-none} sw_mac_track.log=${MAC_TRACK_LOG:-none} mac_ip.csv=${MAC_IP_CSV:-none} sw.log=${#SW_PLUGIN_LOG_FILES[@]} file(s)"
+    # tap mode's sources: dhclass learn-callback logs and daily stats history.
+    while IFS= read -r f; do
+        DHCLASS_LOG_FILES+=("$f")
+    done < <(find "$BUNDLE_ROOT" -path "*/usr/local/forescout/log/plugin/dhclass/dhclass*.log" 2>/dev/null | sort)
+    while IFS= read -r f; do
+        STATS_DAILY_FILES+=("$f")
+    done < <(find "$BUNDLE_ROOT" -path "*/usr/local/forescout/stats/*" -name "[0-9][0-9][0-9][0-9]_[0-9][0-9]_[0-9][0-9].gz" 2>/dev/null | sort)
+
+    echo "Bundle sources found: today.log=${TODAY_LOG:-none} sw_mac_track.log=${MAC_TRACK_LOG:-none} mac_ip.csv=${MAC_IP_CSV:-none} sw.log=${#SW_PLUGIN_LOG_FILES[@]} file(s) dhclass.log=${#DHCLASS_LOG_FILES[@]} file(s) daily-stats=${#STATS_DAILY_FILES[@]} file(s)"
     echo
 fi
 
@@ -458,6 +517,273 @@ fi
 if [ -z "$TODAY_LOG" ] || [ ! -f "$TODAY_LOG" ]; then
     echo "Error: no today.log source found$( [ -n "$BUNDLE" ] && echo " in this bundle" )." >&2
     exit 1
+fi
+
+# ==================================================================
+# tap mode
+# ==================================================================
+if [ "$MODE" = "tap" ]; then
+    # eyeSight defaults (FSAdmTap): per host, this many admissions of one type ...
+    TAP_COUNT=5
+    # ... within this many seconds -> further ones of that type are ignored.
+    TAP_PERIOD=36000
+    if [ -z "$BUNDLE" ]; then
+        for f in /usr/local/forescout/log/plugin/dhclass/dhclass*.log; do
+            [ -f "$f" ] && DHCLASS_LOG_FILES+=("$f")
+        done
+        for f in /usr/local/forescout/stats/[0-9][0-9][0-9][0-9]_[0-9][0-9]_[0-9][0-9].gz; do
+            [ -f "$f" ] && STATS_DAILY_FILES+=("$f")
+        done
+        # Live: use this appliance's own thresholds if someone overrode them
+        # (blank = default, per `fstool get_property`).
+        if command -v fstool >/dev/null 2>&1; then
+            v=$(fstool get_property fs.adm.tap.count 2>/dev/null | awk '{for (i = NF; i > 0; i--) if ($i ~ /^[0-9]+$/) { print $i; exit }}' || true)
+            [ -n "$v" ] && TAP_COUNT="$v"
+            v=$(fstool get_property fs.adm.tap.period.sec 2>/dev/null | awk '{for (i = NF; i > 0; i--) if ($i ~ /^[0-9]+$/) { print $i; exit }}' || true)
+            [ -n "$v" ] && TAP_PERIOD="$v"
+        fi
+    fi
+
+    TAPWORK=$(mktemp -d /tmp/hat-tap.XXXXXX)
+    trap 'rm -rf "$TAPWORK"; if [ -n "$BUNDLE_TMP" ]; then rm -rf "$BUNDLE_TMP"; fi' EXIT
+
+    # node id -> appliance name (learn events carry only the node id)
+    NAMES_TSV="$TAPWORK/names.tsv"
+    : > "$NAMES_TSV"
+    if [ -n "$NODES_FILE" ]; then
+        if [ -f "$NODES_FILE" ]; then
+            awk -F'|' 'NF >= 2 { id = $1; nm = $2; gsub(/[ \t\r]/, "", id); gsub(/^[ \t]+|[ \t\r]+$/, "", nm); if (id ~ /^-?[0-9]+$/ && nm != "") print id "\t" nm }' "$NODES_FILE" > "$NAMES_TSV"
+        else
+            echo "Warning: -N '$NODES_FILE' not found -- showing node ids instead of names." >&2
+        fi
+    elif [ -z "$BUNDLE" ] && command -v psql >/dev/null 2>&1; then
+        psql -t -A -F'|' -c "select node_id, name from reg" 2>/dev/null \
+            | awk -F'|' 'NF >= 2 && $1 ~ /^-?[0-9]+$/ { print $1 "\t" $2 }' > "$NAMES_TSV" || true
+    fi
+
+    # Window: live ends now; a bundle ends at its own last today.log sample.
+    LAST_TS=$(tail -n 200 "$TODAY_LOG" | awk '$1 == "p" { t = $2 } END { print t + 0 }')
+    if [ -z "$BUNDLE" ]; then END_EPOCH=$(date +%s); else END_EPOCH="$LAST_TS"; fi
+    if [ "$WINDOW" = "all" ]; then
+        START_EPOCH=0
+    else
+        START_EPOCH=$((END_EPOCH - $(window_to_seconds "$WINDOW")))
+    fi
+    echo "Window: $( [ "$WINDOW" = "all" ] && echo "all of today.log" || echo "last ${WINDOW}" ) ending $(awk -v t="$END_EPOCH" 'BEGIN { print strftime("%Y-%m-%d %H:%M:%S", t) }')$( [ -n "$BUNDLE" ] && echo " (the bundle's last sample)" )"
+    echo "Per-host TAP threshold in use: ${TAP_COUNT} admissions of one type within $((TAP_PERIOD / 3600))h"
+    echo
+
+    # One pass per stats file, keeping only the three metric families used below.
+    TAPDATA="$TAPWORK/tap.dat"
+    EXTRACT='$1 == "p" && ($5 == "adm.tap.active" || $5 ~ /^learn\.adm\./ || $5 ~ /^adm\.tap\.(accept|discard)\./) { print $2, $5, $6 }'
+    {
+        if [ "${#STATS_DAILY_FILES[@]}" -gt 0 ] && [ "$HISTORY_DAYS" -gt 0 ]; then
+            printf '%s\n' "${STATS_DAILY_FILES[@]}" | sort | tail -n "$HISTORY_DAYS" > "$TAPWORK/daily.lst"
+            while IFS= read -r f; do
+                gzip -dc "$f" 2>/dev/null | awk "$EXTRACT" || true
+            done < "$TAPWORK/daily.lst"
+        fi
+        awk "$EXTRACT" "$TODAY_LOG"
+    } > "$TAPDATA"
+
+    # ---------------------------------------------------------------
+    echo "=== 1. Admission TAP control state (adm.tap.active, one sample a minute) ==="
+    echo "  (ON when admissions across ALL endpoints exceed 100/h or 1,000/10h. ON by itself throttles"
+    echo "  nothing -- it arms the per-host rule in section 4.)"
+    awk '$2 == "adm.tap.active" { print $1, ($3 == "true" ? 1 : 0) }' "$TAPDATA" | sort -n -u -k1,1 > "$TAPWORK/active.dat"
+    awk -v entries="$TAPWORK/entries.dat" '
+        {
+            t = $1; a = $2; d = strftime("%Y-%m-%d", t)
+            if (!(d in seen)) { seen[d] = 1; days[++nd] = d; run = 0 }
+            n[d]++
+            if (a) act[d]++
+            if (a && !prev) {
+                if (NR == 1) { onatstart = 1; lastentry = t }   # already ON when the data starts -- not an entry
+                else {
+                    ent[d]++
+                    if (ent[d] <= 6) elist[d] = elist[d] (elist[d] == "" ? "" : " ") strftime("%H:%M", t)
+                    lastentry = t; print t > entries
+                }
+            }
+            if (!a && prev) lastexit = t
+            run = a ? run + 1 : 0
+            if (run > best[d]) best[d] = run
+            orun = a ? orun + 1 : 0
+            if (orun > obest) { obest = orun; obest_end = t }
+            prev = a; lasta = a; lastt = t
+        }
+        END {
+            if (nd == 0) { print "  (no adm.tap.active samples found)"; exit }
+            if (onatstart) printf "  (already ON at the first sample, %s -- not counted as an entry)\n", strftime("%Y-%m-%d %H:%M", first_t)
+            printf "  %-10s %8s %8s %6s %8s %13s  %s\n", "day", "samples", "in TAP", "", "entries", "longest run", "entered at"
+            for (i = 1; i <= nd; i++) {
+                d = days[i]
+                printf "  %-10s %8d %8d %5.0f%% %8d %9d min  %s\n", d, n[d], act[d] + 0, 100 * (act[d] + 0) / n[d], ent[d] + 0, best[d] + 0, elist[d]
+            }
+            if (obest > 0) printf "\n  Longest continuous TAP run in this data: %d min, ending %s\n", obest, strftime("%Y-%m-%d %H:%M", obest_end)
+            if (lasta) printf "  Current state: IN TAP control since %s%s\n", strftime("%Y-%m-%d %H:%M", lastentry), ((onatstart && lastentry == first_t) ? " -- already ON when this data starts; add daily stats history (-D, or the full bundle) to see when it went in" : "")
+            else if (lastexit) printf "  Current state: not in TAP control (last left it %s)\n", strftime("%Y-%m-%d %H:%M", lastexit)
+            else print "  Current state: not in TAP control"
+        }
+        NR == 1 { first_t = $1 }
+    ' "$TAPWORK/active.dat"
+
+    # ---------------------------------------------------------------
+    echo
+    echo "=== 2. What pushed it into TAP -- admissions in the hour before each entry (last 5 entries) ==="
+    if [ ! -s "$TAPWORK/entries.dat" ]; then
+        echo "  (no TAP entry in this data)"
+    else
+        tail -n 5 "$TAPWORK/entries.dat" > "$TAPWORK/entries5.dat"
+        awk -v ef="$TAPWORK/entries5.dat" '
+            BEGIN { while ((getline x < ef) > 0) E[++ne] = x + 0 }
+            $2 ~ /^learn\.adm\./ {
+                for (i = 1; i <= ne; i++)
+                    if ($1 > E[i] - 3600 && $1 <= E[i]) { S[i, substr($2, 11)] += $3; tot[i] += $3; T[substr($2, 11)] = 1 }
+            }
+            END {
+                for (i = 1; i <= ne; i++) {
+                    line = ""
+                    for (t in T) if (S[i, t] > 0) line = line sprintf("%s=%d ", t, S[i, t])
+                    printf "  entered %s -- %d admissions in the hour before: %s\n", strftime("%Y-%m-%d %H:%M", E[i]), tot[i] + 0, (line == "" ? "(no learn.adm data for that hour)" : line)
+                }
+            }
+        ' "$TAPDATA"
+    fi
+
+    # ---------------------------------------------------------------
+    echo
+    echo "=== 3. Admissions in the window by type (today.log) -- accepted vs ignored by TAP ==="
+    awk -v s="$START_EPOCH" -v e="$END_EPOCH" '
+        $1 >= s && $1 <= e {
+            if ($2 ~ /^learn\.adm\./)             { t = substr($2, 11); L[t] += $3; T[t] = 1 }
+            else if ($2 ~ /^adm\.tap\.accept\./)  { t = substr($2, 16); A[t] += $3; T[t] = 1 }
+            else if ($2 ~ /^adm\.tap\.discard\./) { t = substr($2, 17); D[t] += $3; T[t] = 1 }
+        }
+        END { for (t in T) printf "%d\t%s\t%d\t%d\n", L[t], t, A[t], D[t] }
+    ' "$TAPDATA" | sort -t$'\t' -k1,1rn > "$TAPWORK/bytype.tsv"
+    ADM_TOTAL=$(awk -F'\t' '{ s += $1 } END { print s + 0 }' "$TAPWORK/bytype.tsv")
+    if [ ! -s "$TAPWORK/bytype.tsv" ]; then
+        echo "  (no admission counters in this window)"
+    else
+        printf "  %-14s %10s %10s %10s %9s\n" "type" "admissions" "accepted" "ignored" "% ignored"
+        while IFS=$'\t' read -r cnt t acc dis; do
+            pct=$(awk -v a="$acc" -v d="$dis" 'BEGIN { printf "%.0f", (a + d > 0) ? 100 * d / (a + d) : 0 }')
+            printf "  %-14s %10s %10s %10s %8s%%\n" "$t" "$cnt" "$acc" "$dis" "$pct"
+        done < "$TAPWORK/bytype.tsv"
+        echo "  total          $ADM_TOTAL"
+    fi
+
+    # ---------------------------------------------------------------
+    echo
+    echo "=== 4. The endpoints behind them (dhclass plugin_learn_cb) ==="
+    if [ "${#DHCLASS_LOG_FILES[@]}" -eq 0 ]; then
+        echo "  (no dhclass.log found$( [ -n "$BUNDLE" ] && echo " in this bundle" ) -- per-endpoint attribution needs the DHCP Classifier"
+        echo "  plugin running on this appliance. Without it, run 'analyze' (switch logs) or elevate Switch-plugin"
+        echo "  debug with 'live' on the switch-managing appliance.)"
+    else
+        LC_ALL=C awk -v s="$START_EPOCH" -v e="$END_EPOCH" '
+            /plugin_learn_cb/ {
+                split($0, f, ":"); t = int(f[3])   # whole seconds: a fractional epoch prints as 1.79069e+09
+                if (t < s || t > e) next
+                if (!match($0, /\{name=adm,value=([a-z_0-9]+)\}/, am)) next
+                host = ""
+                if (match($0, /host=\{(.*)\},learnevent=/, hm)) host = hm[1]
+                gsub(/_timeinfo=\{[^}]*\},?/, "", host)
+                ip = "-"; mac = "-"
+                if (match(host, /(^|,)ip=([0-9.]+)/, im)) ip = im[2]
+                if (match(host, /(^|,)mac=([0-9a-f]{12})/, mm)) mac = mm[2]
+                # MAC-only hosts are keyed by a 224.x placeholder IP that
+                # appears here as a plain integer.
+                if (ip != "-" && ip !~ /\./) { v = ip + 0; ip = int(v / 16777216) % 256 "." int(v / 65536) % 256 "." int(v / 256) % 256 "." v % 256 }
+                agent = "-"; node = "-"
+                if (match($0, /learnevent=\{agent=\{id=([a-z_0-9]+),nodeid=(-?[0-9]+)\}/, gm)) { agent = gm[1]; node = gm[2] }
+                else if ($0 ~ /learnevent=\{agent=,/) { agent = "engine"; node = "local" }   # raised by the engine itself
+                print t "\t" ip "\t" mac "\t" am[1] "\t" agent "\t" node
+            }
+        ' "${DHCLASS_LOG_FILES[@]}" > "$TAPWORK/cb.tsv"
+
+        CB_TOTAL=$(wc -l < "$TAPWORK/cb.tsv" | tr -d ' ')
+        if [ "$CB_TOTAL" -eq 0 ]; then
+            echo "  (dhclass.log present but it has no learn callbacks in this window -- it may have rotated;"
+            echo "  widen -w or collect closer to the event)"
+        else
+            CB_FIRST=$(awk -F'\t' 'NR == 1 || $1 < m { m = $1 } END { print strftime("%H:%M", m) }' "$TAPWORK/cb.tsv")
+            CB_LAST=$(awk -F'\t' '$1 > m { m = $1 } END { print strftime("%H:%M", m) }' "$TAPWORK/cb.tsv")
+            echo "  Coverage: dhclass named ${CB_TOTAL} admissions between ${CB_FIRST} and ${CB_LAST}; today.log counted ${ADM_TOTAL} in the"
+            echo "  whole window. The endpoint figures below are for the dhclass span -- if it is much shorter than"
+            echo "  the window (dhclass.log rotated), re-run with a -w that matches it for a like-for-like share."
+
+            # Aggregate per host + type + source, with the per-host TAP rule applied.
+            LC_ALL=C awk -F'\t' -v names="$NAMES_TSV" -v tc="$TAP_COUNT" -v tp="$TAP_PERIOD" '
+                BEGIN { while ((getline l < names) > 0) { split(l, x, "\t"); nm[x[1]] = x[2] } }
+                {
+                    src = ($5 == "engine") ? "engine (this appliance)" : $5 "@" (($6 in nm) ? nm[$6] : $6)
+                    k = $2 SUBSEP $3 SUBSEP $4 SUBSEP src
+                    c[k]++; ts[k, c[k]] = $1
+                }
+                END {
+                    for (k in c) {
+                        n = c[k]
+                        for (i = 1; i <= n; i++) a[i] = ts[k, i]
+                        for (i = 2; i <= n; i++) { v = a[i]; j = i - 1; while (j >= 1 && a[j] > v) { a[j + 1] = a[j]; j-- } a[j + 1] = v }
+                        # largest number inside any TAP_PERIOD-long window
+                        mx = 0; lo = 1
+                        for (hi = 1; hi <= n; hi++) { while (a[hi] - a[lo] > tp) lo++; if (hi - lo + 1 > mx) mx = hi - lo + 1 }
+                        # typical interval, ignoring same-second duplicates
+                        dn = 1; dd[1] = a[1]
+                        for (i = 2; i <= n; i++) if (a[i] - dd[dn] >= 2) dd[++dn] = a[i]
+                        gap = (dn > 1) ? (dd[dn] - dd[1]) / (dn - 1) : 0
+                        split(k, p, SUBSEP)
+                        printf "%d\t%s\t%s\t%s\t%s\t%.0f\t%d\t%s\n", n, p[1], p[2], p[3], p[4], gap, mx, (mx >= tc ? "THROTTLED" : "")
+                        delete a; delete dd
+                    }
+                }
+            ' "$TAPWORK/cb.tsv" | sort -t$'\t' -k1,1rn > "$TAPWORK/hosts.tsv"
+
+            echo
+            echo "  --- By raising plugin@appliance ---"
+            awk -F'\t' '{ s[$5] += $1 } END { for (k in s) printf "%d\t%s\n", s[k], k }' "$TAPWORK/hosts.tsv" | sort -t$'\t' -k1,1rn > "$TAPWORK/bysrc.tsv"
+            while IFS=$'\t' read -r cnt src; do
+                printf "    %5s  %5.1f%%  %s\n" "$cnt" "$(awk -v c="$cnt" -v t="$CB_TOTAL" 'BEGIN { print 100 * c / t }')" "$src"
+            done < "$TAPWORK/bysrc.tsv"
+
+            echo
+            echo "  --- Top ${TOP_N} endpoints (share = of the ${CB_TOTAL} dhclass-named admissions) ---"
+            printf "    %5s %6s  %-12s %-15s %-13s %-30s %9s  %s\n" "count" "share" "type" "ip" "mac" "raised by" "every" "per-host TAP"
+            awk -v n="$TOP_N" 'NR <= n' "$TAPWORK/hosts.tsv" > "$TAPWORK/top.tsv"
+            while IFS=$'\t' read -r cnt ip mac t src gap mx flag; do
+                every="-"
+                [ "$gap" -gt 0 ] && every=$(awk -v g="$gap" 'BEGIN { if (g < 120) printf "%ds", g; else printf "%.1fm", g / 60 }')
+                printf "    %5s %5.1f%%  %-12s %-15s %-13s %-30s %9s  %s\n" "$cnt" "$(awk -v c="$cnt" -v t="$CB_TOTAL" 'BEGIN { print 100 * c / t }')" \
+                    "$t" "$ip" "$mac" "$src" "$every" "$( [ -n "$flag" ] && echo "THROTTLED ($mx of one type within $((TAP_PERIOD / 3600))h)" || echo "under threshold (max $mx)" )"
+            done < "$TAPWORK/top.tsv"
+
+            echo
+            THR_HOSTS=$(awk -F'\t' '$8 == "THROTTLED" { print $2 "|" $3 }' "$TAPWORK/hosts.tsv" | sort -u | wc -l | tr -d ' ')
+            THR_ADM=$(awk -F'\t' '$8 == "THROTTLED" { s += $1 } END { print s + 0 }' "$TAPWORK/hosts.tsv")
+            echo "  Hosts over the per-host threshold (their further admissions of that type are ignored, so their"
+            echo "  actively-resolved properties stop being rechecked): ${THR_HOSTS} host(s), ${THR_ADM} of the ${CB_TOTAL} named admissions."
+
+            echo
+            echo "  --- IP<->MAC pairing changes seen in these callbacks (a pairing change is itself an admission) ---"
+            awk -F'\t' '
+                $2 != "-" && $3 != "-" && $2 !~ /^224\./ { pair[$3, $2] = 1; macs[$2, $3] = 1 }
+                END {
+                    for (k in pair) { split(k, p, SUBSEP); ipn[p[1]]++; ips[p[1]] = ips[p[1]] (ips[p[1]] == "" ? "" : ",") p[2] }
+                    for (k in macs) { split(k, p, SUBSEP); macn[p[1]]++; ml[p[1]] = ml[p[1]] (ml[p[1]] == "" ? "" : ",") p[2] }
+                    for (m in ipn) if (ipn[m] > 1) { printf "    MAC %s seen with %d IPs: %s\n", m, ipn[m], ips[m]; f = 1 }
+                    for (i in macn) if (macn[i] > 1) { printf "    IP %s seen with %d MACs: %s\n", i, macn[i], ml[i]; f = 1 }
+                    if (!f) print "    (none in this window)"
+                }
+            ' "$TAPWORK/cb.tsv"
+        fi
+    fi
+
+    echo
+    echo "Notes: an IP shown as 224.x is Forescout's placeholder for a host with no known IP (MAC-only)."
+    echo "The same event can be logged as two callbacks a few seconds apart; the engine counts both."
+    exit 0
 fi
 
 WINDOW_SECONDS=$(window_to_seconds "$WINDOW")
