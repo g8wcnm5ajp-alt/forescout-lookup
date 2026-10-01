@@ -4112,11 +4112,13 @@ def do_analyzeadm(target, bundle_path, window, switch_filter, top_n, spike_n, st
     # thread and polls, never blocking a request on it, same pattern as
     # run_show_errors/tech-support builds.
     if mode == "em":
-        out, err, rc = run(["bash", "-s", "--", *args], timeout=1200, input=script_text)
+        out, err, rc = run(["timeout", str(HAT_BOX_TIMEOUT_ADM), "bash", "-s", "--", *args], timeout=1200, input=script_text)
     else:
-        remote_cmd = "bash -s -- " + " ".join(shlex.quote(a) for a in args)
+        remote_cmd = f"timeout {HAT_BOX_TIMEOUT_ADM} bash -s -- " + " ".join(shlex.quote(a) for a in args)
         out, err, rc = ssh_appliance(appliance, remote_cmd, timeout=1200, input=script_text)
 
+    if rc == 124:
+        fail(f"analyze ran longer than {HAT_BOX_TIMEOUT_ADM // 60} min on {target} and was stopped there -- try a shorter window.")
     if rc != 0:
         fail((err or out or f"analyze exited {rc}").strip()[-4000:])
     print(json.dumps({"target": target, "bundle": bundle_path, "output": out}))
@@ -4125,6 +4127,12 @@ def do_analyzeadm(target, bundle_path, window, switch_filter, top_n, spike_n, st
 # "plugin@<node id>" in tap's "raised by" output -- node ids decoded on the EM, which alone has
 # the reg table (an appliance running the script can only print the raw id).
 TAP_NODE_REF_RE = re.compile(r"@(-?\d+)\b")
+
+# The script runs under `timeout` ON the box, a little inside this side's own wait: when this
+# side gives up, the remote bash/awk/grep are stopped too instead of carrying on reading logs on
+# a busy appliance (seen 2026-10-01: a tap run timed out here at 900 s and kept going there).
+HAT_BOX_TIMEOUT_TAP = 870
+HAT_BOX_TIMEOUT_ADM = 1170
 
 
 def do_analyzetap(target, window, top_n, history_days):
@@ -4146,10 +4154,13 @@ def do_analyzetap(target, window, top_n, history_days):
     # tap reads today.log plus up to -D gzipped daily stats files -- a few seconds to a couple
     # of minutes on a busy appliance; app.py runs this in a background thread and polls.
     if mode == "em":
-        out, err, rc = run(["bash", "-s", "--", *args], timeout=900, input=script_text)
+        out, err, rc = run(["timeout", str(HAT_BOX_TIMEOUT_TAP), "bash", "-s", "--", *args], timeout=900, input=script_text)
     else:
-        remote_cmd = "bash -s -- " + " ".join(shlex.quote(a) for a in args)
+        remote_cmd = f"timeout {HAT_BOX_TIMEOUT_TAP} bash -s -- " + " ".join(shlex.quote(a) for a in args)
         out, err, rc = ssh_appliance(appliance, remote_cmd, timeout=900, input=script_text)
+    if rc == 124:
+        fail(f"TAP endpoints ran longer than {HAT_BOX_TIMEOUT_TAP // 60} min on {target} and was stopped there -- "
+             "try a shorter window or fewer history days.")
     if rc != 0:
         fail((err or out or f"tap exited {rc}").strip()[-4000:])
 

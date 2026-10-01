@@ -155,7 +155,7 @@
 #
 set -euo pipefail
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 
 # Overridden below when -b points analyze at a bundle instead of this
 # live appliance -- everything else in the script reads through these
@@ -658,6 +658,7 @@ if [ "$MODE" = "tap" ]; then
 
     TAPWORK=$(mktemp -d /tmp/hat-tap.XXXXXX)
     trap 'rm -rf "$TAPWORK"; if [ -n "$BUNDLE_TMP" ]; then rm -rf "$BUNDLE_TMP"; fi' EXIT
+    trap 'exit 143' TERM INT   # stopped from outside (e.g. the caller's timeout): still clean up
 
     # node id -> appliance name (learn events carry only the node id)
     NAMES_TSV="$TAPWORK/names.tsv"
@@ -683,19 +684,34 @@ if [ "$MODE" = "tap" ]; then
     fi
     echo "Window: $( [ "$WINDOW" = "all" ] && echo "all of today.log" || echo "last ${WINDOW}" ) ending $(awk -v t="$END_EPOCH" 'BEGIN { print strftime("%Y-%m-%d %H:%M:%S", t) }')$( [ -n "$BUNDLE" ] && echo " (the bundle's last sample)" )"
     echo "Per-host TAP threshold in use: ${TAP_COUNT} admissions of one type within $((TAP_PERIOD / 3600))h"
+
+    # A dhclass log last written before the window starts can't hold a line inside it --
+    # on a busy appliance with dhclass debug raised there can be many large rotated files
+    # (a 900 s timeout was hit on one, 2026-10-01), so skip them rather than read them all.
+    if [ "$START_EPOCH" -gt 0 ] && [ "${#DHCLASS_LOG_FILES[@]}" -gt 0 ]; then
+        DHCLASS_ALL=${#DHCLASS_LOG_FILES[@]}
+        KEEP=()
+        for f in "${DHCLASS_LOG_FILES[@]}"; do
+            m=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+            if [ "$m" -ge "$START_EPOCH" ]; then KEEP+=("$f"); fi
+        done
+        DHCLASS_LOG_FILES=("${KEEP[@]}")
+        echo "dhclass logs read: ${#DHCLASS_LOG_FILES[@]} of ${DHCLASS_ALL} (the rest were last written before the window)"
+    fi
     echo
 
     # One pass per stats file, keeping only the three metric families used below.
     TAPDATA="$TAPWORK/tap.dat"
     EXTRACT='$1 == "p" && ($5 == "adm.tap.active" || $5 ~ /^learn\.adm\./ || $5 ~ /^adm\.tap\.(accept|discard)\./) { print $2, $5, $6 }'
+    PREFILTER='adm\.tap\.(active|accept|discard)|learn\.adm\.'
     {
         if [ "${#STATS_DAILY_FILES[@]}" -gt 0 ] && [ "$HISTORY_DAYS" -gt 0 ]; then
             printf '%s\n' "${STATS_DAILY_FILES[@]}" | sort | tail -n "$HISTORY_DAYS" > "$TAPWORK/daily.lst"
             while IFS= read -r f; do
-                gzip -dc "$f" 2>/dev/null | awk "$EXTRACT" || true
+                gzip -dc "$f" 2>/dev/null | LC_ALL=C grep -E "$PREFILTER" | LC_ALL=C awk "$EXTRACT" || true
             done < "$TAPWORK/daily.lst"
         fi
-        awk "$EXTRACT" "$TODAY_LOG"
+        LC_ALL=C grep -E "$PREFILTER" "$TODAY_LOG" | LC_ALL=C awk "$EXTRACT" || true
     } > "$TAPDATA"
 
     # ---------------------------------------------------------------
@@ -789,12 +805,14 @@ if [ "$MODE" = "tap" ]; then
     # ---------------------------------------------------------------
     echo
     echo "=== 4. The endpoints behind them (dhclass plugin_learn_cb) ==="
-    if [ "${#DHCLASS_LOG_FILES[@]}" -eq 0 ]; then
+    if [ "${#DHCLASS_LOG_FILES[@]}" -eq 0 ] && [ -n "${DHCLASS_ALL:-}" ]; then
+        echo "  (no dhclass log was written during this window -- widen -w)"
+    elif [ "${#DHCLASS_LOG_FILES[@]}" -eq 0 ]; then
         echo "  (no dhclass.log found$( [ -n "$BUNDLE" ] && echo " in this bundle" ) -- per-endpoint attribution needs the DHCP Classifier"
         echo "  plugin running on this appliance. Without it, run 'analyze' (switch logs) or elevate Switch-plugin"
         echo "  debug with 'live' on the switch-managing appliance.)"
     else
-        LC_ALL=C awk -v s="$START_EPOCH" -v e="$END_EPOCH" '
+        LC_ALL=C grep -h -F plugin_learn_cb "${DHCLASS_LOG_FILES[@]}" | LC_ALL=C awk -v s="$START_EPOCH" -v e="$END_EPOCH" '
             /plugin_learn_cb/ {
                 split($0, f, ":"); t = int(f[3])   # whole seconds: a fractional epoch prints as 1.79069e+09
                 if (t < s || t > e) next
@@ -813,7 +831,7 @@ if [ "$MODE" = "tap" ]; then
                 else if ($0 ~ /learnevent=\{agent=,/) { agent = "engine"; node = "local" }   # raised by the engine itself
                 print t "\t" ip "\t" mac "\t" am[1] "\t" agent "\t" node
             }
-        ' "${DHCLASS_LOG_FILES[@]}" > "$TAPWORK/cb.tsv"
+        ' > "$TAPWORK/cb.tsv" || true
 
         CB_TOTAL=$(wc -l < "$TAPWORK/cb.tsv" | tr -d ' ')
         if [ "$CB_TOTAL" -eq 0 ]; then
