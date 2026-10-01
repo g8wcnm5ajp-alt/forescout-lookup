@@ -200,7 +200,7 @@
                         <input type="hidden" name="active_ip" value="{{ result.ip }}">
                         <button type="submit" class="btn-small">&#8635; Refresh</button>
                     </form>
-                    <button type="button" class="btn-small btn-gold ip-report-export-btn" onclick="window.print()">Export to PDF</button>
+                    <button type="button" class="btn-small btn-export ip-report-export-btn" onclick="window.print()">Export to PDF</button>
                     <a class="btn-small" href="/hostlog/download/{{ result.ip }}">Download host log (.zip)</a>
                     <button type="button" class="btn-small btn-secondary ip-sections-expand" data-slug="{{ slug }}">Expand all</button>
                     <button type="button" class="btn-small btn-secondary ip-sections-collapse" data-slug="{{ slug }}">Collapse all</button>
@@ -2320,7 +2320,7 @@
                         }
                         const result = d.result || {};
                         panelEl.innerHTML = (
-                            "<div class=\"no-print\"><button type=\"button\" class=\"btn-small btn-gold appliance-report-export-btn\">Export to PDF</button></div>" +
+                            "<div class=\"no-print\"><button type=\"button\" class=\"btn-small btn-export appliance-report-export-btn\">Export to PDF</button></div>" +
                             "<p class=\"hint\">Snapshot: " + escapeHtml(result.snapshot_dir || "—") +
                             " (deleted after reading -- this panel is a live review, not a retained bundle)</p>" +
                             renderCategories(result.categories) +

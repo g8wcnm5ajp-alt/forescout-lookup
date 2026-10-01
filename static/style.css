@@ -324,6 +324,10 @@ details.data-section summary:hover { color: var(--accent); }
 
 .btn-secondary { background: var(--panel); color: var(--text); border: 1px solid var(--border); }
 .btn-gold { background: var(--both); color: #0b1220; }
+/* Export to PDF (David 2026-10-01: the gold one was hard to see on the dark page) -- near-white,
+   dark bold text: the highest contrast here and clearly apart from the blue Refresh */
+.btn-export { background: #f5f7fa; color: #14213d; border: 1px solid #c9d3e3; font-weight: 700; }
+.btn-export:hover { background: #ffffff; opacity: 1; }
 
 /* An <a> styled as a button (e.g. "Clear results") needs the same reset
    `button {}` gives real <button> elements for free -- element-scoped
