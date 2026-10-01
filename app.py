@@ -48,7 +48,7 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.12.1"
+APP_VERSION = "1.13.0"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
@@ -1588,7 +1588,8 @@ def render(**kwargs):
     """render_template wrapper that always carries the pending-scheduled-jobs list, regardless of which
     action's route is rendering -- it's global state, not tied to any one lookup."""
     kwargs.setdefault("ip", "")
-    kwargs.setdefault("results", [])
+    if "results" not in kwargs:
+        kwargs["results"] = ws_results(_ws_id(create=False)) if has_request_context() else []
     kwargs.setdefault("result", None)
     kwargs.setdefault("error", None)
     kwargs.setdefault("action", None)
@@ -1642,17 +1643,98 @@ _LOG_LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) UTC \[([^\]]+
 _lookup_log_cache = {"at": 0.0, "text": ""}
 
 
+# Lookup workspace (David 2026-10-01: "add new lookups without losing the previous ones, refresh
+# just one or all"): the open lookups of one login session, in memory -- a new IP adds a tab and
+# only that IP is looked up; a tab's Refresh re-runs just that IP. Up to MAX_LOOKUP_IPS hosts,
+# kept LOOKUP_WS_TTL after last use. A failed lookup is shown once, not kept. A restart clears it.
+LOOKUP_WS_TTL = 8 * 3600
+_lookup_ws = {}
+_lookup_ws_lock = threading.Lock()
+
+
+def _ws_id(create=True):
+    wid = session.get("lookup_ws")
+    if not wid and create:
+        wid = secrets.token_hex(8)
+        session["lookup_ws"] = wid
+    return wid
+
+
+def _ws_locked(wid):
+    """The workspace for wid (created if new); caller holds _lookup_ws_lock. Expires idle ones."""
+    now = time.time()
+    for k in [k for k, v in _lookup_ws.items() if now - v["touched"] > LOOKUP_WS_TTL]:
+        _lookup_ws.pop(k, None)
+    ws = _lookup_ws.setdefault(wid, {"order": [], "entries": {}, "touched": now})
+    ws["touched"] = now
+    return ws
+
+
+def ws_merge(wid, entries):
+    """Adds/replaces the successful lookups in the workspace; returns the failed ones (shown once)."""
+    failed = []
+    with _lookup_ws_lock:
+        ws = _ws_locked(wid)
+        for e in entries:
+            if not e.get("result"):
+                failed.append(e)
+                continue
+            now = time.time()
+            ws["entries"][e["ip"]] = dict(e, looked_up_at=int(now),
+                                          looked_up_display=datetime.fromtimestamp(now, tz=timezone.utc).strftime("%H:%M UTC"))
+            if e["ip"] not in ws["order"]:
+                ws["order"].append(e["ip"])
+    return failed
+
+
+def ws_ips(wid):
+    with _lookup_ws_lock:
+        ws = _lookup_ws.get(wid) if wid else None
+        return list(ws["order"]) if ws else []
+
+
+def ws_results(wid):
+    with _lookup_ws_lock:
+        ws = _lookup_ws.get(wid) if wid else None
+        if not ws:
+            return []
+        ws["touched"] = time.time()
+        return [ws["entries"][ip] for ip in ws["order"]]
+
+
+def ws_remove(wid, ip=None):
+    """Removes one host, or every host when ip is None."""
+    with _lookup_ws_lock:
+        ws = _lookup_ws.get(wid) if wid else None
+        if not ws:
+            return
+        for k in ([ip] if ip else list(ws["order"])):
+            ws["entries"].pop(k, None)
+            if k in ws["order"]:
+                ws["order"].remove(k)
+
+
+def ws_capacity_error(wid, new_ips):
+    """None, or why these IPs can't be added (the union would exceed MAX_LOOKUP_IPS)."""
+    open_ips = ws_ips(wid)
+    total = len(set(open_ips) | set(new_ips))
+    if total > MAX_LOOKUP_IPS:
+        return (f"{len(open_ips)} lookup(s) are open and this would make {total} -- the limit is {MAX_LOOKUP_IPS}. "
+                f"Close a tab (x) or use Clear all first.")
+    return None
+
+
 def _expire_lookup_runs():
     now = time.time()
     for rid in [r for r, run in LOOKUP_RUNS.items() if now - run["started"] > LOOKUP_RUN_TTL]:
         LOOKUP_RUNS.pop(rid, None)
 
 
-def start_lookup_run(ips, active_ip):
+def start_lookup_run(ips, active_ip, wid):
     run_id = secrets.token_hex(8)
     run = {
         "id": run_id, "ips": ips, "active_ip": active_ip, "started": int(time.time()), "finished": None,
-        "status": "running", "results": [], "error": None,
+        "status": "running", "results": [], "error": None, "ws": wid, "failed": [],
         "per_ip": {ip: {"status": "queued", "pct": 0, "step": "Queued"} for ip in ips},
     }
     with _lookup_runs_lock:
@@ -1674,8 +1756,10 @@ def start_lookup_run(ips, active_ip):
                 entry = {"ip": ip, "result": result, "error": None}
             except ForescoutClientError as e:
                 entry = {"ip": ip, "result": None, "error": str(e)}
+            failed = ws_merge(wid, [entry])
             with _lookup_runs_lock:
                 run["results"].append(entry)
+                run["failed"] += failed
                 run["per_ip"][ip].update(status="done", pct=100, step="Done" if not entry["error"] else "Failed: " + entry["error"][:120])
         with _lookup_runs_lock:
             run["status"] = "done"
@@ -1733,8 +1817,32 @@ def lookup_start_route():
         return jsonify({"error": f"Not a valid IPv4 address: {', '.join(bad)}"}), 400
     if len(ips) > MAX_LOOKUP_IPS:
         return jsonify({"error": f"Too many IPs ({len(ips)}) -- limit is {MAX_LOOKUP_IPS} per lookup."}), 400
+    wid = _ws_id()
+    cap = ws_capacity_error(wid, ips)
+    if cap:
+        return jsonify({"error": cap}), 400
     _log_activity("lookup", ips=ips)
-    return jsonify({"run_id": start_lookup_run(ips, active_ip)})
+    return jsonify({"run_id": start_lookup_run(ips, active_ip, wid)})
+
+
+@app.route("/lookup/close", methods=["POST"])
+def lookup_close_route():
+    """A tab's x -- removes that host from the open lookups, so a reload doesn't bring it back."""
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    ip = request.form.get("ip", "").strip()
+    if not valid_ip(ip):
+        return jsonify({"error": "Not a valid IPv4 address."}), 400
+    ws_remove(_ws_id(create=False), ip)
+    return jsonify({"ok": True, "open": ws_ips(_ws_id(create=False))})
+
+
+@app.route("/lookup/clear", methods=["POST"])
+def lookup_clear_route():
+    """Clear all -- every open lookup closed."""
+    if _check_csrf():
+        ws_remove(_ws_id(create=False))
+    return redirect(url_for("index"))
 
 
 @app.route("/api/lookup_run/<run_id>", methods=["GET"])
@@ -1773,13 +1881,15 @@ def do_lookup():
         if run is not None:
             if run["status"] != "done":
                 return redirect(url_for("index"))
-            return render(ip=",".join(run["ips"]), results=list(run["results"]), error=None, action="lookup",
-                          active_ip=request.args.get("active_ip", "").strip() or run["active_ip"],
+            done_ok = [e["ip"] for e in run["results"] if e.get("result")]
+            return render(results=list(run["failed"]) + ws_results(run["ws"]), error=None, action="lookup",
+                          active_ip=request.args.get("active_ip", "").strip() or run["active_ip"] or (done_ok[-1] if done_ok else None),
                           db_check=run.get("db_check"))
         ip_raw = request.args.get("ip", "").strip()
         active_ip = request.args.get("active_ip", "").strip() or None
         if not ip_raw:
-            return redirect(url_for("index"))
+            # an expired run link or a bare /lookup: the open lookups as they are
+            return render(results=ws_results(_ws_id(create=False)), action="lookup", active_ip=active_ip)
     else:
         if not _check_csrf():
             return render(error="Session expired -- please try again.", action="lookup")
@@ -1787,19 +1897,25 @@ def do_lookup():
         active_ip = request.form.get("active_ip", "").strip() or None
     ips = [p.strip() for p in ip_raw.split(",") if p.strip()]
     _log_activity("lookup", ips=ips)
+    wid = _ws_id()
     error = None
-    results = []
+    failed = []
     db_check_report = None
     if len(ips) > MAX_LOOKUP_IPS:
         error = f"Too many IPs ({len(ips)}) -- limit is {MAX_LOOKUP_IPS} per lookup."
+    elif ws_capacity_error(wid, ips):
+        error = ws_capacity_error(wid, ips)
     else:
         db_check_report = get_db_check() if ips else None
         for ip in ips:
             try:
-                results.append({"ip": ip, "result": lookup(ip), "error": None})
+                entry = {"ip": ip, "result": lookup(ip), "error": None}
             except ForescoutClientError as e:
-                results.append({"ip": ip, "result": None, "error": str(e)})
-    return render(ip=ip_raw, results=results, error=error, action="lookup", active_ip=active_ip,
+                entry = {"ip": ip, "result": None, "error": str(e)}
+            failed += ws_merge(wid, [entry])
+        ok_ips = [ip for ip in ips if not any(f["ip"] == ip for f in failed)]
+        active_ip = active_ip or (ok_ips[-1] if ok_ips else None)
+    return render(results=failed + ws_results(wid), error=error, action="lookup", active_ip=active_ip,
                   db_check=db_check_report)
 
 

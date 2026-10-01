@@ -60,14 +60,11 @@
         <section class="page-tab-panel{% if active_page_tab != "lookup" %} page-tab-panel-hidden{% endif %}" data-page-tab-panel="lookup">
         <form method="post" action="/lookup" class="lookup-form no-print">
             <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-            <input type="text" name="ip" placeholder="203.0.113.10 or 203.0.113.10,203.0.113.11" value="{{ ip }}" required
+            <input type="text" name="ip" placeholder="{% if results %}Add a host: 203.0.113.12 (open lookups stay){% else %}203.0.113.10 or 203.0.113.10,203.0.113.11{% endif %}" value="" required
                    pattern="^\s*(\d{1,3}\.){3}\d{1,3}\s*(,\s*(\d{1,3}\.){3}\d{1,3}\s*)*$"
                    title="One or more IPv4 addresses, comma-separated">
             <button type="submit" id="lookup-submit-btn">Look up</button>
             <span id="lookup-spinner" class="spinner" style="display:none"></span>
-            {% if results %}
-            <a href="/" class="btn-small btn-secondary" id="lookup-clear-all">Clear results</a>
-            {% endif %}
         </form>
         <div class="card no-print" id="lookup-progress" style="display:none;">
             <h3>Collecting host data <span class="muted" id="lookup-progress-elapsed"></span></h3>
@@ -162,12 +159,27 @@
 
         {% set successful = results|selectattr('result')|list %}
         {% set tabbed = successful|length > 1 %}
+        {% if successful %}
+        <div class="lookup-toolbar no-print">
+            <span class="muted">{{ successful|length }} open lookup(s) -- a new address above adds a tab; each tab's Refresh re-runs just that host.</span>
+            <form method="post" action="/lookup" class="inline-form" id="lookup-refresh-all-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <input type="hidden" name="ip" value="{{ successful|map(attribute='ip')|join(',') }}">
+                <input type="hidden" name="active_ip" value="" id="lookup-refresh-all-active">
+                <button type="submit" class="btn-small">&#8635; Refresh all</button>
+            </form>
+            <form method="post" action="/lookup/clear" class="inline-form">
+                <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+                <button type="submit" class="btn-small btn-secondary" id="lookup-clear-all">Clear all</button>
+            </form>
+        </div>
+        {% endif %}
         {% if tabbed %}
         <div class="tabs no-print">
             {% for entry in successful %}
             {% set is_active_tab = (entry.result.ip == active_ip) if active_ip else loop.first %}
             <button type="button" class="tab-btn{% if is_active_tab %} active{% endif %}" data-tab-target="{{ entry.result.ip|replace('.', '-') }}">{{ entry.result.ip }}
-                <span class="tab-close" data-close-tab="{{ entry.result.ip|replace('.', '-') }}" title="Remove {{ entry.result.ip }} from this view">&times;</span>
+                <span class="tab-close" data-close-tab="{{ entry.result.ip|replace('.', '-') }}" data-ip="{{ entry.result.ip }}" title="Close {{ entry.result.ip }}">&times;</span>
             </button>
             {% endfor %}
         </div>
@@ -180,10 +192,11 @@
             <section class="result{% if tabbed %} tab-panel{% if not is_active_tab %} tab-panel-hidden{% endif %}{% endif %}" data-tab-panel="{{ slug }}">
                 <h2>
                     {{ result.ip }} <span class="verdict verdict-{{ result.wired_or_wireless }}">{{ result.wired_or_wireless }}</span>
+                    {% if entry.looked_up_display %}<span class="muted lookup-time">looked up at {{ entry.looked_up_display }}</span>{% endif %}
                     <span class="no-print">
                     <form method="post" action="/lookup" class="inline-form refresh-ip-form">
                         <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-                        <input type="hidden" name="ip" value="{{ ip }}">
+                        <input type="hidden" name="ip" value="{{ result.ip }}">
                         <input type="hidden" name="active_ip" value="{{ result.ip }}">
                         <button type="submit" class="btn-small">&#8635; Refresh</button>
                     </form>
@@ -1982,6 +1995,15 @@
             closeEl.addEventListener("click", (e) => {
                 e.stopPropagation();
                 const slug = closeEl.dataset.closeTab;
+                // the open lookups live on the server now -- tell it, so a reload doesn't bring it back
+                if (closeEl.dataset.ip) {
+                    const fd = new URLSearchParams();
+                    fd.set("csrf_token", CSRF_TOKEN);
+                    fd.set("ip", closeEl.dataset.ip);
+                    fetch("/lookup/close", { method: "POST", body: fd, credentials: "same-origin" }).catch(() => {});
+                    const allForm = document.querySelector("#lookup-refresh-all-form input[name=ip]");
+                    if (allForm) allForm.value = allForm.value.split(",").filter(x => x !== closeEl.dataset.ip).join(",");
+                }
                 const tabBtn = closeEl.closest(".tab-btn");
                 const panel = document.querySelector('.tab-panel[data-tab-panel="' + slug + '"]');
                 const wasActive = tabBtn && tabBtn.classList.contains("active");
@@ -5091,6 +5113,10 @@
                 form.addEventListener("submit", async ev => {
                     if (form.dataset.fallback === "1") return;   // second submit after a failed start: plain POST
                     ev.preventDefault();
+                    if (form.id === "lookup-refresh-all-form") {
+                        const act = document.querySelector(".tab-btn.active");
+                        document.getElementById("lookup-refresh-all-active").value = act ? act.dataset.tabTarget.replace(/-/g, ".") : "";
+                    }
                     const fd = new FormData(form);
                     if (btn) { btn.disabled = true; btn.textContent = "Looking up…"; }
                     if (spinner) spinner.style.display = "";

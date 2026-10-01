@@ -82,6 +82,8 @@ button:hover { opacity: 0.9; }
 .db-alert-ok { background: rgba(79, 180, 119, 0.12); border-color: var(--wired); color: var(--wired); }
 .db-alert .muted { color: var(--muted); }
 .db-check-banner { margin: 1rem 0; }
+.lookup-toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin: 0.5rem 0 1rem; }
+.lookup-time { font-size: 0.8rem; font-weight: normal; margin-left: 0.4rem; }
 .db-check-banner > strong { margin-right: 0.5rem; }
 
 .grid {
