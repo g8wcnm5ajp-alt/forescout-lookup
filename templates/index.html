@@ -178,6 +178,7 @@
                     </span>
                 </h2>
                 <p class="hint no-print">Printed report includes this IP's identity, location, and policy data below -- other open IP tabs and the search controls above are left out.</p>
+                {% for w in result.db_warnings or [] %}<div class="db-alert db-alert-red">&#9888; {{ w }}</div>{% endfor %}
 
                 <div class="grid">
                     <details class="card data-section ip-section" data-section="identity" open>
@@ -396,6 +397,17 @@
                 just clears a stuck "running" state, e.g. one left behind by a container redeploy mid-job.</p>
         </div>
         {% endif %}
+
+        <div class="card no-print" id="dbcheck-card">
+            <h3>Database check <span class="muted">(every box's Postgres tables, compared -- read-only)</span></h3>
+            <p class="hint">Reads each box's table list and sizes from the Postgres catalogue (no table scans, nothing
+                changed) and compares the boxes: <strong>red</strong> = a core table the other boxes have is missing, or
+                the database didn't answer; <strong>amber</strong> = a table that is very large, or far bigger than on the
+                other boxes. Other differences (often a plugin that isn't installed on that box) are listed per box.</p>
+            <button type="button" id="dbcheck-run-btn">Run database check</button>
+            <span class="hint" id="dbcheck-status"></span>
+            <div id="dbcheck-result"></div>
+        </div>
 
         <div class="card actions" id="appliances-panel" data-active-runs="{{ active_appliance_runs|tojson|forceescape }}">
             <div class="no-print">
@@ -2664,6 +2676,48 @@
                 } catch (e) {
                     st.textContent = "Failed: " + e.message;
                 } finally { btns.forEach(b => b.disabled = false); }
+            });
+        })();
+
+        // Appliances tab: Database check (2026-10-01) -- /api/db_check, rendered as alerts + a per-box table.
+        (function () {
+            const btn = document.getElementById("dbcheck-run-btn");
+            if (!btn) return;
+            const status = document.getElementById("dbcheck-status");
+            const out = document.getElementById("dbcheck-result");
+            const esc = s => (s == null ? "" : String(s)).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+            btn.addEventListener("click", () => {
+                btn.disabled = true;
+                status.textContent = "Reading every box's table list…";
+                out.innerHTML = "";
+                fetch("/api/db_check")
+                    .then(r => r.json())
+                    .then(d => {
+                        btn.disabled = false;
+                        if (d.error) { status.textContent = "Failed: " + d.error; return; }
+                        const red = d.alerts.filter(a => a.level === "red").length;
+                        const amber = d.alerts.filter(a => a.level === "amber").length;
+                        status.textContent = "Checked " + d.boxes.length + " box(es) at " + (d.generated || "") + " -- " +
+                            (red || amber ? red + " red, " + amber + " amber alert(s)." : "no alerts.");
+                        let html = "";
+                        d.alerts.forEach(a => {
+                            html += "<div class=\"db-alert db-alert-" + a.level + "\"><strong>" + (a.level === "red" ? "&#9888; " : "") +
+                                esc(a.box) + " -- " + esc(a.kind) + "</strong><br>" + esc(a.detail) +
+                                "<br><span class=\"muted\">Affects: " + esc(a.impact) + "</span></div>";
+                        });
+                        if (!d.alerts.length) html += "<div class=\"db-alert db-alert-ok\">No missing core tables and no oversized tables.</div>";
+                        html += "<table><tr><th>Box</th><th>Database</th><th>Tables</th><th>Total</th><th>Largest</th><th>Differs from peers</th></tr>";
+                        d.boxes.forEach(b => {
+                            html += "<tr><td>" + esc(b.box) + (b.is_em ? " (EM)" : "") + "</td><td>" + (b.ok ? esc(b.database) : "<span class=\"case-history-error\">no answer</span>") +
+                                "</td><td>" + b.table_count + "</td><td>" + esc(b.total) + "</td><td>" + esc(b.largest) + "</td><td>" +
+                                (b.differs.length ? "<span class=\"muted\">no " + esc(b.differs.join(", ")) + " (often a plugin not installed here)</span>" : "&mdash;") + "</td></tr>";
+                        });
+                        html += "</table>";
+                        if (d.offline.length) html += "<p class=\"hint\">Offline, not checked: " + esc(d.offline.join(", ")) + "</p>";
+                        html += "<p class=\"hint\">Rules: " + esc(d.thresholds) + ".</p>";
+                        out.innerHTML = html;
+                    })
+                    .catch(err => { btn.disabled = false; status.textContent = "Failed: " + err; });
             });
         })();
 

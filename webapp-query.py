@@ -229,6 +229,9 @@ Verbs (see the plan this was built from, forescout-lookup):
                             techsupportdownload/_cleanup) -- the script's
                             own text is piped in over stdin, not
                             deployed per-appliance
+    dbcheck                 no args -- every box's Postgres table list
+                            with sizes (catalogue only, no scans); the
+                            Appliances tab's Database check compares them
     analyzetap <target> <window|all> <top_n> <history_days>
                             runs high-admission-trace.sh's `tap` mode
                             live against target: which endpoints keep it
@@ -1126,11 +1129,22 @@ def _do_lookup_inner(ip):
         ip, mode, appliance, fields, targets=history_boxes(fields, mode, appliance), probe_targets=all_targets_result)
     alias_cache_write(ip, aliases, alias_failed, alias_skipped, known_boxes)
     notes = location_notes(ip, fields, verdict, aliases, all_targets_result, alias_failed, alias_skipped)
+    own_box = EM_IP if mode == "em" else appliance
+    db_warnings = []
+    sl_out, sl_rc = _psql_on(own_box, "SELECT count(*) FROM pg_class WHERE relname='source_log';", timeout=15)
+    if sl_rc != 0:
+        db_warnings.append(f"The database on the managing box ({own_box}) did not answer -- roaming history and "
+                           "the identity cross-check below may be incomplete. Run the Database check on the Appliances tab.")
+    elif sl_out.strip() == "0":
+        db_warnings.append(f"The managing box ({own_box}) has no source_log table, so roaming history and the "
+                           "identity cross-check cannot be built for hosts it manages. Run the Database check on the "
+                           "Appliances tab and raise it with Forescout support.")
     _log_lookup(f"identity aliases: {len(aliases)} row(s), {len(notes)} note(s), elapsed={time.time()-t0:.2f}s")
     result = {
         "ip": ip,
         "identity_aliases": aliases,
         "location_notes": notes,
+        "db_warnings": db_warnings,
         "mac": get_field(fields, "mac"),
         # Raw source (e.g. "snow@<node id> []") kept alongside its
         # decoded appliance, same convention as arp_list/policy_history/
@@ -4170,6 +4184,57 @@ def do_analyzetap(target, window, top_n, history_days):
     print(json.dumps({"target": target, "output": out}))
 
 
+# ---------------------------------------------------------------------
+# Database check (Appliances tab, David 2026-10-01): every box's table list with sizes, straight
+# from the Postgres catalogue -- no table scan, nothing written. app.py compares the boxes against
+# each other (a table most peers have but one box lacks; a table far bigger than its peers'). Found
+# from a customer case: one appliance had no source_log at all (`relation "source_log" does not
+# exist`), which silently emptied roaming history and the identity cross-check for its hosts.
+# ---------------------------------------------------------------------
+# one statement: `psql -c` with two only prints the last result
+DB_CATALOG_SQL = (
+    "SELECT '__db__', current_database() UNION ALL "
+    "SELECT c.relname, pg_total_relation_size(c.oid)::text FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+    "WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p');"
+)
+
+
+def _db_tables(target):
+    """{"ok", "error", "database", "tables": {name: bytes}} for one box (EM or appliance)."""
+    if target == EM_IP:
+        out, err, rc = run(["env", "PGOPTIONS=-c statement_timeout=25000",
+                            "psql", "-t", "-A", "-F", "|", "-c", DB_CATALOG_SQL], timeout=30)
+    else:
+        out, err, rc = ssh_appliance(target, f"PGOPTIONS='-c statement_timeout=25000' "
+                                             f"psql -t -A -F '|' -c \"{DB_CATALOG_SQL}\"", timeout=30)
+    if rc != 0:
+        why = "\n".join(l for l in (err or out or "").splitlines() if "Permanently added" not in l).strip()
+        return {"ok": False, "error": (why or f"psql exited {rc}")[-300:], "database": None, "tables": {}}
+    tables, database = {}, None
+    for line in out.splitlines():
+        name, _, size = line.partition("|")
+        if name == "__db__":
+            database = size.strip()
+        elif name.strip() and size.strip().isdigit():
+            tables[name.strip()] = int(size.strip())
+    if not tables:
+        return {"ok": False, "error": "the database answered but listed no tables", "database": database, "tables": {}}
+    return {"ok": True, "error": None, "database": database, "tables": tables}
+
+
+def do_dbcheck():
+    """Every box's table list + sizes (see DB_CATALOG_SQL): the EM and every online appliance in
+    parallel; offline appliances listed, not queried."""
+    addresses = sorted(set(get_node_map().values()))
+    targets = get_all_targets()
+    results = _parallel_target_map(targets, _db_tables)
+    print(json.dumps({
+        "em": EM_IP, "generated": format_epoch(int(time.time())),
+        "boxes": [{"target": t, "is_em": t == EM_IP, **results[t]} for t in targets],
+        "offline": [a for a in addresses if a not in targets],
+    }))
+
+
 CORRELATE_SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bundle-correlate.py")
 MAX_CORRELATE_BUNDLES = 8
 
@@ -5103,6 +5168,9 @@ def main():
     if original.strip() == "appliances":
         return do_appliances()
 
+    if original.strip() == "dbcheck":
+        return do_dbcheck()
+
     m = re.fullmatch(rf"runshowerrors ({TARGET_RE}) (\d{{1,4}}[mh])", original.strip())
     if m:
         return do_run_show_errors(m.group(1), m.group(2))
@@ -5356,7 +5424,7 @@ def main():
         "arplist <ip> | appliances | runshowerrors <target> <N>m|h | "
         "pluginlist <target> | "
         "analyzeadm <target> <bundle|-> <window> <switch_filter|-> <top_n> <spike_n> <stale_days> | "
-        "analyzetap <target> <window|all> <top_n> <history_days> | "
+        "analyzetap <target> <window|all> <top_n> <history_days> | dbcheck | "
         "pluginlogszip <target> <plugin,...> <start>:<end> | "
         "bundleupload <filename> | bundleuploadcleanup <path> | bundleuploadlist | "
         "bundlepartappend <filename> <index> <count> <size> | bundlepartfinish <filename> <count> | bundlepartabort <filename> | "

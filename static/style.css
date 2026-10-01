@@ -75,6 +75,13 @@ button:hover { opacity: 0.9; }
 
 .case-history-error { color: var(--err); }
 
+/* Database check alerts (Appliances tab) and the IP Lookup source_log warning */
+.db-alert { padding: 0.6rem 0.9rem; border-radius: 6px; margin: 0.6rem 0; border: 1px solid var(--border); }
+.db-alert-red { background: rgba(224, 95, 95, 0.12); border-color: var(--err); color: var(--err); }
+.db-alert-amber { background: rgba(224, 168, 80, 0.12); border-color: var(--both); color: var(--both); }
+.db-alert-ok { background: rgba(79, 180, 119, 0.12); border-color: var(--wired); color: var(--wired); }
+.db-alert .muted { color: var(--muted); }
+
 .grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));

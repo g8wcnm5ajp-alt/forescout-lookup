@@ -729,6 +729,12 @@ def analyze_admission(
     )
 
 
+def db_check(timeout=150):
+    """Every box's Postgres table list with sizes (webapp-query.py's dbcheck: catalogue only, no
+    scans) -- the Appliances tab's Database check; app.py compares the boxes."""
+    return _run_verb("dbcheck", timeout=timeout)
+
+
 TAP_WINDOW_RE = re.compile(r"^(?:\d{1,5}[smhd]|all)$")
 
 

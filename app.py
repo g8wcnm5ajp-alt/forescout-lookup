@@ -23,7 +23,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 
 from forescout_client import (
     CASE_REF_RE, COMPANY_NAME_RE, LEVEL_RE, ForescoutClientError, admtap_apply, admtap_preview, admtap_restart, admtap_status,
-    analyze_admission, analyze_tap, arp_list,
+    analyze_admission, analyze_tap, arp_list, db_check,
     cleanup_preview, cleanup_run, cleanup_scan,
     build_techsupport_em, build_techsupport_window_appliance, clear_lookup_debug_log, clear_techsupport_log,
     bundle_roaming, collect_techsupport, correlate_bundles, debug_set_appliance, delete_techsupport_bundle, delete_uploaded_bundle,
@@ -48,7 +48,7 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.11.2"
+APP_VERSION = "1.12.0"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
@@ -847,6 +847,119 @@ def start_analyze_run(target, bundle_path, window, switch_filter, top_n, spike_n
 
     threading.Thread(target=_worker, daemon=True).start()
     return run_id
+
+
+# Database check (Appliances tab, David 2026-10-01) -- compares every box's Postgres tables.
+# Core tables: present on the EM and every appliance on 9.1.x (checked on the lab, 5 boxes); a box
+# without one where its peers have it is a real fault. Any other table missing vs. peers is shown as
+# a quiet difference -- plugin tables (e.g. of_device/of_library/of_prop) exist only where that
+# plugin is installed. Sizes: an absolute ceiling, or far bigger than the same table on the peers.
+DB_CORE_TABLES = {
+    "source_log": "roaming history and the identity cross-check in IP Lookup can't be built for hosts on this box",
+    "hostinfo": "host properties for hosts on this box",
+    "eval_status": "policy evaluation state for hosts on this box",
+    "np_action": "policy action history for hosts on this box",
+    "np_rules": "the policy rule index used for evaluation",
+    "np_outcomes": "policy match results",
+    "userinfo": "user / login data",
+    "devinfo": "device information",
+    "mac_ip": "MAC-to-IP mappings (switch port lookups)",
+    "events": "event logging",
+    "audit": "the audit trail",
+    "conf_params": "configuration parameters",
+    "policy_trend_minutes": "policy trend charts",
+    "detected_macs": "MAC detection",
+    "eval_action_calls": "action call tracking",
+}
+DB_LARGE_BYTES = 5 * 1024 ** 3         # any table this big is flagged
+DB_LARGE_RATIO = 10                    # ...or this many times the peers' median for the same table
+DB_RATIO_MIN_BYTES = 500 * 1024 ** 2   # (only for tables at least this big, so tiny tables aren't noise)
+
+
+def _fmt_bytes(n):
+    for unit in ("B", "kB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit in ("B", "kB") else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def analyze_db_check(data):
+    """dbcheck's raw per-box table lists -> alerts + a per-box summary.
+    red: a box's database didn't answer; a CORE table its peers have is missing.
+    amber: a table over DB_LARGE_BYTES, or (appliances only) >= DB_LARGE_RATIO x the other appliances' median
+    for that table (and >= DB_RATIO_MIN_BYTES).
+    info: any other table its peers have but this box lacks (often a plugin not installed here).
+    Peers: appliances are compared with the other appliances; the EM only with what EVERY appliance has
+    (it carries EM-only tables of its own)."""
+    boxes = data.get("boxes") or []
+    ok = [b for b in boxes if b.get("ok")]
+    em = next((b for b in ok if b.get("is_em")), None)
+    apps = [b for b in ok if not b.get("is_em")]
+    alerts = []
+    for b in boxes:
+        if not b.get("ok"):
+            alerts.append({"level": "red", "box": b["target"], "kind": "Database did not answer",
+                           "detail": b.get("error") or "unknown error",
+                           "impact": "nothing that reads this box's database (lookups, roaming, policy history) can work"})
+    differs = {}
+    for b in ok:
+        mine = set(b["tables"])
+        if b.get("is_em"):
+            if not apps:
+                continue
+            expected = set.intersection(*[set(a["tables"]) for a in apps])
+            peers_note = f"on all {len(apps)} appliance(s)"
+        else:
+            others = [a for a in apps if a is not b]
+            if not others:
+                continue
+            counts = {}
+            for a in others:
+                for t in a["tables"]:
+                    counts[t] = counts.get(t, 0) + 1
+            expected = {t for t, c in counts.items() if c > len(others) / 2}
+            peers_note = f"on most of the other {len(others)} appliance(s)"
+        missing = sorted(expected - mine)
+        for t in missing:
+            if t in DB_CORE_TABLES:
+                alerts.append({"level": "red", "box": b["target"], "kind": f"Missing table: {t}",
+                               "detail": f"present {peers_note}, not on this box", "impact": DB_CORE_TABLES[t]})
+        other = [t for t in missing if t not in DB_CORE_TABLES]
+        if other:
+            differs[b["target"]] = other
+    for b in ok:
+        # sizes only against the same role: the EM holds estate-wide data (e.g. policy trends from
+        # every appliance -- 57x an appliance's on the lab), so it gets the absolute ceiling only
+        peers = [] if b.get("is_em") else [p for p in apps if p is not b]
+        for t, size in b["tables"].items():
+            peer_sizes = sorted(p["tables"][t] for p in peers if t in p["tables"])
+            median = peer_sizes[len(peer_sizes) // 2] if peer_sizes else 0
+            if size >= DB_LARGE_BYTES:
+                why = f"{_fmt_bytes(size)} (over {_fmt_bytes(DB_LARGE_BYTES)})"
+            elif size >= DB_RATIO_MIN_BYTES and median > 0 and size >= DB_LARGE_RATIO * median:
+                why = f"{_fmt_bytes(size)}, {size / median:.0f}x the other appliances' median ({_fmt_bytes(median)})"
+            else:
+                continue
+            alerts.append({"level": "amber", "box": b["target"], "kind": f"Large table: {t}", "detail": why,
+                           "impact": "slows queries and lookups that read it on this box; check with Forescout support "
+                                     "before clearing anything"})
+    order = {"red": 0, "amber": 1}
+    alerts.sort(key=lambda a: (order[a["level"]], a["box"], a["kind"]))
+    summary = []
+    for b in boxes:
+        tables = b.get("tables") or {}
+        top = sorted(tables.items(), key=lambda x: -x[1])[:3]
+        summary.append({
+            "box": b["target"], "is_em": b.get("is_em", False), "ok": b.get("ok", False),
+            "database": b.get("database"), "table_count": len(tables),
+            "total": _fmt_bytes(sum(tables.values())) if tables else "-",
+            "largest": ", ".join(f"{n} {_fmt_bytes(v)}" for n, v in top) or "-",
+            "differs": differs.get(b["target"], []),
+        })
+    return {"generated": data.get("generated"), "alerts": alerts, "boxes": summary,
+            "offline": data.get("offline") or [],
+            "thresholds": f"core table missing vs peers = red; table over {_fmt_bytes(DB_LARGE_BYTES)}, or "
+                          f"{DB_LARGE_RATIO}x the other appliances' median (appliances, tables over {_fmt_bytes(DB_RATIO_MIN_BYTES)}) = amber"}
 
 
 LIVE_ANALYZE_ALL = "all"
@@ -1930,6 +2043,16 @@ def hostinfo_download_route(ip):
         io.BytesIO((header + text).encode("utf-8")), mimetype="text/plain",
         as_attachment=True, download_name=f"hostinfo-{ip.replace('.', '-')}{suffix}.txt",
     )
+
+
+@app.route("/api/db_check", methods=["GET"])
+def api_db_check():
+    """Appliances tab's Database check -- read-only (catalogue only on every box), so a plain GET."""
+    _log_activity("db_check", username=session.get("username"))
+    try:
+        return jsonify(analyze_db_check(db_check()))
+    except ForescoutClientError as e:
+        return jsonify({"error": str(e)}), 502
 
 
 @app.route("/api/appliances", methods=["GET"])
