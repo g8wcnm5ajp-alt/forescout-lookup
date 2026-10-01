@@ -144,6 +144,22 @@
             {% endif %}
         {% endfor %}
 
+        {% if db_check %}
+            {% if db_check.error %}
+            <p class="hint no-print">Database check could not run before this lookup: {{ db_check.error }}</p>
+            {% elif db_check.alerts %}
+            <div class="db-check-banner no-print">
+                <strong>Database check ({{ db_check.checked_display }}{% if db_check.cached %}, cached{% endif %}): {{ db_check.alerts|length }} alert(s)</strong>
+                <button type="button" class="btn-small btn-secondary" onclick="document.querySelector('[data-page-tab-target=appliances]').click()">Full report</button>
+                {% for a in db_check.alerts %}
+                <div class="db-alert db-alert-{{ a.level }}">{% if a.level == 'red' %}&#9888; {% endif %}<strong>{{ a.box }} -- {{ a.kind }}</strong>: {{ a.detail }}<br><span class="muted">Affects: {{ a.impact }}</span></div>
+                {% endfor %}
+            </div>
+            {% else %}
+            <p class="hint no-print">Database check OK ({{ db_check.checked_display }}{% if db_check.cached %}, cached{% endif %}) -- every box's database answered, no missing core tables, no oversized tables.</p>
+            {% endif %}
+        {% endif %}
+
         {% set successful = results|selectattr('result')|list %}
         {% set tabbed = successful|length > 1 %}
         {% if tabbed %}
@@ -178,7 +194,9 @@
                     </span>
                 </h2>
                 <p class="hint no-print">Printed report includes this IP's identity, location, and policy data below -- other open IP tabs and the search controls above are left out.</p>
-                {% for w in result.db_warnings or [] %}<div class="db-alert db-alert-red">&#9888; {{ w }}</div>{% endfor %}
+                {% if db_check and db_check.alerts %}{% for a in db_check.alerts if a.box == result.own_appliance %}
+                <div class="db-alert db-alert-{{ a.level }}">{% if a.level == 'red' %}&#9888; {% endif %}<strong>Affects this lookup -- the managing box {{ a.box }}: {{ a.kind }}</strong>. {{ a.detail }}<br><span class="muted">Affects: {{ a.impact }}</span></div>
+                {% endfor %}{% endif %}
 
                 <div class="grid">
                     <details class="card data-section ip-section" data-section="identity" open>

@@ -48,7 +48,7 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.12.0"
+APP_VERSION = "1.12.1"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
@@ -912,6 +912,15 @@ def analyze_db_check(data):
         else:
             others = [a for a in apps if a is not b]
             if not others:
+                # the only appliance: hold it to the core tables the EM has (every box carries those)
+                if em is None:
+                    continue
+                expected = set(em["tables"]) & set(DB_CORE_TABLES)
+                peers_note = "on the EM"
+                missing = sorted(expected - mine)
+                for t in missing:
+                    alerts.append({"level": "red", "box": b["target"], "kind": f"Missing table: {t}",
+                                   "detail": f"present {peers_note}, not on this box", "impact": DB_CORE_TABLES[t]})
                 continue
             counts = {}
             for a in others:
@@ -960,6 +969,34 @@ def analyze_db_check(data):
             "offline": data.get("offline") or [],
             "thresholds": f"core table missing vs peers = red; table over {_fmt_bytes(DB_LARGE_BYTES)}, or "
                           f"{DB_LARGE_RATIO}x the other appliances' median (appliances, tables over {_fmt_bytes(DB_RATIO_MIN_BYTES)}) = amber"}
+
+
+# Pre-lookup database check (David 2026-10-01: "a basic check before any IP Lookup"): the same
+# Database check, cached so a burst of lookups pays for it once; the Appliances-tab button always
+# runs it fresh and refreshes this. Never blocks a lookup -- a failed check is reported, not raised.
+DB_CHECK_CACHE_TTL = 15 * 60
+DB_CHECK_FAIL_TTL = 60   # a failed check is retried after a minute, not every lookup
+_db_check_cache = {"at": 0.0, "report": None}
+_db_check_lock = threading.Lock()
+
+
+def get_db_check(force=False):
+    """The Database check report (analyze_db_check) plus checked_at/checked_display/cached, or
+    {"error": ...} when the check itself could not run."""
+    with _db_check_lock:
+        cached = _db_check_cache["report"]
+        age = time.time() - _db_check_cache["at"]
+        if not force and cached is not None and age < (DB_CHECK_FAIL_TTL if cached.get("error") else DB_CHECK_CACHE_TTL):
+            return dict(cached, cached=True)
+        try:
+            report = analyze_db_check(db_check())
+        except ForescoutClientError as e:
+            report = {"error": str(e)}
+        now = time.time()
+        report["checked_at"] = int(now)
+        report["checked_display"] = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%H:%M UTC")
+        _db_check_cache.update(at=now, report=report)
+        return dict(report, cached=False)
 
 
 LIVE_ANALYZE_ALL = "all"
@@ -1556,6 +1593,7 @@ def render(**kwargs):
     kwargs.setdefault("error", None)
     kwargs.setdefault("action", None)
     kwargs.setdefault("active_ip", None)
+    kwargs.setdefault("db_check", None)
     kwargs.setdefault("csrf_token", _csrf_token())
     kwargs["scheduled_jobs"] = get_pending_jobs()
     kwargs["pending_trace_reverts"] = get_pending_trace_reverts()
@@ -1622,6 +1660,12 @@ def start_lookup_run(ips, active_ip):
         LOOKUP_RUNS[run_id] = run
 
     def worker():
+        with _lookup_runs_lock:
+            for ip in ips:
+                run["per_ip"][ip].update(pct=1, step="Database check (every box)")
+        dbc = get_db_check()
+        with _lookup_runs_lock:
+            run["db_check"] = dbc
         for ip in ips:
             with _lookup_runs_lock:
                 run["per_ip"][ip].update(status="running", pct=3, step="Starting")
@@ -1730,7 +1774,8 @@ def do_lookup():
             if run["status"] != "done":
                 return redirect(url_for("index"))
             return render(ip=",".join(run["ips"]), results=list(run["results"]), error=None, action="lookup",
-                          active_ip=request.args.get("active_ip", "").strip() or run["active_ip"])
+                          active_ip=request.args.get("active_ip", "").strip() or run["active_ip"],
+                          db_check=run.get("db_check"))
         ip_raw = request.args.get("ip", "").strip()
         active_ip = request.args.get("active_ip", "").strip() or None
         if not ip_raw:
@@ -1744,15 +1789,18 @@ def do_lookup():
     _log_activity("lookup", ips=ips)
     error = None
     results = []
+    db_check_report = None
     if len(ips) > MAX_LOOKUP_IPS:
         error = f"Too many IPs ({len(ips)}) -- limit is {MAX_LOOKUP_IPS} per lookup."
     else:
+        db_check_report = get_db_check() if ips else None
         for ip in ips:
             try:
                 results.append({"ip": ip, "result": lookup(ip), "error": None})
             except ForescoutClientError as e:
                 results.append({"ip": ip, "result": None, "error": str(e)})
-    return render(ip=ip_raw, results=results, error=error, action="lookup", active_ip=active_ip)
+    return render(ip=ip_raw, results=results, error=error, action="lookup", active_ip=active_ip,
+                  db_check=db_check_report)
 
 
 def _fmt_utc(epoch):
@@ -2049,10 +2097,10 @@ def hostinfo_download_route(ip):
 def api_db_check():
     """Appliances tab's Database check -- read-only (catalogue only on every box), so a plain GET."""
     _log_activity("db_check", username=session.get("username"))
-    try:
-        return jsonify(analyze_db_check(db_check()))
-    except ForescoutClientError as e:
-        return jsonify({"error": str(e)}), 502
+    report = get_db_check(force=True)   # always fresh here, and it refreshes the pre-lookup cache
+    if report.get("error"):
+        return jsonify({"error": report["error"]}), 502
+    return jsonify(report)
 
 
 @app.route("/api/appliances", methods=["GET"])

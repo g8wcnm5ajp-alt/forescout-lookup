@@ -1129,22 +1129,11 @@ def _do_lookup_inner(ip):
         ip, mode, appliance, fields, targets=history_boxes(fields, mode, appliance), probe_targets=all_targets_result)
     alias_cache_write(ip, aliases, alias_failed, alias_skipped, known_boxes)
     notes = location_notes(ip, fields, verdict, aliases, all_targets_result, alias_failed, alias_skipped)
-    own_box = EM_IP if mode == "em" else appliance
-    db_warnings = []
-    sl_out, sl_rc = _psql_on(own_box, "SELECT count(*) FROM pg_class WHERE relname='source_log';", timeout=15)
-    if sl_rc != 0:
-        db_warnings.append(f"The database on the managing box ({own_box}) did not answer -- roaming history and "
-                           "the identity cross-check below may be incomplete. Run the Database check on the Appliances tab.")
-    elif sl_out.strip() == "0":
-        db_warnings.append(f"The managing box ({own_box}) has no source_log table, so roaming history and the "
-                           "identity cross-check cannot be built for hosts it manages. Run the Database check on the "
-                           "Appliances tab and raise it with Forescout support.")
     _log_lookup(f"identity aliases: {len(aliases)} row(s), {len(notes)} note(s), elapsed={time.time()-t0:.2f}s")
     result = {
         "ip": ip,
         "identity_aliases": aliases,
         "location_notes": notes,
-        "db_warnings": db_warnings,
         "mac": get_field(fields, "mac"),
         # Raw source (e.g. "snow@<node id> []") kept alongside its
         # decoded appliance, same convention as arp_list/policy_history/

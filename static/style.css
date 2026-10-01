@@ -81,6 +81,8 @@ button:hover { opacity: 0.9; }
 .db-alert-amber { background: rgba(224, 168, 80, 0.12); border-color: var(--both); color: var(--both); }
 .db-alert-ok { background: rgba(79, 180, 119, 0.12); border-color: var(--wired); color: var(--wired); }
 .db-alert .muted { color: var(--muted); }
+.db-check-banner { margin: 1rem 0; }
+.db-check-banner > strong { margin-right: 0.5rem; }
 
 .grid {
     display: grid;
