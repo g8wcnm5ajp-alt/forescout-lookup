@@ -4199,9 +4199,17 @@
                     const downloadCell = (b.chunks && b.chunks.length)
                         ? b.chunks.map((c, i) => downloadLink(c, "part " + (i + 1))).join("")
                         : ((downloadLink(b.path, "bundle") || "—") + analyzeCell(b.path));
+                    // Forescout --send result is reported separately from the local build: a bundle can be
+                    // built/kept on the EM even if the optional Forescout transfer (or its trailing Snapshot
+                    // Server step) didn't complete -- e.g. egress to snapshot.forescout.com is blocked.
+                    const sendNote = b.send_status === "sent"
+                        ? "<div class=\"hint\" style=\"color:var(--wired)\">✓ sent to Forescout</div>"
+                        : b.send_status === "not_completed"
+                            ? "<div class=\"hint\" style=\"color:var(--both)\">⚠ Forescout transfer didn't complete — bundle kept on the EM</div>"
+                            : "";
                     rows += "<tr><td>" + escapeHtml((b.plugins || []).join(", ")) + "</td><td>" +
                         escapeHtml((b.hosts || []).join(", ") || "—") + "</td><td>" + escapeHtml(b.target) + "</td><td>" +
-                        (b.ok ? "ok" : "failed") + "</td><td>" + pathCell + "</td>" +
+                        (b.ok ? "ok" : "failed") + sendNote + "</td><td>" + pathCell + "</td>" +
                         "<td>" + escapeHtml(b.size || "—") + "</td><td>" + escapeHtml(b.commands_log || "—") + "</td>" +
                         "<td>" + downloadCell + downloadLink(b.commands_log, "commands log") + "</td></tr>";
                 });

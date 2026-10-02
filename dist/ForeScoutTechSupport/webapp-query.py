@@ -2519,6 +2519,45 @@ def _split_if_oversized(path):
     return None, chunk_paths, executed
 
 
+_SAFE_COMPANY_RE = re.compile(r"^[A-Za-z0-9._-]{1,60}$")
+
+
+def _locate_packed_bundle(plugin_target, company, since_epoch):
+    """
+    Find the tech-support archive `fstool --pack` actually wrote, for the case
+    where the command didn't print its usual File:/Size: summary. fstool emits
+    that summary only at the very END -- after the optional --send upload AND
+    the Snapshot Server transfer. If that external transfer stalls/fails (egress
+    to snapshot.forescout.com blocked -- observed live on a real case, 2026-10-02), fstool
+    exits before printing File:/Size:, so _build_combined_bundle's parse comes up
+    empty and would otherwise discard a perfectly good local bundle. The archive
+    is <company>-v<ver>-<em|appliance>-<ts>.tgz in /tmp on whichever box built
+    it; return the newest one created during this build ({"path","size"}) or
+    None. Read-only (find + du), run locally on the EM or over the existing
+    appliance SSH trust -- never fires --send itself.
+    """
+    if not _SAFE_COMPANY_RE.match(company or ""):
+        return None
+    since = max(0, int(since_epoch) - 5)
+    cmd = (
+        "p=$(find /tmp -maxdepth 1 -type f -name '" + company + "-*.tgz' "
+        "-newermt '@" + str(since) + "' -printf '%T@ %p\\n' 2>/dev/null "
+        "| sort -rn | head -1 | sed 's/^[^ ]* //'); "
+        "[ -n \"$p\" ] && printf '%s\\t%s\\n' \"$p\" \"$(du -h \"$p\" 2>/dev/null | cut -f1)\""
+    )
+    if plugin_target == EM_IP:
+        out, _err, _rc = run(["bash", "-c", cmd], timeout=30)
+    else:
+        out, _err, _rc = ssh_appliance(plugin_target, cmd, timeout=30)
+    lines = (out or "").strip().splitlines()
+    if not lines:
+        return None
+    parts = lines[0].split("\t")
+    if not parts[0]:
+        return None
+    return {"path": parts[0], "size": (parts[1] if len(parts) > 1 and parts[1] else None)}
+
+
 def _build_combined_bundle(
     plugins, plugin_target, comment, case_ref, time_args, hostinfo_by_ip=None, databases=None, company=None,
     case_dir=None, send=False,
@@ -2595,6 +2634,7 @@ def _build_combined_bundle(
     db_appliance = None if plugin_target == EM_IP else plugin_target
     valid_table_names = {t["name"] for t in get_databases(db_mode, db_appliance)}
     databases = sorted(d for d in (databases or []) if d in valid_table_names)
+    started_epoch = int(time.time())
     started_display = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
 
     attach_paths = _attach_hostinfo_files(plugin_target, hostinfo_by_ip)
@@ -2616,10 +2656,32 @@ def _build_combined_bundle(
     m = re.search(r"File:\s*(\S+)", text)
     m_size = re.search(r"Size:\s*([0-9.]+\s*\w+)", text)
     path = m.group(1) if m else None
+    size_text = m_size.group(1) if m_size else None
+
+    # --send: the optional Forescout upload + Snapshot Server transfer run AFTER
+    # the archive is packed, and fstool prints its File:/Size: summary only at
+    # the very END. In an egress-restricted network that trailing transfer can
+    # stall/fail (observed live on a real case, 2026-10-02: the snapshot transfer to
+    # snapshot.forescout.com hung), so fstool exits before printing File:/Size:
+    # and this parse comes up empty -- even though --pack already wrote a
+    # perfectly good .tgz. Don't discard it: locate the packed archive on disk
+    # and keep it. The external transfer result is reported separately
+    # (send_status) and never fails the local build on its own.
+    send_status = None
+    if send:
+        send_status = "sent" if "successfully sent to ForeScout support" in text else "not_completed"
+        if path is None:
+            located = _locate_packed_bundle(plugin_target, company, started_epoch)
+            if located:
+                path, size_text = located["path"], located.get("size")
+    # Local-bundle success = an archive exists (for a --send build, independent
+    # of the transfer). Non-send builds keep the strict rc==0 + File: check.
+    built = bool(path) if send else (rc == 0 and bool(m))
     _log_ts(
         log_tag,
-        f"[{plugin_target}] -> {'ok' if rc == 0 and m else 'FAILED'}"
-        + (f", file={m.group(1)}, size={m_size.group(1)}" if m and m_size else ""),
+        f"[{plugin_target}] -> {'ok' if built else 'FAILED'}"
+        + (f", file={path}, size={size_text}" if path and size_text else (f", file={path}" if path else ""))
+        + (f" [Forescout send: {send_status}]" if send_status else ""),
     )
 
     # Best-effort cleanup of the temp hostinfo files regardless of the
@@ -2656,9 +2718,10 @@ def _build_combined_bundle(
             "Collection command (run on the target box above):",
             f"  {ts_cmd}",
             "",
-            f"Result: {'ok' if rc == 0 and m else 'FAILED'}",
-            f"File: {m.group(1) if m else '(not reported)'}",
-            f"Size: {m_size.group(1) if m_size else '(not reported)'}",
+            f"Result: {'ok' if built else 'FAILED'}",
+            f"File: {path or '(not reported)'}",
+            f"Size: {size_text or '(not reported)'}",
+        ] + ([f"Forescout send (--send): {send_status}"] if send_status else []) + [
             "",
             "--- Full tool output ---",
             text,
@@ -2689,9 +2752,10 @@ def _build_combined_bundle(
     return {
         "plugins": plugins or ["general"], "target": plugin_target,
         "hosts": sorted(hostinfo_by_ip.keys()), "databases": databases,
-        "ok": rc == 0 and bool(m), "path": path,
+        "ok": built, "path": path,
         "chunks": chunk_paths,
-        "size": m_size.group(1) if m_size else None,
+        "size": size_text,
+        "send_status": send_status,
         "commands_log": commands_log,
         "centralize_commands": centralize_commands,
         "output_tail": text[-500:],
