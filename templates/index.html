@@ -1235,6 +1235,190 @@
 
         <section class="page-tab-panel page-tab-panel-hidden" data-page-tab-panel="help">
         <div class="card">
+            <h3>User Guide</h3>
+            <p class="hint">What each tab does and how to use it. This app runs on the Enterprise Manager and
+                reaches it (and its appliances) over a restricted SSH key -- you don't need any shell access.
+                Tech-support bundles are built and reported, never auto-downloaded: they're centralized on the EM
+                under <code>/shared/shared/case/&lt;case reference&gt;/</code>. The HTTPS cert is self-signed by
+                default, so the first visit shows a browser trust warning (replace it on the Certificate page).</p>
+
+            <details class="guide-section">
+                <summary>IP Lookup</summary>
+                <div class="guide-body">
+                    <p class="guide-use">Find everything Forescout knows about a host from its IP -- location, how
+                        it connected, which policies matched, and its full host properties.</p>
+                    <ol>
+                        <li>Type one IPv4, or several comma-separated, and press <strong>Look up</strong>. A quick
+                            database check runs first so a degraded EM is reported clearly rather than as a blank
+                            result.</li>
+                        <li>Each host opens its own tab; open lookups stay open. Refresh one host or all of them,
+                            or <strong>Clear results</strong> to start over.</li>
+                        <li>In a host's result: a <strong>wired/wireless location</strong> verdict, connection and
+                            client status, <strong>Policy match history</strong> (set the time window), an
+                            interactive <strong>Current Policy Tree</strong> with the matched rule(s) highlighted
+                            (Print tree/graph, Export to PDF), a <strong>Roaming</strong> / "Also known as"
+                            identity cross-check, <strong>Raw/All fields</strong>, <strong>Host Details</strong>,
+                            and host-info downloads (original and decoded).</li>
+                    </ol>
+                </div>
+            </details>
+
+            <details class="guide-section">
+                <summary>Appliances -- Run Show Errors</summary>
+                <div class="guide-body">
+                    <p class="guide-use">Pull the error report from one or more appliances / the EM to spot a box
+                        that's unhealthy.</p>
+                    <ol>
+                        <li>Tick the boxes to check (<strong>Select all online</strong> / <strong>Deselect
+                            all</strong> help on a big estate), then run.</li>
+                        <li>Each box's report comes back as its own collapsible section. A badge on the tab shows
+                            runs still in progress; a run left over from a redeploy can be deleted.</li>
+                    </ol>
+                </div>
+            </details>
+
+            <details class="guide-section">
+                <summary>Tech Support Bundle Generator</summary>
+                <div class="guide-body">
+                    <p class="guide-use">Build Forescout tech-support bundles, optionally turning on plugin debug
+                        first. Two panels, and every build previews its exact commands before anything runs.</p>
+                    <p><strong>Appliance Host</strong> -- driven by a host. Enter the host IP(s); the app groups
+                        each plugin onto the box that actually owns it. Tick the plugins (and any DB tables) to
+                        include, set one debug level + duration, <strong>Review commands…</strong>, then
+                        <strong>Proceed</strong>.</p>
+                    <p><strong>Estate Debug Bundles</strong> -- no host needed. Tick any appliances and/or the EM
+                        (<strong>All Appliances &amp; EM</strong>), then pick plugins with a <strong>per-plugin
+                        debug level</strong>, or <strong>All plugins</strong> (everything installed on each box).
+                        One shared duration; one bundle per box. A box with no plugins ticked still gets a general
+                        bundle.</p>
+                    <ul>
+                        <li>A <strong>Case reference</strong> groups every bundle built under it into one directory
+                            on the box that built it.</li>
+                        <li><strong>Send support bundle directly to Forescout</strong> adds fstool's
+                            <code>--send</code> (the bundle is still kept on the EM too).</li>
+                        <li>A live log popup shows the real commands as they run; retrieve finished bundles from
+                            <code>/shared/shared/case/&lt;ref&gt;/&lt;box IP&gt;/</code>. A Kill/Delete button
+                            unsticks a hung job.</li>
+                    </ul>
+                </div>
+            </details>
+
+            <details class="guide-section">
+                <summary>Live Analyze</summary>
+                <div class="guide-body">
+                    <p class="guide-use">Root-cause tools you run live against a target (or a bundle), without a
+                        host lookup.</p>
+                    <ol>
+                        <li><strong>1. Target</strong> -- pick an appliance or the EM (or "all online appliances"
+                            for the TAP report).</li>
+                        <li><strong>2. Discovered plugins</strong> / <strong>3. Debug</strong> -- start/stop debug
+                            on chosen plugins at a level for a set time.</li>
+                        <li><strong>4. Plugin logs</strong> -- zip up a plugin's raw logs for the captured debug
+                            window.</li>
+                        <li><strong>High Admission</strong> root-cause tracing (TAP endpoints report) and
+                            <strong>RADIUS Log Analysis</strong> (live window, a bundle, an uploaded file, or
+                            pasted text) run from here too.</li>
+                    </ol>
+                </div>
+            </details>
+
+            <details class="guide-section">
+                <summary>Upload &amp; Review Bundle</summary>
+                <div class="guide-body">
+                    <p class="guide-use">Analyze tech-support bundles you already have -- no live box needed.</p>
+                    <ol>
+                        <li>Upload one or more bundles (split parts are accepted and rejoined), then
+                            <strong>Review ticked bundles</strong> for a ranked findings report and, across
+                            several bundles, a time-aligned multi-bundle correlation (e.g. an appliance repeatedly
+                            dropping off the EM).</li>
+                        <li><strong>Roaming</strong> and <strong>RADIUS Log Analysis</strong> can be run straight
+                            from an uploaded bundle.</li>
+                    </ol>
+                </div>
+            </details>
+
+            <details class="guide-section">
+                <summary>Templates</summary>
+                <div class="guide-body">
+                    <p class="guide-use">Save and reuse a Tech Support build setup.</p>
+                    <p>Prefill a build from a saved template -- its <strong>Plugins</strong>, <strong>Attach DB
+                        tables</strong>, <strong>Hosts</strong> and <strong>General duration</strong> drop
+                        straight into the Tech Support panel so a routine collection is one click.</p>
+                </div>
+            </details>
+
+            <details class="guide-section">
+                <summary>Clean Up</summary>
+                <div class="guide-body">
+                    <p class="guide-use">Reclaim space on the EM safely.</p>
+                    <ol>
+                        <li><strong>Scan</strong>, review the <strong>exact commands</strong> it proposes, then
+                            give the go-ahead -- the go-ahead is enforced on the EM itself, not just in the
+                            browser.</li>
+                        <li><strong>Last resort</strong> items (data reset, truncate eval_status, db rescue) are
+                            shown as reference text only and are never run by this app.</li>
+                    </ol>
+                </div>
+            </details>
+
+            <details class="guide-section">
+                <summary>Admission Rate</summary>
+                <div class="guide-body">
+                    <p class="guide-use">View and tune eyeSight Admission TAP control.</p>
+                    <ol>
+                        <li><strong>Status</strong> is read from the EM's own admission log; <strong>Settings</strong>
+                            shows the six <code>fs.adm.*</code> values.</li>
+                        <li>Change settings, <strong>preview</strong> the exact change, then <strong>apply</strong>;
+                            a service restart (if needed) is a separate, guarded step.</li>
+                    </ol>
+                </div>
+            </details>
+
+            <details class="guide-section">
+                <summary>Admin pages (Setup, Certificate, password)</summary>
+                <div class="guide-body">
+                    <p class="guide-use">Reached from the links in the top bar.</p>
+                    <ul>
+                        <li><strong>Setup</strong> -- change the source network (CIDR) allowed to reach this app's
+                            port; it re-runs the same firewall hook the installer uses.</li>
+                        <li><strong>Certificate</strong> -- replace the default self-signed HTTPS cert with your
+                            own.</li>
+                        <li><strong>Password</strong> -- the first login forces a password change; the initial
+                            admin password is printed by <code>Deploy.sh</code> on a fresh install.</li>
+                    </ul>
+                </div>
+            </details>
+        </div>
+
+        <div class="card">
+            <h3>What's changed <span class="muted">(release history)</span></h3>
+            <dl class="changelog">
+                <dt>v1.14.0 <span class="muted">2026-10-02</span></dt>
+                <dd>Estate Debug Bundles: per-plugin debug across any appliances &amp; the EM; the EM-only panel folded in.</dd>
+                <dt>v1.13.x <span class="muted">2026-10-01</span></dt>
+                <dd>IP Lookup: open lookups stay open, refresh one or all; clearer Export to PDF buttons.</dd>
+                <dt>v1.12.x <span class="muted">2026-10-01</span></dt>
+                <dd>Database check before every lookup -- flags missing and oversized tables.</dd>
+                <dt>v1.11.x <span class="muted">2026-10-01</span></dt>
+                <dd>Live Analyze: TAP endpoints report and all-appliance runs (with a busy-appliance fix).</dd>
+                <dt>v1.10.x <span class="muted">2026-09-23</span></dt>
+                <dd>Split-bundle upload and a single Review button; label / host-identity detectors in bundle analysis; wireless-lookup crash fix.</dd>
+                <dt>v1.8.x <span class="muted">2026-09-23</span></dt>
+                <dd>Clean Up tab, RADIUS Log Analysis, and the Admission Rate tab.</dd>
+                <dt>v1.5.x <span class="muted">2026-09-18</span></dt>
+                <dd>IP Lookup sections + Print tree, endpoint roaming, identity cross-check, host-info downloads, safe cross-check on large estates.</dd>
+                <dt>v1.4.x <span class="muted">2026-09-17</span></dt>
+                <dd>Multi-bundle correlation with ranked findings; Clear results.</dd>
+                <dt>v1.2.x <span class="muted">2026-09-14…15</span></dt>
+                <dd>Live Analyze, Upload &amp; Review Bundle, host log export; collapsible reports; release-packaging fixes.</dd>
+                <dt>v1.1.0 <span class="muted">2026-09-12</span></dt>
+                <dd>Support log download.</dd>
+            </dl>
+            <p class="hint">Full per-release notes and downloads:
+                <a href="https://github.com/g8wcnm5ajp-alt/forescout-lookup/releases" target="_blank" rel="noopener">GitHub releases</a>.</p>
+        </div>
+
+        <div class="card">
             <h3>About</h3>
             <table>
                 <tr><th>Version</th><td>{{ app_version }}+{{ deploy_count }} <span class="muted">(build/deploy number after the +, per semver build-metadata convention)</span></td></tr>

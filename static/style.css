@@ -402,3 +402,22 @@ a.btn-small { display: inline-flex; align-items: center; border-radius: 6px; cur
 .badge-warn { display: inline-block; padding: 0.05rem 0.5rem; border-radius: 4px; background: #fbe7e3; color: #a3402f; font-weight: 600; }
 tr.row-warn td { background: rgba(192, 57, 43, 0.22); }
 #admission-settings-table td, #admission-settings-table th { vertical-align: top; }
+
+/* Help tab -- User Guide (collapsible) + changelog. David's ask 2026-10-02.
+   Reuses the <details> pattern already used by the IP Lookup cards. */
+.guide-section { border: 1px solid var(--border); border-radius: 6px; margin-bottom: 0.5rem; background: var(--bg); }
+.guide-section > summary { cursor: pointer; padding: 0.6rem 0.85rem; font-weight: 600; color: var(--text); list-style: none; }
+.guide-section > summary::-webkit-details-marker { display: none; }
+.guide-section > summary::before { content: "\25B8"; color: var(--accent); display: inline-block; width: 1em; transition: transform 0.12s; }
+.guide-section[open] > summary::before { transform: rotate(90deg); }
+.guide-section > summary:hover { color: var(--accent); }
+.guide-body { padding: 0.2rem 0.95rem 0.85rem 1.85rem; }
+.guide-body p { margin: 0.35rem 0; }
+.guide-body ol, .guide-body ul { margin: 0.35rem 0; padding-left: 1.2rem; }
+.guide-body li { margin-bottom: 0.2rem; }
+.guide-body .guide-use { color: var(--muted); font-size: 0.85rem; }
+.changelog { margin: 0; }
+.changelog dt { font-weight: 600; color: var(--accent); margin-top: 0.6rem; }
+.changelog dt:first-child { margin-top: 0; }
+.changelog dd { margin: 0.1rem 0 0 0; color: var(--text); }
+.changelog dd .muted { font-size: 0.82rem; }
