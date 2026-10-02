@@ -1003,45 +1003,78 @@
             </div>
         </div>
 
-        <div class="card actions" id="techsupport-em-panel" data-active-runs="{{ active_techsupport_runs|tojson|forceescape }}">
-            <h3>EM Tech Support Bundle Generation</h3>
+        <div class="card actions" id="techsupport-estate-panel" data-active-runs="{{ active_techsupport_runs|tojson|forceescape }}">
+            <h3>Estate Debug Bundles
+                <span class="muted" style="font-weight:normal">(appliances &amp; EM, per-plugin debug)</span>
+            </h3>
+            <p class="hint">Collect a tech-support bundle from any set of appliances and/or the EM, with debug
+                enabled first on the plugins you pick -- each plugin at its own level. One bundle per box, all
+                grouped under one case reference. No host lookup needed -- this replaces the old EM-only panel
+                and extends it to the whole estate.</p>
 
             <div class="tree-filter-row">
                 <label class="tree-filter-toggle">Case reference
-                    <input type="text" id="techsupport-em-case-ref" placeholder="Case-12345-YourName" style="width:16em">
+                    <input type="text" id="techsupport-estate-case-ref" placeholder="Case-12345-YourName" style="width:16em">
                 </label>
             </div>
-            <p class="hint">Same as above, applied to this bundle's fstool comment and its directory under
-                <code>/shared/shared/case/</code>.</p>
-
             <div class="tree-filter-row">
                 <label class="tree-filter-toggle">
-                    <input type="checkbox" id="techsupport-em-send">
+                    <input type="checkbox" id="techsupport-estate-send">
                     Send support bundle directly to Forescout
                 </label>
             </div>
-            <p class="hint">Adds fstool's own <code>--send</code> flag alongside <code>--pack</code> -- the bundle is
-                still built and centralized onto the EM as normal, and also transmitted directly to Forescout
-                support.</p>
 
+            <h4 style="margin-bottom:0.3rem">1. Targets</h4>
+            <div class="tree-filter-row">
+                <label class="tree-filter-toggle">
+                    <input type="checkbox" id="estate-all-targets">
+                    <strong>All Appliances &amp; EM</strong>
+                </label>
+            </div>
+            <div id="estate-target-list" class="tree-filter-row" style="flex-wrap:wrap; gap:0.75rem">
+                <span class="hint">Loading appliances…</span>
+            </div>
+
+            <h4 style="margin-bottom:0.3rem">2. Plugins</h4>
+            <div class="tree-filter-row">
+                <label class="tree-filter-toggle">
+                    <input type="checkbox" id="estate-all-plugins">
+                    <strong>All plugins</strong> (every plugin installed on each selected box)
+                </label>
+                <label class="tree-filter-toggle" id="estate-all-level-wrap" style="display:none">at level
+                    <select id="estate-all-level">
+                        {% for lvl in range(13) %}
+                        <option value="{{ lvl }}"{% if lvl == 4 %} selected{% endif %}>{{ lvl }}</option>
+                        {% endfor %}
+                    </select>
+                </label>
+            </div>
+            <p class="hint" id="estate-plugins-status">Pick one or more targets above to list their plugins.</p>
+            <table id="estate-plugin-table" style="display:none">
+                <thead><tr><th></th><th>Plugin</th><th>Debug level</th><th>Installed on</th></tr></thead>
+                <tbody id="estate-plugin-tbody"></tbody>
+            </table>
+
+            <h4 style="margin-bottom:0.3rem">3. Duration</h4>
             <div class="tree-filter-row">
                 <label class="tree-filter-toggle">Duration
-                    <input type="number" id="techsupport-em-duration-value" value="60" min="1" max="9999" step="1" style="width:5em">
+                    <input type="number" id="techsupport-estate-duration-value" value="60" min="1" max="9999" step="1" style="width:5em">
                 </label>
-                <select id="techsupport-em-duration-unit">
+                <select id="techsupport-estate-duration-unit">
                     <option value="m" selected>Minutes</option>
                     <option value="h">Hours</option>
                 </select>
             </div>
-            <p class="hint">No host to scope plugins from, so this collects fstool's own default category set
-                directly on the EM -- no debug-enable step.</p>
+            <p class="hint">Debug is enabled for this long on every selected plugin, then one bundle is collected
+                per box. The whole run takes a little over the chosen duration. A box with no plugins ticked still
+                gets a general bundle.</p>
 
-            <button type="button" id="techsupport-em-build-btn">Review commands…</button>
+            <button type="button" id="techsupport-estate-build-btn">Review commands…</button>
             <p class="hint">Bundles are built and reported, not auto-downloaded -- retrieve them from
-                <code>/shared/shared/case/&lt;case reference&gt;/&lt;this EM's IP&gt;/</code> on the EM. Each bundle also gets
-                a "-commands.txt" file written right next to it.</p>
+                <code>/shared/shared/case/&lt;case reference&gt;/&lt;box IP&gt;/</code> on the EM. Each bundle also gets a
+                "-commands.txt" file written right next to it.</p>
 
-            <div id="techsupport-em-jobs"></div>
+            <div id="techsupport-estate-jobs"></div>
         </div>
 
         {% if error and action == "techsupport" %}
@@ -3840,19 +3873,19 @@
 
     <script>
         // Both Tech Support Bundle Generation panels (Appliance Host and
-        // EM) share one factory -- each checked host, or the EM, becomes
-        // its own background build job (mirrors the Appliances panel's
-        // job pattern above: start -> spinner -> poll -> result, resumed
-        // on load from data-active-runs so a reload doesn't lose track
-        // of a build already in progress). Build never starts anything
-        // directly -- it first fetches a read-only preview of the exact
-        // commands that would run and shows them in one shared modal;
-        // only clicking Proceed there actually starts the job -- David's
-        // ask, review before going ahead. The two panels are otherwise
-        // fully independent (own case reference, own job list, own
-        // duplicate-run guard) -- deliberately separate now (EM pulled
-        // out of the host panel per David's ask), not just visually
-        // split.
+        // Estate) share one factory via createTsPanel -- each checked
+        // host, or each selected estate box, becomes its own background
+        // build job (mirrors the Appliances panel's job pattern above:
+        // start -> spinner -> poll -> result, resumed on load from
+        // data-active-runs so a reload doesn't lose track of a build
+        // already in progress). Build never starts anything directly --
+        // it first fetches a read-only preview of the exact commands
+        // that would run and shows them in one shared modal; only
+        // clicking Proceed there actually starts the job -- David's ask,
+        // review before going ahead. opts.previewUrl/proceedUrl let each
+        // panel point at its own routes (host: /techsupport/*, estate:
+        // /techsupport/estate/*). The old EM-only panel was folded into
+        // the Estate panel (David 2026-10-02).
         (function () {
             const modal = document.getElementById("techsupport-preview-modal");
             if (!modal) return;
@@ -4215,7 +4248,7 @@
 
                     buildBtn.disabled = true;
                     buildBtn.textContent = "Loading preview…";
-                    fetch("/techsupport/preview", { method: "POST", body: formData })
+                    fetch(opts.previewUrl || "/techsupport/preview", { method: "POST", body: formData })
                         .then(r => r.json())
                         .then(d => {
                             buildBtn.disabled = false;
@@ -4223,7 +4256,7 @@
                             if (d.error) { window.alert("Failed to preview: " + d.error); return; }
                             openPreviewModal(d, () => {
                                 openTsLogPopup();
-                                fetch("/techsupport/proceed", { method: "POST", body: formData })
+                                fetch(opts.proceedUrl || "/techsupport/proceed", { method: "POST", body: formData })
                                     .then(r => r.json())
                                     .then(d2 => {
                                         if (d2.error) { window.alert("Failed to start: " + d2.error); return; }
@@ -4620,21 +4653,163 @@
                 },
             });
 
-            createTsPanel({
-                panelId: "techsupport-em-panel", jobsId: "techsupport-em-jobs", buildBtnId: "techsupport-em-build-btn",
-                kind: "em",
-                buildFormData: () => {
-                    const formData = new URLSearchParams();
-                    formData.set("csrf_token", CSRF_TOKEN);
-                    formData.set("case_ref", document.getElementById("techsupport-em-case-ref").value.trim());
-                    formData.set("ts_company", document.getElementById("techsupport-company").value.trim());
-                    formData.set("include_ts_em", "1");
-                    formData.set("em_duration_value", document.getElementById("techsupport-em-duration-value").value);
-                    formData.set("em_duration_unit", document.getElementById("techsupport-em-duration-unit").value);
-                    formData.set("ts_send", document.getElementById("techsupport-em-send").checked ? "1" : "0");
-                    return formData;
-                },
-            });
+            // ---- Estate Debug Bundles (appliances & EM, per-plugin debug) ------------------------------
+            // David's ask, 2026-10-02: "Create two new tick boxes all Appliances & EM & All plugins, I also
+            // need to be able to select the same plugin to be included in each appliance or EM instance for
+            // debug, instead of having the Debug level at the bottom that is currently applied to all plugins.
+            // You can also remove the EM Tech Support Bundle Generator Windows as this will be redundant."
+            // This panel replaces the old EM-only one. Targets come from /api/appliances; the plugin list is
+            // the union of each selected box's /api/plugins/<target> set, each row carrying its own level.
+            // "All plugins" means every plugin actually installed on each box (resolved per box at build
+            // time), at one shared level. The build posts an explicit {target:[{plugin,level}]} JSON so the
+            // server never has to guess which plugins live where.
+            (function wireEstatePanel() {
+                const panel = document.getElementById("techsupport-estate-panel");
+                if (!panel) return;
+                const allTargetsCb = document.getElementById("estate-all-targets");
+                const targetListEl = document.getElementById("estate-target-list");
+                const allPluginsCb = document.getElementById("estate-all-plugins");
+                const allLevelWrap = document.getElementById("estate-all-level-wrap");
+                const allLevelSel = document.getElementById("estate-all-level");
+                const statusEl = document.getElementById("estate-plugins-status");
+                const pluginTable = document.getElementById("estate-plugin-table");
+                const pluginTbody = document.getElementById("estate-plugin-tbody");
+
+                const pluginsByTarget = {};   // target -> [plugin, ...] (cached from /api/plugins/<target>)
+                const levelByPlugin = {};     // plugin -> last chosen per-plugin level (persists across rerenders)
+
+                function levelOptions(selected) {
+                    let o = "";
+                    for (let n = 0; n <= 12; n++) o += "<option value=\"" + n + "\"" + (n === selected ? " selected" : "") + ">" + n + "</option>";
+                    return o;
+                }
+
+                function selectedTargets() {
+                    return Array.from(targetListEl.querySelectorAll(".estate-target-cb:checked")).map(cb => cb.value);
+                }
+
+                // Fetch (and cache) installed plugins for a target. Returns a promise of the plugin array.
+                function ensurePlugins(target) {
+                    if (pluginsByTarget[target]) return Promise.resolve(pluginsByTarget[target]);
+                    return fetch("/api/plugins/" + encodeURIComponent(target))
+                        .then(r => r.json())
+                        .then(d => { pluginsByTarget[target] = (d && !d.error && d.plugins) ? d.plugins : []; return pluginsByTarget[target]; })
+                        .catch(() => { pluginsByTarget[target] = []; return []; });
+                }
+
+                // Rebuild the per-plugin table from the union of plugins across the selected targets. Each row:
+                // a checkbox, the plugin name, a per-plugin level dropdown, and which selected boxes have it.
+                function renderPluginTable() {
+                    const targets = selectedTargets();
+                    if (allPluginsCb.checked) {
+                        pluginTable.style.display = "none";
+                        statusEl.textContent = targets.length
+                            ? "All plugins installed on each selected box will be enabled at level " + allLevelSel.value + "."
+                            : "Pick one or more targets above.";
+                        return;
+                    }
+                    if (!targets.length) {
+                        pluginTable.style.display = "none";
+                        statusEl.textContent = "Pick one or more targets above to list their plugins.";
+                        return;
+                    }
+                    statusEl.textContent = "Loading plugins…";
+                    Promise.all(targets.map(ensurePlugins)).then(() => {
+                        const checkedBefore = new Set(
+                            Array.from(pluginTbody.querySelectorAll(".estate-plugin-cb:checked")).map(cb => cb.value)
+                        );
+                        const union = {};   // plugin -> [targets that have it]
+                        targets.forEach(t => (pluginsByTarget[t] || []).forEach(p => { (union[p] = union[p] || []).push(t); }));
+                        const plugins = Object.keys(union).sort();
+                        if (!plugins.length) {
+                            pluginTable.style.display = "none";
+                            statusEl.textContent = "No plugins found on the selected target(s).";
+                            return;
+                        }
+                        pluginTbody.innerHTML = plugins.map(p => {
+                            const lvl = (p in levelByPlugin) ? levelByPlugin[p] : 4;
+                            const checked = checkedBefore.has(p) ? " checked" : "";
+                            return "<tr><td><input type=\"checkbox\" class=\"estate-plugin-cb\" value=\"" + escapeHtml(p) + "\"" + checked + "></td>" +
+                                "<td>" + escapeHtml(p) + "</td>" +
+                                "<td><select class=\"estate-plugin-level\" data-plugin=\"" + escapeHtml(p) + "\">" + levelOptions(lvl) + "</select></td>" +
+                                "<td class=\"hint\">" + escapeHtml(union[p].join(", ")) + "</td></tr>";
+                        }).join("");
+                        pluginTbody.querySelectorAll(".estate-plugin-level").forEach(sel => {
+                            sel.addEventListener("change", () => { levelByPlugin[sel.dataset.plugin] = parseInt(sel.value, 10); });
+                        });
+                        pluginTable.style.display = "";
+                        statusEl.textContent = "Tick the plugins to debug; each has its own level. Untouched boxes still get a general bundle.";
+                    });
+                }
+
+                // Load the target list once (every appliance + the EM). Offline appliances are shown but
+                // disabled -- collecting from an unreachable box can't work.
+                fetch("/api/appliances").then(r => r.json()).then(d => {
+                    const appliances = (d && d.appliances) || [];
+                    if (!appliances.length) { targetListEl.innerHTML = "<span class=\"hint\">No appliances found.</span>"; return; }
+                    targetListEl.innerHTML = appliances.map(a => {
+                        const label = escapeHtml(a.address) + (a.is_em ? " (EM)" : "") + (a.online ? "" : " — offline");
+                        const dis = a.online ? "" : " disabled";
+                        return "<label class=\"tree-filter-toggle\"><input type=\"checkbox\" class=\"estate-target-cb\" value=\"" +
+                            escapeHtml(a.address) + "\"" + dis + "> " + label + "</label>";
+                    }).join("");
+                    targetListEl.querySelectorAll(".estate-target-cb").forEach(cb => {
+                        cb.addEventListener("change", () => {
+                            if (!cb.checked) allTargetsCb.checked = false;
+                            renderPluginTable();
+                        });
+                    });
+                }).catch(() => { targetListEl.innerHTML = "<span class=\"hint\">Could not load appliances.</span>"; });
+
+                allTargetsCb.addEventListener("change", () => {
+                    targetListEl.querySelectorAll(".estate-target-cb:not([disabled])").forEach(cb => { cb.checked = allTargetsCb.checked; });
+                    renderPluginTable();
+                });
+                allPluginsCb.addEventListener("change", () => {
+                    allLevelWrap.style.display = allPluginsCb.checked ? "" : "none";
+                    renderPluginTable();
+                });
+                allLevelSel.addEventListener("change", () => { if (allPluginsCb.checked) renderPluginTable(); });
+
+                createTsPanel({
+                    panelId: "techsupport-estate-panel", jobsId: "techsupport-estate-jobs",
+                    buildBtnId: "techsupport-estate-build-btn", kind: "estate",
+                    previewUrl: "/techsupport/estate/preview", proceedUrl: "/techsupport/estate/proceed",
+                    buildFormData: () => {
+                        const targets = selectedTargets();
+                        if (!targets.length) { window.alert("Select at least one appliance or the EM."); return null; }
+                        const estate = {};
+                        if (allPluginsCb.checked) {
+                            const lvl = parseInt(allLevelSel.value, 10);
+                            // Each box gets its own full installed-plugin set. ensurePlugins caches on target
+                            // selection, so by the time Review is clicked these are populated; guard anyway.
+                            const missing = targets.filter(t => !pluginsByTarget[t]);
+                            if (missing.length) { window.alert("Still loading plugins for " + missing.join(", ") + " -- try again in a moment."); return null; }
+                            targets.forEach(t => { estate[t] = (pluginsByTarget[t] || []).map(p => ({ plugin: p, level: lvl })); });
+                        } else {
+                            const rows = Array.from(pluginTbody.querySelectorAll(".estate-plugin-cb:checked")).map(cb => ({
+                                plugin: cb.value,
+                                level: parseInt(pluginTbody.querySelector(".estate-plugin-level[data-plugin=\"" + CSS.escape(cb.value) + "\"]").value, 10),
+                            }));
+                            // Per box, keep only the ticked plugins actually installed on it. A box with none
+                            // ticked still appears (empty list) so it gets a general bundle.
+                            targets.forEach(t => {
+                                const have = new Set(pluginsByTarget[t] || []);
+                                estate[t] = rows.filter(r => have.has(r.plugin));
+                            });
+                        }
+                        const formData = new URLSearchParams();
+                        formData.set("csrf_token", CSRF_TOKEN);
+                        formData.set("case_ref", document.getElementById("techsupport-estate-case-ref").value.trim());
+                        formData.set("ts_company", document.getElementById("techsupport-company").value.trim());
+                        formData.set("ts_send", document.getElementById("techsupport-estate-send").checked ? "1" : "0");
+                        formData.set("estate", JSON.stringify(estate));
+                        formData.set("estate_duration_value", document.getElementById("techsupport-estate-duration-value").value);
+                        formData.set("estate_duration_unit", document.getElementById("techsupport-estate-duration-unit").value);
+                        return formData;
+                    },
+                });
+            })();
         })();
     </script>
 

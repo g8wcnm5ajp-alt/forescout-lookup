@@ -423,6 +423,32 @@ def preview_techsupport_em(duration, company=None, send=False, case_ref=None, ti
     )
 
 
+TS_DURATION_RE = re.compile(r"^\d{1,4}[mh]$")
+TS_PLUGIN_RE = re.compile(r"^[a-z][a-z0-9_]{1,40}$")
+
+
+def collect_techsupport_target(target, plugins, duration, company=None, send=False, case_ref=None, timeout=3600):
+    """Estate mode: collect one bundle on an explicit appliance/EM with an explicit plugin list.
+    Debug is enabled separately (debug_set_appliance). plugins = list (empty -> general bundle)."""
+    if not valid_target(target):
+        raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
+    if not TS_DURATION_RE.match(duration or ""):
+        raise ForescoutClientError(f"'{duration}' is not a valid duration (e.g. 60m, 2h).")
+    plugins = plugins or []
+    if not all(TS_PLUGIN_RE.match(p) for p in plugins):
+        raise ForescoutClientError("Invalid plugin name in selection.")
+    company = company or "YourCompany"
+    if not COMPANY_NAME_RE.match(company):
+        raise ForescoutClientError("Invalid company value.")
+    if case_ref is not None and not CASE_REF_RE.match(case_ref):
+        raise ForescoutClientError("Invalid case reference.")
+    token = ",".join(plugins) if plugins else "-"
+    return _run_verb(
+        f"techsupporttargetcollect {target} {token} {duration} {company} {1 if send else 0} {case_ref or '-'}",
+        timeout=timeout,
+    )
+
+
 def build_techsupport_em(duration, company=None, send=False, case_ref=None, timeout=480):
     """
     A general, EM-wide tech-support bundle -- there's no host to derive a

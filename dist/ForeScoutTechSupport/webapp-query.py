@@ -229,6 +229,9 @@ Verbs (see the plan this was built from, forescout-lookup):
                             techsupportdownload/_cleanup) -- the script's
                             own text is piped in over stdin, not
                             deployed per-appliance
+    techsupporttargetcollect <target> <plugin,...|-> <Nm|Nh> <company> <0|1 send> <case_ref|->
+                            estate mode: collect one bundle on an explicit
+                            appliance/EM with an explicit plugin list
     dbcheck                 no args -- every box's Postgres table list
                             with sizes (catalogue only, no scans); the
                             Appliances tab's Database check compares them
@@ -3078,6 +3081,30 @@ def do_techsupport_window_appliance(target, start_epoch, end_epoch, plugins_csv,
     print(json.dumps({"target": target, "window": {"start": start_epoch, "end": end_epoch}, "bundles": [bundle]}))
 
 
+def do_techsupport_target_collect(target, plugins_csv, duration, company=None, send=False, case_ref=None):
+    """
+    Estate mode (David 2026-10-02): collect ONE bundle on an explicit target box (appliance or EM) with
+    an explicit plugin list -- no host scoping. Debug is enabled separately by the caller via
+    debugsetappliance (per-plugin levels); this only collects. plugins_csv "-" = general bundle (no -p).
+    Plugins not installed on this box are dropped here so one missing plugin can't fail the box.
+    """
+    company = company or DEFAULT_COMPANY
+    log_tag = case_ref if (case_ref and case_ref != "-") else "adhoc"
+    mode, appliance = resolve_target(target)
+    if mode is None:
+        fail(f"'{target}' is not a known EM or managed appliance")
+    plugins = [] if plugins_csv == "-" else plugins_csv.split(",")
+    if plugins:
+        installed = get_installed_plugins(mode, appliance)
+        plugins = [p for p in plugins if p in installed]
+    case_dir = _case_dir_name(case_ref if case_ref != "-" else None)
+    bundle = _build_combined_bundle(
+        sorted(plugins), target, (case_ref if case_ref and case_ref != "-" else "webapp-estate"),
+        (case_ref if case_ref != "-" else None), f"-t {duration}", None, None, company, case_dir=case_dir, send=send,
+    )
+    print(json.dumps({"target": target, "bundles": [bundle]}))
+
+
 def do_techsupport_em(duration, company=None, send=False, case_ref=None):
     """
     A general, EM-wide tech-support bundle -- unlike do_techsupport_collect,
@@ -5159,6 +5186,16 @@ def main():
 
     if original.strip() == "dbcheck":
         return do_dbcheck()
+
+    m = re.fullmatch(
+        rf"techsupporttargetcollect ({TARGET_RE}) (-|{DEBUGSET_PLUGIN_RE}(?:,{DEBUGSET_PLUGIN_RE})*) "
+        rf"(\d{{1,4}}[mh]) ({COMPANY_NAME_RE.pattern[1:-1]}) ([01]) ({CASE_REF_RE.pattern[1:-1]})", original.strip(),
+    )
+    if m:
+        return do_techsupport_target_collect(
+            m.group(1), m.group(2), m.group(3), company=m.group(4), send=(m.group(5) == "1"),
+            case_ref=None if m.group(6) == "-" else m.group(6),
+        )
 
     m = re.fullmatch(rf"runshowerrors ({TARGET_RE}) (\d{{1,4}}[mh])", original.strip())
     if m:

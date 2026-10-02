@@ -27,7 +27,7 @@ from forescout_client import (
     cleanup_preview, cleanup_run, cleanup_scan,
     build_techsupport_em, build_techsupport_window_appliance, clear_lookup_debug_log, clear_techsupport_log,
     bundle_roaming, collect_techsupport, correlate_bundles, debug_set_appliance, delete_techsupport_bundle, delete_uploaded_bundle,
-    download_plugin_logs_zip, download_techsupport_bundle, get_admin_cidr, hostinfo, last_checked, list_appliances,
+    collect_techsupport_target, download_plugin_logs_zip, download_techsupport_bundle, get_admin_cidr, hostinfo, last_checked, list_appliances,
     list_plugins, list_uploaded_bundles, lookup, matched_rules, policy_history, policy_tree, preview_techsupport,
     preview_techsupport_em, radius_bundle, radius_file, radius_live, raw_fields, roaming, run_show_errors, set_admin_cidr, tail_lookup_debug_log,
     tail_techsupport_log, trace_defaults, trace_list, trace_set, upload_bundle, valid_cidr, valid_ip,
@@ -48,7 +48,7 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.13.1"
+APP_VERSION = "1.14.0"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
@@ -1333,7 +1333,7 @@ def _log_case_build(kind, key, case_ref, result, error):
 
 def start_techsupport_run(
     kind, hosts, case_ref, level=None, minutes=None, duration=None, selected_plugins=None, selected_dbtables=None,
-    company=None, send=False,
+    company=None, send=False, estate_targets=None,
 ):
     """
     kind: "host" (hosts is a non-empty list of one or more IPs; level +
@@ -1394,7 +1394,7 @@ def start_techsupport_run(
     of the single shared time.sleep() below applying to the whole batch,
     not a per-target wait.
     """
-    key = "EM" if kind == "em" else ", ".join(sorted(hosts))
+    key = ("ESTATE: " + ", ".join(sorted(estate_targets))) if kind == "estate" else ("EM" if kind == "em" else ", ".join(sorted(hosts)))
     run_id = f"{int(time.time() * 1000)}-{os.urandom(3).hex()}"
     with _ts_runs_lock:
         runs = _load_ts_runs()
@@ -1402,7 +1402,7 @@ def start_techsupport_run(
             return None
         runs.append({
             "id": run_id, "kind": kind, "key": key, "case_ref": case_ref, "status": "running",
-            "phase": "enabling_debug" if kind == "host" else "collecting",
+            "phase": "collecting" if kind == "em" else "enabling_debug",
             "started_at": int(time.time()), "finished_at": None, "result": None, "error": None,
         })
         _save_ts_runs(runs)
@@ -1448,6 +1448,32 @@ def start_techsupport_run(
                     selected_dbtables=selected_dbtables, company=company, send=send, case_ref=case_ref,
                     timeout=3600,
                 )
+            elif kind == "estate":
+                mins = int(duration[:-1]) * (60 if duration.endswith("h") else 1)
+                any_debug = False
+                for tgt, plugs in estate_targets.items():
+                    spec = ",".join(f"{p['plugin']}:{p['level']}:{mins}" for p in plugs)
+                    if spec:
+                        debug_set_appliance(tgt, spec, case_ref=case_ref or "adhoc")
+                        any_debug = True
+                if any_debug:
+                    _update_ts_run(run_id, phase="waiting", waiting_until=int(time.time()) + mins * 60)
+                    time.sleep(mins * 60)
+                _update_ts_run(run_id, phase="collecting")
+                bundles, failures = [], 0
+                for tgt, plugs in estate_targets.items():
+                    try:
+                        r = collect_techsupport_target(tgt, [p["plugin"] for p in plugs], duration,
+                                                       company=company, send=send, case_ref=case_ref, timeout=3600)
+                        bundles.extend(r.get("bundles", []))
+                    except ForescoutClientError as e:
+                        failures += 1
+                        bundles.append({"target": tgt, "ok": False, "plugins": [p["plugin"] for p in plugs],
+                                        "output_tail": str(e)[-500:]})
+                result = {"bundles": bundles}
+                if failures and failures == len(estate_targets):
+                    raise ForescoutClientError("Every target failed:\n" + "; ".join(
+                        b.get("output_tail", "") for b in bundles)[-1500:])
             else:
                 result = build_techsupport_em(duration, company=company, send=send, case_ref=case_ref, timeout=3600)
             _update_ts_run(run_id, status="complete", finished_at=int(time.time()), result=result)
@@ -2812,6 +2838,97 @@ def _checked_ts_hosts_and_em():
     if not host_ips and not include_em:
         return None, None, (jsonify({"error": "Select at least one host or the EM."}), 400)
     return host_ips, include_em, None
+
+
+ESTATE_PLUGIN_RE = re.compile(r"^[a-z][a-z0-9_]{1,40}$")
+
+
+def _parse_estate_form():
+    """(estate_targets {target: [{plugin, level}]}, duration 'Nm'/'Nh', error). Targets + per-plugin
+    levels come as JSON in 'estate'; duration from estate_duration_value/unit."""
+    import json as _json
+    raw = request.form.get("estate", "")
+    try:
+        data = _json.loads(raw) if raw else {}
+    except ValueError:
+        return None, None, "Could not read the target/plugin selection."
+    if not isinstance(data, dict) or not data:
+        return None, None, "Select at least one appliance/EM."
+    unit = request.form.get("estate_duration_unit", "m").strip()
+    value = request.form.get("estate_duration_value", "60").strip()
+    if not DURATION_UNIT_RE.match(unit) or not value.isdigit() or not (1 <= int(value) <= 9999):
+        return None, None, "Invalid duration."
+    duration = f"{value}{unit}"
+    estate = {}
+    for target, plugs in data.items():
+        if not valid_target(target):
+            return None, None, f"'{target}' is not a valid target."
+        if not isinstance(plugs, list):
+            return None, None, "Bad plugin list."
+        clean = []
+        for p in plugs:
+            name = str(p.get("plugin", ""))
+            try:
+                lvl = int(p.get("level"))
+            except (TypeError, ValueError):
+                return None, None, f"Bad debug level for {name}."
+            if not ESTATE_PLUGIN_RE.match(name) or not (0 <= lvl <= 12):
+                return None, None, f"Bad plugin/level: {name}:{p.get('level')}."
+            clean.append({"plugin": name, "level": lvl})
+        estate[target] = clean
+    return estate, duration, None
+
+
+@app.route("/techsupport/estate/preview", methods=["POST"])
+def do_techsupport_estate_preview():
+    """Read-only: the exact per-target commands the estate build would run (debug-enable per plugin,
+    then one collect per box). Nothing is started."""
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    case_ref, err = _validate_case_ref()
+    if err:
+        return jsonify({"error": err}), 400
+    company, comp_err = _validate_company()
+    if comp_err:
+        return jsonify({"error": comp_err}), 400
+    send = _parse_ts_send()
+    estate, duration, perr = _parse_estate_form()
+    if perr:
+        return jsonify({"error": perr}), 400
+    mins = int(duration[:-1]) * (60 if duration.endswith("h") else 1)
+    targets = []
+    for tgt, plugs in estate.items():
+        cmds = [f"fstool {p['plugin']} debug {p['level']} {mins}m   # on {tgt}" for p in plugs]
+        pflags = "".join(f"-p {p['plugin']} " for p in plugs)
+        cmds.append(f'fstool tech-support {pflags}--pack {"--send " if send else ""}-company "{company}" -t {duration}   # on {tgt}')
+        targets.append({"target": tgt, "plugins": [p["plugin"] for p in plugs], "commands": cmds})
+    return jsonify({"targets": targets, "duration": duration})
+
+
+@app.route("/techsupport/estate/proceed", methods=["POST"])
+def do_techsupport_estate_proceed():
+    """Start the estate build: per target, enable the selected plugins at their levels, wait the shared
+    duration, then collect one bundle per target. Never blocks the request."""
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    case_ref, err = _validate_case_ref()
+    if err:
+        return jsonify({"error": err}), 400
+    company, comp_err = _validate_company()
+    if comp_err:
+        return jsonify({"error": comp_err}), 400
+    send = _parse_ts_send()
+    estate, duration, perr = _parse_estate_form()
+    if perr:
+        return jsonify({"error": perr}), 400
+    _log_activity("techsupport_estate_proceed", case_ref=case_ref, targets=sorted(estate), send=send)
+    key = "ESTATE: " + ", ".join(sorted(estate))
+    run_id = start_techsupport_run("estate", None, case_ref, duration=duration, company=company, send=send,
+                                   estate_targets=estate)
+    # Same shape as /techsupport/proceed so the shared createTsPanel JS handles all three kinds uniformly.
+    if run_id is None:
+        return jsonify({"runs": [], "skipped": [key]})
+    return jsonify({"runs": [{"key": key, "run_id": run_id}], "skipped": []})
 
 
 @app.route("/techsupport/preview", methods=["POST"])
