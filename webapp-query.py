@@ -2714,9 +2714,14 @@ def _build_combined_bundle(
             located = _locate_packed_bundle(plugin_target, company, started_epoch)
             if located:
                 path, size_text = located["path"], located.get("size")
-    # Local-bundle success = an archive exists (for a --send build, independent
-    # of the transfer). Non-send builds keep the strict rc==0 + File: check.
-    built = bool(path) if send else (rc == 0 and bool(m))
+    # Success determination.
+    #   --send build: ok if Forescout confirms "sent" (a successful send uploads
+    #     the archive and removes the local .tgz without printing File:/Size:, so
+    #     `path` legitimately comes up None -- that must NOT read as a failure,
+    #     David 2026-10-09 "failed to upload log" false alarm), OR if a local
+    #     archive still exists (the stalled-transfer case the v1.15.1 fix kept).
+    #   non-send build: strict rc==0 + a File: line.
+    built = (bool(path) or send_status == "sent") if send else (rc == 0 and bool(m))
     _log_ts(
         log_tag,
         f"[{plugin_target}] -> {'ok' if built else 'FAILED'}"
