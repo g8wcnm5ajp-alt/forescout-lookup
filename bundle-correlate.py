@@ -1285,8 +1285,12 @@ class Bundle:
                 m = re.search(r"Total Elements: \[(\d+)\]", fobj.read(4000).decode("utf-8", "replace"))
                 if m:
                     self.wireless_controllers = int(m.group(1))
-            elif base.lower().startswith("allhosts") and base.endswith((".txt", ".log")):
-                # every host record on the appliance -- streamed, never held whole (millions of lines)
+            elif base.lower().startswith(("allhosts", "allhostinfo")) and base.endswith((".txt", ".log")):
+                # the FULL appliance host dump -- streamed, never held whole (millions of lines).
+                # Two names seen in the wild for the same `fstool`-style dump: Allhosts.txt
+                # (LSEG 2026-09-23) and allhostinfo.txt (LSEG 2026-10-05). Both must reach the
+                # label analyzer; "allhostinfo" also matches the single-host hostinfo branch
+                # below, so this full-dump test has to come first and claim it.
                 self.labels.feed(fobj)
             elif base.endswith((".txt", ".log")) and "hostinfo" in base.lower():
                 self.hostinfo.update(parse_hostinfo(fobj.read(4000000).decode("utf-8", "replace")))
@@ -1925,7 +1929,8 @@ def section_identity_labels(rep, bundles, args, findings):
             rep.p(f"           {len(h['labels'])} label(s): {', '.join(h['labels'][:6])}"
                   + (f"   [{h['del']} delete attempt(s) recorded]" if h["del"] else ""))
     if not shown:
-        rep.p("  No files/tmp/Allhosts.txt in these bundle(s) -- host identity and label state not available.")
+        rep.p("  No full host dump (files/tmp/Allhosts.txt or allhostinfo.txt) in these bundle(s) -- "
+              "host identity and label state not available.")
         return
     for b in bundles:
         if not b.labels.seen:
