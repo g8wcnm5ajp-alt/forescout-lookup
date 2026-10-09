@@ -349,7 +349,7 @@ def preview_techsupport(
 
 def collect_techsupport(
     ips, minutes, selected_plugins=None, selected_dbtables=None, company=None, send=False, case_ref=None,
-    timeout=480,
+    trace_tgz=False, timeout=480,
 ):
     """
     One or more host IPs at once -- webapp-query.py's do_techsupport_collect
@@ -376,7 +376,7 @@ def collect_techsupport(
     dbtables_token = _selected_dbtables_token(selected_dbtables)
     return _run_verb(
         f"techsupportcollect {','.join(ips)} {minutes} {plugins_token} {dbtables_token} "
-        f"{_company_token(company)} {_send_token(send)} {_case_ref_token(case_ref)}",
+        f"{_company_token(company)} {_send_token(send)} {_case_ref_token(case_ref)} {1 if trace_tgz else 0}",
         timeout=timeout,
     )
 
@@ -427,9 +427,21 @@ TS_DURATION_RE = re.compile(r"^\d{1,4}[mh]$")
 TS_PLUGIN_RE = re.compile(r"^[a-z][a-z0-9_]{1,40}$")
 
 
-def collect_techsupport_target(target, plugins, duration, company=None, send=False, case_ref=None, timeout=3600):
+def list_databases(target, timeout=25):
+    """Significant DB tables (fstool db diskspace) for one box -- drives the Estate panel's per-box
+    DB-table selector (David 2026-10-09), same target-addressed pattern as list_plugins."""
+    if not valid_target(target):
+        raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
+    return _run_verb(f"databaselist {target}", timeout=timeout)
+
+
+def collect_techsupport_target(target, plugins, duration, company=None, send=False, case_ref=None,
+                               trace_tgz=False, hostinfo_all=False, dbtables=None, timeout=3600):
     """Estate mode: collect one bundle on an explicit appliance/EM with an explicit plugin list.
-    Debug is enabled separately (debug_set_appliance). plugins = list (empty -> general bundle)."""
+    Debug is enabled separately (debug_set_appliance). plugins = list (empty -> general bundle).
+    David 2026-10-09: trace_tgz = attach the Enhanced Trace archive; hostinfo_all = attach the full
+    `fstool hostinfo all` dump; dbtables = list of DB table names to attach via --dbtable (each
+    re-validated against this box's own db-diskspace list EM-side)."""
     if not valid_target(target):
         raise ForescoutClientError(f"'{target}' is not a valid target (expected an IP or a hostname).")
     if not TS_DURATION_RE.match(duration or ""):
@@ -443,8 +455,11 @@ def collect_techsupport_target(target, plugins, duration, company=None, send=Fal
     if case_ref is not None and not CASE_REF_RE.match(case_ref):
         raise ForescoutClientError("Invalid case reference.")
     token = ",".join(plugins) if plugins else "-"
+    _tbl_ok = re.compile(r"^[a-z_][a-z0-9_]*$")
+    db_token = ",".join(t for t in (dbtables or []) if _tbl_ok.match(t)) or "-"
     return _run_verb(
-        f"techsupporttargetcollect {target} {token} {duration} {company} {1 if send else 0} {case_ref or '-'}",
+        f"techsupporttargetcollect {target} {token} {duration} {company} {1 if send else 0} {case_ref or '-'} "
+        f"{1 if trace_tgz else 0} {1 if hostinfo_all else 0} {db_token}",
         timeout=timeout,
     )
 

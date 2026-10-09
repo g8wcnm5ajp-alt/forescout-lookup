@@ -1970,6 +1970,36 @@ def _attach_hostinfo_files(plugin_target, hostinfo_by_ip):
     return paths
 
 
+def _run_on_target(plugin_target, cmd, timeout=120):
+    """Run a shell command on the target box -- locally on the EM, else over SSH to the appliance.
+    Same EM-vs-appliance split _build_combined_bundle uses for its own fstool invocation."""
+    if plugin_target == EM_IP:
+        return run(["bash", "-c", cmd], timeout=timeout)
+    return ssh_appliance(plugin_target, cmd, timeout=timeout)
+
+
+def _attach_trace_tgz(plugin_target):
+    """David's ask (2026-10-09): once the Enhanced Trace window has expired, tar this box's Trace_cu*
+    logs and attach the archive to its tech-support bundle. The glob expands on the target shell; a
+    box with no Trace_cu* output yields nothing to attach. Returns the remote path, or None."""
+    path = f"/tmp/trace-{int(time.time() * 1000)}-{os.urandom(2).hex()}.tgz"
+    cmd = (f'tar -czf "{path}" /usr/local/forescout/log/Trace_cu* 2>/dev/null; '
+           f'if [ -s "{path}" ]; then echo HAVE; else rm -f "{path}"; echo EMPTY; fi')
+    out, err, _rc = _run_on_target(plugin_target, cmd, timeout=180)
+    return path if "HAVE" in (out + err) else None
+
+
+def _attach_hostinfo_all(plugin_target):
+    """David's ask (Estate 'Include all hostinfo', 2026-10-09): run `fstool hostinfo all` on the box,
+    save it to a file, and attach it to the box's tech-support bundle. Can be large/slow on a busy
+    appliance, hence the generous timeout. Returns the remote path, or None if it produced nothing."""
+    path = f"/tmp/hostinfo-all-{int(time.time() * 1000)}-{os.urandom(2).hex()}.txt"
+    cmd = (f'fstool hostinfo all > "{path}" 2>/dev/null; '
+           f'if [ -s "{path}" ]; then echo HAVE; else rm -f "{path}"; echo EMPTY; fi')
+    out, err, _rc = _run_on_target(plugin_target, cmd, timeout=900)
+    return path if "HAVE" in (out + err) else None
+
+
 def do_techsupport_log_tail():
     """
     Returns the tail of TS_LOG_PATH (capped at TS_LOG_TAIL_BYTES) --
@@ -2560,7 +2590,7 @@ def _locate_packed_bundle(plugin_target, company, since_epoch):
 
 def _build_combined_bundle(
     plugins, plugin_target, comment, case_ref, time_args, hostinfo_by_ip=None, databases=None, company=None,
-    case_dir=None, send=False,
+    case_dir=None, send=False, attach_trace_tgz=False, attach_hostinfo_all=False,
 ):
     """
     Runs ONE `fstool tech-support [-p <plugin>]... [--attach-file <f>]...
@@ -2638,13 +2668,23 @@ def _build_combined_bundle(
     started_display = time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime())
 
     attach_paths = _attach_hostinfo_files(plugin_target, hostinfo_by_ip)
+    # David 2026-10-09: Enhanced Trace archive (Trace_cu*, after its window) and/or the full
+    # `fstool hostinfo all` dump, attached into this box's bundle the same way as per-host hostinfo.
+    if attach_trace_tgz:
+        _tp = _attach_trace_tgz(plugin_target)
+        if _tp:
+            attach_paths.append(_tp)
+    if attach_hostinfo_all:
+        _hp = _attach_hostinfo_all(plugin_target)
+        if _hp:
+            attach_paths.append(_hp)
     plugin_flags = "".join(f"-p {p} " for p in plugins)
     attach_flags = "".join(f'--attach-file "{p}" ' for p in attach_paths)
     dbtable_flags = "".join(f"--dbtable {t} " for t in databases)
     send_flag = "--send " if send else ""
     ts_cmd = (
         f'fstool tech-support {plugin_flags}{attach_flags}{dbtable_flags}'
-        f'-comment {comment} --pack {send_flag}-company "{company}" {time_args}'
+        f'--comment "{comment}" --pack {send_flag}--company "{company}" {time_args}'
     )
     _log_ts(log_tag, f"[{plugin_target}] {ts_cmd}")
     if plugin_target == EM_IP:
@@ -2995,7 +3035,7 @@ def do_techsupport_preview(
                                                               # appliance general bundle, fstool's default set)
         comment = case_ref or "webapp-multihost"
         send_flag = "--send " if send else ""
-        commands.append(f'fstool tech-support {flags_prefix}-comment {comment} --pack {send_flag}-company "{company}" -t {duration}')
+        commands.append(f'fstool tech-support {flags_prefix}--comment "{comment}" --pack {send_flag}--company "{company}" -t {duration}')
 
         centralize_commands, _ = _centralize_command_lines(target, "<bundle>.tgz", "<bundle>-commands.txt", case_dir)
         commands.extend(centralize_commands)
@@ -3013,6 +3053,7 @@ def do_techsupport_preview(
 
 def do_techsupport_collect(
     ips_csv, minutes, selected_plugins_token, selected_dbtables_token, company=None, send=False, case_ref=None,
+    trace_tgz=False,
 ):
     """
     The collect phase of the debug-enable -> wait -> collect ->
@@ -3084,6 +3125,7 @@ def do_techsupport_collect(
         return _build_combined_bundle(
             sorted(plugin_set), target, comment, case_ref, f"-t {minutes}m", hostinfo_by_target.get(target, {}),
             sorted(selected_dbtables.get(target, set())), company, case_dir=case_dir, send=send,
+            attach_trace_tgz=trace_tgz,
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(targets)) as executor:
@@ -3145,12 +3187,19 @@ def do_techsupport_window_appliance(target, start_epoch, end_epoch, plugins_csv,
     print(json.dumps({"target": target, "window": {"start": start_epoch, "end": end_epoch}, "bundles": [bundle]}))
 
 
-def do_techsupport_target_collect(target, plugins_csv, duration, company=None, send=False, case_ref=None):
+def do_techsupport_target_collect(target, plugins_csv, duration, company=None, send=False, case_ref=None,
+                                  trace_tgz=0, hostinfo_all=0, dbtables=None):
     """
     Estate mode (David 2026-10-02): collect ONE bundle on an explicit target box (appliance or EM) with
     an explicit plugin list -- no host scoping. Debug is enabled separately by the caller via
     debugsetappliance (per-plugin levels); this only collects. plugins_csv "-" = general bundle (no -p).
     Plugins not installed on this box are dropped here so one missing plugin can't fail the box.
+
+    David 2026-10-09: three optional attach-ins, each embedded into this box's bundle --
+      trace_tgz=1     the Enhanced Trace archive (Trace_cu*, after the trace window)
+      hostinfo_all=1  the full `fstool hostinfo all` dump
+      dbs=1           this box's own significant DB tables (fstool db diskspace) via --dbtable,
+                      the same set the single-appliance panel offers (resolved per box).
     """
     company = company or DEFAULT_COMPANY
     log_tag = case_ref if (case_ref and case_ref != "-") else "adhoc"
@@ -3161,10 +3210,17 @@ def do_techsupport_target_collect(target, plugins_csv, duration, company=None, s
     if plugins:
         installed = get_installed_plugins(mode, appliance)
         plugins = [p for p in plugins if p in installed]
+    # David 2026-10-09: the Estate panel now selects specific DB tables (not a blanket "all").
+    # _build_combined_bundle re-validates each against this box's own db-diskspace list, so tables
+    # not present here are simply dropped -- a selection spanning several boxes is safe.
+    databases = None
+    if dbtables and dbtables != "-":
+        databases = dbtables.split(",")
     case_dir = _case_dir_name(case_ref if case_ref != "-" else None)
     bundle = _build_combined_bundle(
         sorted(plugins), target, (case_ref if case_ref and case_ref != "-" else "webapp-estate"),
-        (case_ref if case_ref != "-" else None), f"-t {duration}", None, None, company, case_dir=case_dir, send=send,
+        (case_ref if case_ref != "-" else None), f"-t {duration}", None, databases, company, case_dir=case_dir,
+        send=send, attach_trace_tgz=(str(trace_tgz) == "1"), attach_hostinfo_all=(str(hostinfo_all) == "1"),
     )
     print(json.dumps({"target": target, "bundles": [bundle]}))
 
@@ -3208,7 +3264,7 @@ def do_techsupport_em_preview(duration, company=None, send=False, case_ref=None)
     company = company or DEFAULT_COMPANY
     comment = "webapp-em" + (f"-{case_ref}" if case_ref else "")
     send_flag = "--send " if send else ""
-    ts_cmd = f'fstool tech-support -comment {comment} --pack {send_flag}-company "{company}" -t {duration}'
+    ts_cmd = f'fstool tech-support --comment "{comment}" --pack {send_flag}--company "{company}" -t {duration}'
     case_dir = _case_dir_name(case_ref)
     centralize_commands, _ = _centralize_command_lines(EM_IP, "<bundle>.tgz", "<bundle>-commands.txt", case_dir)
     commands = [ts_cmd] + centralize_commands
@@ -4157,6 +4213,17 @@ def do_pluginlist(target):
     if mode is None:
         fail(f"'{target}' is not a known EM or managed appliance")
     print(json.dumps({"target": target, "plugins": sorted(get_installed_plugins(mode, appliance))}))
+
+
+def do_databaselist(target):
+    """Significant DB tables (fstool db diskspace) for `target` alone -- drives the Estate panel's
+    per-box DB-table selector (David 2026-10-09), same target-addressed pattern as do_pluginlist.
+    get_databases returns [{"name","size"}, ...] in fstool's own size-ranked order."""
+    mode, appliance = resolve_target(target)
+    if mode is None:
+        fail(f"'{target}' is not a known EM or managed appliance")
+    tables = get_databases(mode, None if mode == "em" else appliance)
+    print(json.dumps({"target": target, "databases": tables}))
 
 
 ANALYZE_WINDOW_RE = r"\d{1,5}[smhd]"
@@ -5253,12 +5320,14 @@ def main():
 
     m = re.fullmatch(
         rf"techsupporttargetcollect ({TARGET_RE}) (-|{DEBUGSET_PLUGIN_RE}(?:,{DEBUGSET_PLUGIN_RE})*) "
-        rf"(\d{{1,4}}[mh]) ({COMPANY_NAME_RE.pattern[1:-1]}) ([01]) ({CASE_REF_RE.pattern[1:-1]})", original.strip(),
+        rf"(\d{{1,4}}[mh]) ({COMPANY_NAME_RE.pattern[1:-1]}) ([01]) ({CASE_REF_RE.pattern[1:-1]})"
+        rf"(?: ([01]) ([01]) (-|[a-z_][a-z0-9_]*(?:,[a-z_][a-z0-9_]*)*))?", original.strip(),  # opt: trace_tgz hostinfo_all dbtables (David 2026-10-09)
     )
     if m:
         return do_techsupport_target_collect(
             m.group(1), m.group(2), m.group(3), company=m.group(4), send=(m.group(5) == "1"),
             case_ref=None if m.group(6) == "-" else m.group(6),
+            trace_tgz=m.group(7) or 0, hostinfo_all=m.group(8) or 0, dbtables=m.group(9),
         )
 
     m = re.fullmatch(rf"runshowerrors ({TARGET_RE}) (\d{{1,4}}[mh])", original.strip())
@@ -5268,6 +5337,10 @@ def main():
     m = re.fullmatch(rf"pluginlist ({TARGET_RE})", original.strip())
     if m:
         return do_pluginlist(m.group(1))
+
+    m = re.fullmatch(rf"databaselist ({TARGET_RE})", original.strip())
+    if m:
+        return do_databaselist(m.group(1))
 
     m = re.fullmatch(
         rf"analyzeadm ({TARGET_RE}) (-|/shared/shared/case/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+/[A-Za-z0-9_.\-]+|"
@@ -5389,7 +5462,8 @@ def main():
 
     m = re.fullmatch(
         rf"techsupportcollect ({IP_RE}(?:,{IP_RE})*) (\d{{1,4}}) ({SELECTED_PLUGINS_RE}) "
-        rf"({SELECTED_DBTABLES_RE}) ({COMPANY_TOKEN_RE}) ([01]) ({CASE_REF_RE.pattern[1:-1]})",
+        rf"({SELECTED_DBTABLES_RE}) ({COMPANY_TOKEN_RE}) ([01]) ({CASE_REF_RE.pattern[1:-1]})"
+        rf"(?: ([01]))?",  # optional: trace_tgz (Enhanced Trace in the single-appliance panel, David 2026-10-09)
         original.strip(),
     )
     if m:
@@ -5397,6 +5471,7 @@ def main():
             m.group(1), int(m.group(2)), m.group(3), m.group(4),
             None if m.group(5) == "-" else m.group(5), m.group(6) == "1",
             None if m.group(7) == "-" else m.group(7),
+            trace_tgz=(m.group(8) == "1"),
         )
 
     m = re.fullmatch(

@@ -868,11 +868,6 @@
 
         <section class="page-tab-panel{% if active_page_tab != "techsupport" %} page-tab-panel-hidden{% endif %}" data-page-tab-panel="techsupport">
         <div style="display:flex; justify-content:flex-end; margin-bottom:0.75rem; gap:1.25rem; align-items:center;">
-            <label class="tree-filter-toggle">Enhance Trace
-                <select id="trace-target-picker">
-                    <option value="">-- pick appliance/EM --</option>
-                </select>
-            </label>
             <label class="tree-filter-toggle">Company Name
                 <input type="text" id="techsupport-company" value="YourCompany" maxlength="60"
                     pattern="[A-Za-z0-9._-]{1,60}" title="Letters, numbers, '.', '-' and '_' only -- no spaces"
@@ -978,6 +973,13 @@
                 whatever happened to already be logged. Every relevant plugin that resolves to the same appliance
                 collects in one combined bundle, not one per plugin or per host.</p>
 
+            <div class="tree-filter-row">
+                <label class="tree-filter-toggle">Enhanced Trace (optional)
+                    <select class="panel-trace-picker"><option value="">-- pick a box to load its categories --</option></select>
+                </label>
+                <span class="hint">the same trace settings apply to every host's appliance in this build; pick any box just to load the category list</span>
+            </div>
+            <p class="hint staged-trace-indicator" style="display:none"></p>
             <button type="button" id="techsupport-build-btn">Review commands…</button>
             {% if not successful %}
             <p class="hint">Look up an IP first on the IP Lookup tab to select a host here.</p>
@@ -1069,6 +1071,33 @@
                 per box. The whole run takes a little over the chosen duration. A box with no plugins ticked still
                 gets a general bundle.</p>
 
+            <h4 style="margin-bottom:0.3rem">4. Extra attachments</h4>
+            <p class="hint">Added only to the bundle of each appliance you ticked in <strong>1. Targets</strong> above
+                &mdash; or to every selected box, if you ticked <em>All Appliances &amp; EM</em>.</p>
+            <div class="tree-filter-row" style="flex-wrap:wrap; gap:0.75rem">
+                <label class="tree-filter-toggle">
+                    <input type="checkbox" id="estate-include-hostinfo-all">
+                    Include all hostinfo (<code>fstool hostinfo all</code> on each selected appliance)
+                </label>
+                <label class="tree-filter-toggle">
+                    <input type="checkbox" id="estate-attach-dbs-toggle">
+                    Attach DB tables (pick specific tables)
+                </label>
+                <label class="tree-filter-toggle">Enhanced Trace on
+                    <select class="panel-trace-picker" data-trace-scope="1"><option value="">-- off --</option></select>
+                </label>
+            </div>
+            <div id="estate-dbtable-wrap" style="display:none; margin:0.25rem 0 0.5rem">
+                <input type="text" id="estate-dbtable-filter" placeholder="filter table name…" style="width:16em">
+                <p class="hint" id="estate-dbtable-status">Select one or more targets above to list their DB tables.</p>
+                <table id="estate-dbtable-table" style="display:none">
+                    <thead><tr><th></th><th>Table</th><th>On boxes</th></tr></thead>
+                    <tbody id="estate-dbtable-tbody"></tbody>
+                </table>
+            </div>
+            <span class="hint" style="display:block">Enhanced Trace: pick <em>All selected boxes</em> to trace every selected box, or one box to trace just that one &mdash; runs for the bundle's Duration, archived into each bundle, then reverted.</span>
+
+            <p class="hint staged-trace-indicator" style="display:none"></p>
             <button type="button" id="techsupport-estate-build-btn">Review commands…</button>
             <p class="hint">Bundles are built and reported, not auto-downloaded -- retrieve them from
                 <code>/shared/shared/case/&lt;case reference&gt;/&lt;box IP&gt;/</code> on the EM. Each bundle also gets a
@@ -4333,6 +4362,44 @@
             previewCancel.addEventListener("click", () => { if (closeModal) closeModal(); });
             modal.addEventListener("click", (e) => { if (e.target === modal && closeModal) closeModal(); });
 
+            // Enhanced Trace staged for the NEXT bundle run (David 2026-10-09). The "Enhance Trace"
+            // picker now STAGES its selection here instead of applying it straight away; whichever bundle
+            // (Appliance-Host or Estate) runs next carries these change_<cat> fields, so the trace is
+            // applied for that bundle's own window, archived (Trace_cu* -> trace.tgz) into the bundle, then
+            // reverted -- all handled server-side in start_techsupport_run. {} = nothing staged.
+            let stagedTrace = {};  // category -> "on|off:level"
+            let stagedTraceScope = "all";  // "all" selected boxes, or a specific box IP (estate scope, David 2026-10-09)
+            function appendStagedTrace(fd) {
+                Object.keys(stagedTrace).forEach(name => fd.set("change_" + name, stagedTrace[name]));
+                if (Object.keys(stagedTrace).length) fd.set("trace_scope", stagedTraceScope);
+            }
+            function clearStagedTrace() { stagedTrace = {}; stagedTraceScope = "all"; updateStagedTraceIndicators(); }
+            function updateStagedTraceIndicators() {
+                const n = Object.keys(stagedTrace).length;
+                document.querySelectorAll(".staged-trace-indicator").forEach(el => {
+                    if (n) {
+                        const scopeText = (stagedTraceScope && stagedTraceScope !== "all") ? (escapeHtml(stagedTraceScope) + " only") : "all selected boxes";
+                        el.innerHTML = "Enhanced Trace staged: <strong>" + n + "</strong> change(s) on " + scopeText + ", for this bundle's window " +
+                            "&mdash; <a href=\"#\" class=\"staged-trace-clear\">clear</a>";
+                        el.style.display = "";
+                    } else {
+                        el.textContent = "";
+                        el.style.display = "none";
+                    }
+                });
+                document.querySelectorAll(".staged-trace-clear").forEach(a =>
+                    a.addEventListener("click", (e) => { e.preventDefault(); clearStagedTrace(); }));
+            }
+
+            // One shared /api/appliances fetch (David 2026-10-09): the estate target list AND the in-panel
+            // Enhanced Trace pickers both read from this single call, so the appliance search kicks off once
+            // on load -- no second concurrent SSH call to the EM racing/stalling the estate target list.
+            let _appliancesPromise = null;
+            function getAppliancesOnce() {
+                if (!_appliancesPromise) _appliancesPromise = fetch("/api/appliances").then(r => r.json());
+                return _appliancesPromise;
+            }
+
             function createTsPanel(opts) {
                 const panel = document.getElementById(opts.panelId);
                 const buildBtn = document.getElementById(opts.buildBtnId);
@@ -4498,16 +4565,43 @@
             // window.open+document.write popup pattern as the commands-log popup above. Only the
             // categories the user actually touches this session are ever sent to /set (traceDirty), not a
             // full resubmit of all ~250 rows every time.
-            const traceTargetPicker = document.getElementById("trace-target-picker");
-            if (traceTargetPicker) {
-                traceTargetPicker.innerHTML = "<option value=\"\">-- pick appliance/EM --</option>" +
-                    tsAllTargets.map(t => "<option value=\"" + escapeHtml(t) + "\">" + escapeHtml(t) + "</option>").join("");
-                traceTargetPicker.addEventListener("change", () => {
-                    const target = traceTargetPicker.value;
-                    traceTargetPicker.value = "";
-                    if (target) openTracePopup(target);
-                });
-            }
+            // Enhanced Trace pickers live INSIDE each bundle panel (David 2026-10-09), not at the top.
+            // Populated from /api/appliances so they work even without a prior host lookup. Picking a box
+            // opens the trace popup, which STAGES the selection for the next bundle run (openTracePopup ->
+            // stagedTrace); the chosen box is just where the ~250 categories are read from.
+            let _firstOnlineBox = null;  // used by the scoped estate picker for "All selected boxes"
+            (function populatePanelTracePickers() {
+                const pickers = document.querySelectorAll(".panel-trace-picker");
+                if (!pickers.length) return;
+                pickers.forEach(sel => sel.addEventListener("change", () => {
+                    const val = sel.value;
+                    sel.value = "";
+                    if (!val) return;
+                    const scoped = sel.hasAttribute("data-trace-scope");
+                    if (scoped && val === "__all__") {
+                        // Trace the same categories on every selected box.
+                        stagedTraceScope = "all";
+                        if (_firstOnlineBox) openTracePopup(_firstOnlineBox);
+                        else window.alert("Still loading the appliance list — try again in a moment.");
+                    } else {
+                        // Host picker always applies to all selected boxes; estate scoped picker to just this box.
+                        stagedTraceScope = scoped ? val : "all";
+                        openTracePopup(val);
+                    }
+                }));
+                getAppliancesOnce().then(d => {
+                    const boxes = ((d && d.appliances) || []).filter(a => a.online);
+                    _firstOnlineBox = boxes.length ? boxes[0].address : null;
+                    const boxOpts = boxes.map(a => "<option value=\"" + escapeHtml(a.address) + "\">" +
+                        escapeHtml(a.address) + (a.is_em ? " (EM)" : "") + "</option>").join("");
+                    pickers.forEach(p => {
+                        const head = p.hasAttribute("data-trace-scope")
+                            ? "<option value=\"\">-- off --</option><option value=\"__all__\">All selected boxes</option>"
+                            : "<option value=\"\">-- pick a box to load its categories --</option>";
+                        p.innerHTML = head + boxOpts;
+                    });
+                }).catch(() => {});
+            })();
 
             let traceWindow = null;
             const traceDirty = new Map(); // category -> {enabled, level}
@@ -4573,11 +4667,10 @@
                     "<div id=\"controls\">" +
                     "<input type=\"text\" id=\"traceFilter\" placeholder=\"filter categories…\">" +
                     "<button type=\"button\" id=\"traceRevertBtn\">Revert all to default</button>" +
-                    "<label>Auto-revert after <input type=\"number\" id=\"traceDurationValue\" min=\"1\" max=\"9999\" style=\"width:5em\"></label>" +
-                    "<select id=\"traceDurationUnit\"><option value=\"m\" selected>Minutes</option><option value=\"h\">Hours</option></select>" +
-                    "<button type=\"button\" id=\"traceApplyBtn\">Apply changes</button>" +
+                    "<button type=\"button\" id=\"traceApplyBtn\">Stage for next bundle</button>" +
                     "<span class=\"muted\" id=\"traceStatus\"></span>" +
                     "</div>" +
+                    "<div class=\"muted\" style=\"padding:0 12px 8px\">These settings apply to <strong>ALL</strong> appliances/EM selected for this bundle (this box is just where the category list is read from). Staged for the next bundle and restored automatically after its <strong>Duration</strong> -- not applied immediately.</div>" +
                     "<table><thead><tr><th>On</th><th>Category</th><th>Level</th><th>Default</th></tr></thead>" +
                     "<tbody id=\"traceTbody\"><tr><td colspan=\"4\">Loading…</td></tr></tbody></table>" +
                     "</body></html>"
@@ -4618,24 +4711,22 @@
                 });
 
                 traceWindow.document.getElementById("traceApplyBtn").addEventListener("click", () => {
-                    if (traceDirty.size === 0) { traceWindow.alert("No changes to apply."); return; }
+                    if (traceDirty.size === 0) { traceWindow.alert("No changes to stage -- tick a category or change a level first."); return; }
                     const status = traceWindow.document.getElementById("traceStatus");
-                    const durationValue = traceWindow.document.getElementById("traceDurationValue").value.trim();
-                    const durationUnit = traceWindow.document.getElementById("traceDurationUnit").value;
-                    const body = new URLSearchParams();
-                    body.set("csrf_token", CSRF_TOKEN);
-                    traceDirty.forEach((v, name) => body.set("change_" + name, (v.enabled ? "on" : "off") + ":" + v.level));
-                    if (durationValue) { body.set("duration_value", durationValue); body.set("duration_unit", durationUnit); }
-                    status.textContent = "applying…";
-                    fetch("/api/trace/" + target + "/set", { method: "POST", body })
-                        .then(r => r.json())
-                        .then(d => {
-                            if (d.error) { status.textContent = "error: " + d.error; return; }
-                            traceDirty.clear();
-                            status.textContent = "applied." + (d.revert_job_id ? " Auto-revert scheduled." : "");
-                            reload();
-                        })
-                        .catch(err => { status.textContent = "failed: " + err; });
+                    // David 2026-10-09: STAGE the selection for the next bundle run instead of applying it
+                    // straight away. The bundle worker applies it before the collection window, archives the
+                    // Trace_cu* logs into the bundle, then reverts (see start_techsupport_run). The window is
+                    // the bundle's own duration, so the popup's duration field no longer drives an auto-revert.
+                    // We deliberately DON'T reload() here -- that re-fetched unchanged server state and wiped
+                    // the ticked rows, which read as "the Stage button did nothing" (David 2026-10-09). Keep
+                    // traceDirty + the dirty rows visible so re-staging picks up further edits, and confirm
+                    // loudly instead.
+                    stagedTrace = {};
+                    traceDirty.forEach((v, name) => { stagedTrace[name] = (v.enabled ? "on" : "off") + ":" + v.level; });
+                    updateStagedTraceIndicators();
+                    status.textContent = "✓ Staged " + Object.keys(stagedTrace).length +
+                        " change(s) for the next bundle -- you can close this window. (Applied for the bundle's Duration, archived into it, then reverted.)";
+                    status.style.color = "#6fcf6f";
                 });
 
                 reload();
@@ -4841,6 +4932,7 @@
                     formData.set("ts_duration_value", document.getElementById("techsupport-duration-value").value);
                     formData.set("ts_duration_unit", document.getElementById("techsupport-duration-unit").value);
                     formData.set("ts_send", document.getElementById("techsupport-send").checked ? "1" : "0");
+                    appendStagedTrace(formData);   // Enhanced Trace staged for this bundle (David 2026-10-09)
                     return formData;
                 },
             });
@@ -4870,6 +4962,17 @@
                 const pluginsByTarget = {};   // target -> [plugin, ...] (cached from /api/plugins/<target>)
                 const levelByPlugin = {};     // plugin -> last chosen per-plugin level (persists across rerenders)
 
+                // DB-table attach (David 2026-10-09: "select the direct DB"). Per box, list its tables and
+                // let David tick specific ones; each ticked table is attached only to the boxes that have it.
+                const dbByTarget = {};        // target -> [{name,size}, ...] (cached from /api/databases/<target>)
+                const dbChecked = new Set();  // table names ticked (union across boxes)
+                const dbToggleCb = document.getElementById("estate-attach-dbs-toggle");
+                const dbWrap = document.getElementById("estate-dbtable-wrap");
+                const dbFilter = document.getElementById("estate-dbtable-filter");
+                const dbStatus = document.getElementById("estate-dbtable-status");
+                const dbTable = document.getElementById("estate-dbtable-table");
+                const dbTbody = document.getElementById("estate-dbtable-tbody");
+
                 function levelOptions(selected) {
                     let o = "";
                     for (let n = 0; n <= 12; n++) o += "<option value=\"" + n + "\"" + (n === selected ? " selected" : "") + ">" + n + "</option>";
@@ -4887,6 +4990,53 @@
                         .then(r => r.json())
                         .then(d => { pluginsByTarget[target] = (d && !d.error && d.plugins) ? d.plugins : []; return pluginsByTarget[target]; })
                         .catch(() => { pluginsByTarget[target] = []; return []; });
+                }
+
+                // Fetch (and cache) the DB tables for a target. Returns a promise of the table array.
+                function ensureDatabases(target) {
+                    if (dbByTarget[target]) return Promise.resolve(dbByTarget[target]);
+                    return fetch("/api/databases/" + encodeURIComponent(target))
+                        .then(r => r.json())
+                        .then(d => { dbByTarget[target] = (d && !d.error && d.databases) ? d.databases : []; return dbByTarget[target]; })
+                        .catch(() => { dbByTarget[target] = []; return []; });
+                }
+
+                // Rebuild the DB-table picker from the union of tables across the selected boxes. Each row:
+                // a checkbox, the table name, and which selected boxes carry it. Ticked tables persist across
+                // rerenders via dbChecked.
+                function renderDbTable() {
+                    if (!dbToggleCb.checked) { dbWrap.style.display = "none"; return; }
+                    dbWrap.style.display = "";
+                    const targets = selectedTargets();
+                    if (!targets.length) {
+                        dbTable.style.display = "none";
+                        dbStatus.textContent = "Select one or more targets above to list their DB tables.";
+                        return;
+                    }
+                    dbStatus.textContent = "Loading DB tables…";
+                    Promise.all(targets.map(ensureDatabases)).then(() => {
+                        const union = {};   // table -> [targets that have it]
+                        targets.forEach(t => (dbByTarget[t] || []).forEach(tbl => { (union[tbl.name] = union[tbl.name] || []).push(t); }));
+                        const names = Object.keys(union).sort();
+                        if (!names.length) {
+                            dbTable.style.display = "none";
+                            dbStatus.textContent = "No DB tables found on the selected target(s).";
+                            return;
+                        }
+                        const ft = (dbFilter.value || "").toLowerCase();
+                        const shown = names.filter(n => !ft || n.toLowerCase().includes(ft));
+                        dbTbody.innerHTML = shown.map(n => {
+                            const checked = dbChecked.has(n) ? " checked" : "";
+                            return "<tr><td><input type=\"checkbox\" class=\"estate-dbtable-cb\" value=\"" + escapeHtml(n) + "\"" + checked + "></td>" +
+                                "<td>" + escapeHtml(n) + "</td>" +
+                                "<td class=\"hint\">" + escapeHtml(union[n].join(", ")) + "</td></tr>";
+                        }).join("");
+                        dbTbody.querySelectorAll(".estate-dbtable-cb").forEach(cb => {
+                            cb.addEventListener("change", () => { if (cb.checked) dbChecked.add(cb.value); else dbChecked.delete(cb.value); });
+                        });
+                        dbTable.style.display = "";
+                        dbStatus.textContent = "Tick the tables to attach; each is added only to the boxes that actually have it.";
+                    });
                 }
 
                 // Rebuild the per-plugin table from the union of plugins across the selected targets. Each row:
@@ -4936,7 +5086,7 @@
 
                 // Load the target list once (every appliance + the EM). Offline appliances are shown but
                 // disabled -- collecting from an unreachable box can't work.
-                fetch("/api/appliances").then(r => r.json()).then(d => {
+                getAppliancesOnce().then(d => {
                     const appliances = (d && d.appliances) || [];
                     if (!appliances.length) { targetListEl.innerHTML = "<span class=\"hint\">No appliances found.</span>"; return; }
                     targetListEl.innerHTML = appliances.map(a => {
@@ -4949,6 +5099,7 @@
                         cb.addEventListener("change", () => {
                             if (!cb.checked) allTargetsCb.checked = false;
                             renderPluginTable();
+                            renderDbTable();
                         });
                     });
                 }).catch(() => { targetListEl.innerHTML = "<span class=\"hint\">Could not load appliances.</span>"; });
@@ -4956,7 +5107,10 @@
                 allTargetsCb.addEventListener("change", () => {
                     targetListEl.querySelectorAll(".estate-target-cb:not([disabled])").forEach(cb => { cb.checked = allTargetsCb.checked; });
                     renderPluginTable();
+                    renderDbTable();
                 });
+                dbToggleCb.addEventListener("change", renderDbTable);
+                dbFilter.addEventListener("input", renderDbTable);
                 allPluginsCb.addEventListener("change", () => {
                     allLevelWrap.style.display = allPluginsCb.checked ? "" : "none";
                     renderPluginTable();
@@ -4998,6 +5152,20 @@
                         formData.set("estate", JSON.stringify(estate));
                         formData.set("estate_duration_value", document.getElementById("techsupport-estate-duration-value").value);
                         formData.set("estate_duration_unit", document.getElementById("techsupport-estate-duration-unit").value);
+                        // David 2026-10-09: estate attach-ins (hostinfo all / significant DB tables)
+                        formData.set("include_hostinfo_all", document.getElementById("estate-include-hostinfo-all").checked ? "1" : "0");
+                        // Per box, attach only the ticked tables that box actually has (David 2026-10-09:
+                        // "select the direct DB"). Empty object when the toggle is off or nothing is ticked.
+                        const estateDbtables = {};
+                        if (dbToggleCb.checked && dbChecked.size) {
+                            targets.forEach(t => {
+                                const have = new Set((dbByTarget[t] || []).map(x => x.name));
+                                const picks = Array.from(dbChecked).filter(n => have.has(n));
+                                if (picks.length) estateDbtables[t] = picks;
+                            });
+                        }
+                        formData.set("estate_dbtables", JSON.stringify(estateDbtables));
+                        appendStagedTrace(formData);
                         return formData;
                     },
                 });

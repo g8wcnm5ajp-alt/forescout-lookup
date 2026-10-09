@@ -28,7 +28,7 @@ from forescout_client import (
     build_techsupport_em, build_techsupport_window_appliance, clear_lookup_debug_log, clear_techsupport_log,
     bundle_roaming, collect_techsupport, correlate_bundles, debug_set_appliance, delete_techsupport_bundle, delete_uploaded_bundle,
     collect_techsupport_target, download_plugin_logs_zip, download_techsupport_bundle, get_admin_cidr, hostinfo, last_checked, list_appliances,
-    list_plugins, list_uploaded_bundles, lookup, matched_rules, policy_history, policy_tree, preview_techsupport,
+    list_databases, list_plugins, list_uploaded_bundles, lookup, matched_rules, policy_history, policy_tree, preview_techsupport,
     preview_techsupport_em, radius_bundle, radius_file, radius_live, raw_fields, roaming, run_show_errors, set_admin_cidr, tail_lookup_debug_log,
     tail_techsupport_log, trace_defaults, trace_list, trace_set, upload_bundle, valid_cidr, valid_ip,
     upload_bundle_part, finish_bundle_parts, abort_bundle_parts,
@@ -48,7 +48,7 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.15.1"
+APP_VERSION = "1.16.0"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
@@ -1331,10 +1331,41 @@ def _log_case_build(kind, key, case_ref, result, error):
         f.write(json.dumps(entry) + "\n")
 
 
+def _apply_trace_targets(targets, trace_changes):
+    """Enhanced Trace folded into a bundle run (David 2026-10-09): apply the selected trace changes to
+    each target box before the collection window. Best-effort per target -- one box failing to apply
+    shouldn't abort the whole bundle run (the Trace_cu* attach just comes up empty for that box)."""
+    for tgt in dict.fromkeys(targets):   # de-dup, keep order
+        try:
+            trace_set(tgt, trace_changes)
+        except ForescoutClientError:
+            pass
+
+
+def _revert_trace_targets(targets):
+    """Restore each target's captured-once trace defaults after the window -- the same revert the
+    standalone auto-revert timer uses (trace_defaults -> trace_set)."""
+    for tgt in dict.fromkeys(targets):
+        try:
+            defaults = trace_defaults(tgt).get("defaults", {})
+            if defaults:
+                trace_set(tgt, {name: (v["enabled"], v["level"]) for name, v in defaults.items()})
+        except ForescoutClientError:
+            pass
+
+
 def start_techsupport_run(
     kind, hosts, case_ref, level=None, minutes=None, duration=None, selected_plugins=None, selected_dbtables=None,
     company=None, send=False, estate_targets=None,
+    trace_changes=None, trace_scope="all", include_hostinfo_all=False, estate_dbtables=None,
 ):
+    # trace_scope (David 2026-10-09, estate): "all" selected boxes, or one selected box IP -- trace (and its
+    # Trace_cu* attach) are applied only to those. estate_dbtables = {target: [table,...]} selected DB tables
+    # per box (replaces the old blanket include_dbs).
+    # Enhanced Trace / estate attach-ins (David 2026-10-09): trace_changes = {category: (enabled, level)}
+    # applied to every target BEFORE the window and reverted after collection -- its Trace_cu* archive
+    # is attached at collect time (trace_tgz). include_hostinfo_all / include_dbs are estate-only attach
+    # toggles (fstool hostinfo all / the box's significant DB tables) threaded into collect_techsupport_target.
     """
     kind: "host" (hosts is a non-empty list of one or more IPs; level +
     minutes required -- the worker enables debug on every relevant
@@ -1420,7 +1451,9 @@ def start_techsupport_run(
                     selected_dbtables=selected_dbtables, company=company, case_ref=case_ref, timeout=45,
                 )
                 any_debug_enabled = False
+                host_targets = []
                 for t in preview.get("targets", []):
+                    host_targets.append(t["target"])
                     spec = ",".join(f"{p}:{level}:{minutes}" for p in t["plugins"])
                     if spec:
                         # "adhoc" fallback (not the bare case_ref, which can
@@ -1432,7 +1465,9 @@ def start_techsupport_run(
                         # unrelated earlier run's stale "finished" state.
                         debug_set_appliance(t["target"], spec, case_ref=case_ref or "adhoc")
                         any_debug_enabled = True
-                if any_debug_enabled:
+                if trace_changes:
+                    _apply_trace_targets(host_targets, trace_changes)
+                if any_debug_enabled or trace_changes:
                     _update_ts_run(run_id, phase="waiting", waiting_until=int(time.time()) + minutes * 60)
                     time.sleep(minutes * 60)
                 _update_ts_run(run_id, phase="collecting")
@@ -1446,8 +1481,10 @@ def start_techsupport_run(
                 result = collect_techsupport(
                     hosts, minutes, selected_plugins=selected_plugins,
                     selected_dbtables=selected_dbtables, company=company, send=send, case_ref=case_ref,
-                    timeout=3600,
+                    trace_tgz=bool(trace_changes), timeout=3600,
                 )
+                if trace_changes:
+                    _revert_trace_targets(host_targets)
             elif kind == "estate":
                 mins = int(duration[:-1]) * (60 if duration.endswith("h") else 1)
                 any_debug = False
@@ -1456,21 +1493,37 @@ def start_techsupport_run(
                     if spec:
                         debug_set_appliance(tgt, spec, case_ref=case_ref or "adhoc")
                         any_debug = True
-                if any_debug:
+                # Enhanced Trace scope (David 2026-10-09): "all" selected boxes, or just one selected box.
+                trace_targets = ([t for t in estate_targets] if trace_scope == "all"
+                                 else ([trace_scope] if trace_scope in estate_targets else []))
+                if trace_changes and trace_targets:
+                    _apply_trace_targets(trace_targets, trace_changes)
+                if any_debug or (trace_changes and trace_targets):
                     _update_ts_run(run_id, phase="waiting", waiting_until=int(time.time()) + mins * 60)
                     time.sleep(mins * 60)
+                # David 2026-10-09: revert Enhanced Trace the instant the window closes -- BEFORE packing --
+                # so tracing stops ahead of the (possibly long) collect, matching the previewed order
+                # (set -> wait -> reset -> pack -> attach). The Trace_cu* logs already written stay on disk
+                # for the tar inside collect_techsupport_target.
+                if trace_changes and trace_targets:
+                    _revert_trace_targets(trace_targets)
                 _update_ts_run(run_id, phase="collecting")
                 bundles, failures = [], 0
+                _dbtables = estate_dbtables or {}
                 for tgt, plugs in estate_targets.items():
                     try:
                         r = collect_techsupport_target(tgt, [p["plugin"] for p in plugs], duration,
-                                                       company=company, send=send, case_ref=case_ref, timeout=3600)
+                                                       company=company, send=send, case_ref=case_ref,
+                                                       trace_tgz=(bool(trace_changes) and tgt in trace_targets),
+                                                       hostinfo_all=include_hostinfo_all,
+                                                       dbtables=_dbtables.get(tgt), timeout=3600)
                         bundles.extend(r.get("bundles", []))
                     except ForescoutClientError as e:
                         failures += 1
                         bundles.append({"target": tgt, "ok": False, "plugins": [p["plugin"] for p in plugs],
                                         "output_tail": str(e)[-500:]})
                 result = {"bundles": bundles}
+                # (Enhanced Trace already reverted above, right after the window closed and before packing.)
                 if failures and failures == len(estate_targets):
                     raise ForescoutClientError("Every target failed:\n" + "; ".join(
                         b.get("output_tail", "") for b in bundles)[-1500:])
@@ -2583,6 +2636,16 @@ def api_plugins(target):
         return jsonify({"error": str(e)}), 502
 
 
+@app.route("/api/databases/<target>", methods=["GET"])
+def api_databases(target):
+    """Significant DB tables (fstool db diskspace) on target alone -- drives the Estate panel's
+    per-box DB-table selector (David 2026-10-09), independent of any host lookup."""
+    try:
+        return jsonify(list_databases(target))
+    except ForescoutClientError as e:
+        return jsonify({"error": str(e)}), 502
+
+
 @app.route("/analyze/debug", methods=["POST"])
 def do_analyze_debug():
     """
@@ -2896,11 +2959,59 @@ def do_techsupport_estate_preview():
     if perr:
         return jsonify({"error": perr}), 400
     mins = int(duration[:-1]) * (60 if duration.endswith("h") else 1)
+    # Enhanced Trace + attachment toggles (David 2026-10-09): surface the WHOLE lifecycle in Review so it
+    # matches what the worker actually does -- set trace -> wait -> reset -> pack -> attach -> into bundle.
+    # Same parsing as /techsupport/estate/proceed so the preview can't drift from the real run.
+    trace_changes = _parse_trace_changes_form() or None
+    trace_scope = (request.form.get("trace_scope") or "all").strip()
+    if trace_scope != "all" and trace_scope not in estate:
+        trace_scope = "all"
+    include_hostinfo_all = request.form.get("include_hostinfo_all") == "1"
+    estate_dbtables = {}
+    try:
+        raw = json.loads(request.form.get("estate_dbtables") or "{}")
+        if isinstance(raw, dict):
+            for t, tbls in raw.items():
+                if t in estate and isinstance(tbls, list):
+                    sel = [x for x in tbls if isinstance(x, str) and re.match(r"^[a-z_][a-z0-9_]*$", x)]
+                    if sel:
+                        estate_dbtables[t] = sel
+    except (ValueError, TypeError):
+        estate_dbtables = {}
+
+    fstrace_path = "/usr/local/forescout/etc/fstrace.properties"
     targets = []
     for tgt, plugs in estate.items():
+        trace_on = bool(trace_changes) and (trace_scope == "all" or trace_scope == tgt)
+        dbt = estate_dbtables.get(tgt) or []
         cmds = [f"fstool {p['plugin']} debug {p['level']} {mins}m   # on {tgt}" for p in plugs]
+        # 1. set trace options
+        if trace_on:
+            cmds.append(f"# Enhanced Trace -- set categories in {fstrace_path}   # on {tgt}")
+            for cat, (en, lvl) in trace_changes.items():
+                cmds.append(f"    FSTrace.category.{cat} = {'on' if en else 'off'}, level={lvl}")
+        # 2. duration wait
+        cmds.append(f"# wait the collection window: {duration}")
+        # 3. reset trace options (worker reverts the moment the window closes, before packing)
+        if trace_on:
+            cmds.append(f"# Enhanced Trace -- restore {fstrace_path} to captured defaults (revert)   # on {tgt}")
+        # 4. pack the trace archive + any hostinfo-all dump
+        if trace_on:
+            cmds.append(f"tar -czf /tmp/trace-<ts>.tgz /usr/local/forescout/log/Trace_cu*   # pack, on {tgt}")
+        if include_hostinfo_all:
+            cmds.append(f"fstool hostinfo all > /tmp/hostinfo-all-<ts>.txt   # on {tgt}")
+        # 5. attach everything into the tech-support bundle
         pflags = "".join(f"-p {p['plugin']} " for p in plugs)
-        cmds.append(f'fstool tech-support {pflags}--pack {"--send " if send else ""}-company "{company}" -t {duration}   # on {tgt}')
+        attach = ""
+        if trace_on:
+            attach += '--attach-file "/tmp/trace-<ts>.tgz" '
+        if include_hostinfo_all:
+            attach += '--attach-file "/tmp/hostinfo-all-<ts>.txt" '
+        dbflags = "".join(f"--dbtable {t} " for t in dbt)
+        # -comment carries the case reference into the bundle (verified it lands in info/snapshot.properties).
+        # Mirror _build_combined_bundle exactly: comment = case_ref, else the "webapp-estate" fallback.
+        comment = case_ref or "webapp-estate"
+        cmds.append(f'fstool tech-support {pflags}{attach}{dbflags}--comment "{comment}" --pack {"--send " if send else ""}--company "{company}" -t {duration}   # on {tgt}')
         targets.append({"target": tgt, "plugins": [p["plugin"] for p in plugs], "commands": cmds})
     return jsonify({"targets": targets, "duration": duration})
 
@@ -2921,10 +3032,30 @@ def do_techsupport_estate_proceed():
     estate, duration, perr = _parse_estate_form()
     if perr:
         return jsonify({"error": perr}), 400
-    _log_activity("techsupport_estate_proceed", case_ref=case_ref, targets=sorted(estate), send=send)
+    trace_changes = _parse_trace_changes_form() or None
+    trace_scope = (request.form.get("trace_scope") or "all").strip()
+    if trace_scope != "all" and trace_scope not in estate:
+        trace_scope = "all"   # an individual scope must be one of the selected targets
+    include_hostinfo_all = request.form.get("include_hostinfo_all") == "1"
+    estate_dbtables = {}
+    try:
+        raw = json.loads(request.form.get("estate_dbtables") or "{}")
+        if isinstance(raw, dict):
+            for t, tbls in raw.items():
+                if t in estate and isinstance(tbls, list):
+                    sel = [x for x in tbls if isinstance(x, str) and re.match(r"^[a-z_][a-z0-9_]*$", x)]
+                    if sel:
+                        estate_dbtables[t] = sel
+    except (ValueError, TypeError):
+        estate_dbtables = {}
+    _log_activity("techsupport_estate_proceed", case_ref=case_ref, targets=sorted(estate), send=send,
+                  trace=bool(trace_changes), trace_scope=trace_scope, hostinfo_all=include_hostinfo_all,
+                  dbtables={t: len(v) for t, v in estate_dbtables.items()})
     key = "ESTATE: " + ", ".join(sorted(estate))
     run_id = start_techsupport_run("estate", None, case_ref, duration=duration, company=company, send=send,
-                                   estate_targets=estate)
+                                   estate_targets=estate,
+                                   trace_changes=trace_changes, trace_scope=trace_scope,
+                                   include_hostinfo_all=include_hostinfo_all, estate_dbtables=estate_dbtables)
     # Same shape as /techsupport/proceed so the shared createTsPanel JS handles all three kinds uniformly.
     if run_id is None:
         return jsonify({"runs": [], "skipped": [key]})
@@ -3028,9 +3159,11 @@ def do_techsupport_proceed():
             return jsonify({"error": lvl_err}), 400
         selected_plugins = _checked_ts_plugins()
         selected_dbtables = _checked_ts_dbtables()
+        trace_changes = _parse_trace_changes_form() or None
         run_id = start_techsupport_run(
             "host", host_ips, case_ref, level=level, minutes=minutes,
             selected_plugins=selected_plugins, selected_dbtables=selected_dbtables, company=company, send=send,
+            trace_changes=trace_changes,
         )
         key = ", ".join(sorted(host_ips))
         (skipped if run_id is None else started).append(key if run_id is None else {"key": key, "run_id": run_id})
