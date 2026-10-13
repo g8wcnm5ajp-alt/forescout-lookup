@@ -6,7 +6,17 @@
 # available (a dev machine, not the EM).
 #
 # Packages Deploy.sh, Remove.sh, README-Deploy.md (as README.md),
-# webapp-query.py, and a fresh image.tar into dist/ForeScoutTechSupport/.
+# webapp-query.py + its sibling scripts, the portable Python runtime
+# (vendor/, see below) and a fresh image.tar into dist/ForeScoutTechSupport/.
+#
+# The runtime: vendor/ holds one python-build-standalone CPython tarball
+# (install_only_stripped, x86_64 glibc, runs on CentOS/RHEL 7+) plus its
+# published sha256, committed to this repo so a build never needs the
+# internet -- the package has to be self-contained because customer EMs
+# can't download anything (David, 2026-10-13). Deploy.sh unpacks it only
+# on an EM without a python3 of its own (8.x). To move to a newer runtime:
+# drop the new tarball + .sha256 from the project's GitHub release into
+# vendor/, update VENDOR_PYTHON below, delete the old pair.
 # That folder is tracked directly in git (not zipped) -- GitHub's own
 # "Download ZIP" of this repo already lands you with image.tar sitting
 # right next to Deploy.sh, no second unzip step. Confirmed live
@@ -34,6 +44,7 @@ DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMAGE_NAME="forescout-tech-support-collector"
 PKG_DIR="${DIR}/dist/ForeScoutTechSupport"
 ZIP_PATH="${DIR}/dist/ForeScoutTechSupport.zip"
+VENDOR_PYTHON="${DIR}/vendor/cpython-3.12.15+20261009-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
 
 if ! command -v docker >/dev/null 2>&1; then
     echo "Error: docker is not installed/available." >&2
@@ -41,6 +52,10 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 if ! command -v python3 >/dev/null 2>&1; then
     echo "Error: python3 is not installed/available (needed to build the release zip correctly)." >&2
+    exit 1
+fi
+if [ ! -f "$VENDOR_PYTHON" ] || [ ! -f "${VENDOR_PYTHON}.sha256" ]; then
+    echo "Error: ${VENDOR_PYTHON} (+ .sha256) not found -- the portable Python runtime must be committed in vendor/." >&2
     exit 1
 fi
 
@@ -55,6 +70,11 @@ cp "${DIR}/Deploy.sh" "${DIR}/Remove.sh" "$PKG_DIR/"
 cp "${DIR}/README-Deploy.md" "${PKG_DIR}/README.md"
 cp "${DIR}/webapp-query.py" "${DIR}/high-admission-trace.sh" "${DIR}/bundle-correlate.py" "${DIR}/radius-analyze.py" "$PKG_DIR/"
 echo "Staged Deploy.sh, Remove.sh, README.md, webapp-query.py, high-admission-trace.sh, bundle-correlate.py, radius-analyze.py"
+# the runtime, verified against its published checksum before it is staged
+( cd "$(dirname "$VENDOR_PYTHON")" && sha256sum -c --quiet "$(basename "$VENDOR_PYTHON").sha256" ) \
+    || { echo "Error: ${VENDOR_PYTHON} does not match its .sha256 -- refusing to ship it." >&2; exit 1; }
+cp "$VENDOR_PYTHON" "${PKG_DIR}/python-runtime.tar.gz"
+echo "Staged python-runtime.tar.gz ($(basename "$VENDOR_PYTHON"), $(du -h "$VENDOR_PYTHON" | cut -f1), sha256 verified)"
 
 echo
 echo "=== 3. Exporting the image ==="

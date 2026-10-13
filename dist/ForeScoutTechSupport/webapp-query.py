@@ -4495,7 +4495,48 @@ def do_radiuslive(target, start_epoch, end_epoch):
     else:
         remote_cmd = "python3 - " + " ".join(shlex.quote(a) for a in args)
         out, err, rc = ssh_appliance(appliance, remote_cmd, timeout=900, input=_read_radius_script())
+        if rc != 0 and _appliance_lacks_python3(rc, err):
+            out, err, rc = _radiuslive_streamed(appliance, start_epoch, end_epoch)
     _emit_radius_result(out, err, rc, target)
+
+
+def _appliance_lacks_python3(rc, err):
+    """True when the `python3 -` attempt failed because the appliance has no usable
+    python3: not installed at all (an 8.x CentOS 7 appliance -- shell exit 127,
+    "command not found") or one too old to parse the analyser (SyntaxError)."""
+    e = err or ""
+    return rc == 127 or "command not found" in e or "No such file or directory" in e or "SyntaxError" in e
+
+
+# The same files radius-analyze.py's live_files() reads on the box itself; plain sh
+# so an appliance without python3 can serve them (gzip'd rotations are inflated
+# there, since stdin is text). Files whose mtime predates the window are skipped
+# before they cross the wire; the analyser's --since/--until trims per line.
+_RADIUS_STREAM_CMD = (
+    "for f in /usr/local/forescout/log/plugin/dot1x/radiusd*.log "
+    "/usr/local/forescout/log/plugin/dot1x/radius.log* "
+    "/usr/local/forescout/plugin/dot1x/fs_radius/var/log/radius/radius.log*; do "
+    "[ -f \"$f\" ] || continue; m=$(stat -c %Y \"$f\" 2>/dev/null || echo 0); "
+    "[ \"$m\" -ge {since} ] || continue; "
+    "case \"$f\" in *.gz) gzip -dc \"$f\";; *) cat \"$f\";; esac; done"
+)
+
+
+def _radiuslive_streamed(appliance, start_epoch, end_epoch):
+    """Live RADIUS analysis of an appliance that has no python3 (8.x, CentOS 7):
+    stream its radiusd logs back over the EM's existing root trust and run
+    radius-analyze.py here, on whichever interpreter runs this wrapper (the EM's
+    own or the bundled runtime). David, 2026-10-13: the package must be
+    self-contained, nothing installed on the boxes -- so the appliance side is
+    the shell it already has. Costs the log transfer (tens of MB at most) instead
+    of a few KB of report; same window, same findings."""
+    text, err, rc = ssh_appliance(appliance, _RADIUS_STREAM_CMD.format(since=int(start_epoch)), timeout=900)
+    if rc != 0:
+        return "", f"could not read the appliance's RADIUS logs over ssh (no python3 there either): {(err or '').strip()[-1500:]}", rc
+    if not os.path.isfile(RADIUS_SCRIPT_PATH):
+        fail(f"{RADIUS_SCRIPT_PATH} not found on this EM -- redeploy this app to install it.")
+    args = ["--file", "-", "--json", "--since", str(start_epoch), "--until", str(end_epoch)]
+    return run([sys.executable, RADIUS_SCRIPT_PATH, *args], timeout=900, input=text)
 
 
 def do_radiusbundle(path):

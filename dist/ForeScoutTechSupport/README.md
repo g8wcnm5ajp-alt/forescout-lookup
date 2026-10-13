@@ -19,7 +19,7 @@ Run this **on the EM itself**, as root, from inside this unpacked directory. It:
 5. Opens port 8443 through this EM's own firewall via `fstool fw addhook` (survives a firewall reactivation/reboot).
 6. On a genuinely fresh install, waits briefly for the container to generate the initial admin account and **prints the login straight to this console** — no need to dig through `docker logs` or the data volume by hand.
 
-Requires `docker`, `fstool`, and `python3` already present on the EM (all standard on a Forescout EM).
+Requires `docker` and `fstool` on the EM (both standard). The host-side scripts use the EM's own `python3` when it has one (9.x); on an EM without it (8.x, CentOS 7) `Deploy.sh` unpacks the bundled portable Python runtime instead -- nothing is downloaded, the package is self-contained.
 
 Safe to re-run — every step is idempotent.
 
@@ -45,5 +45,7 @@ Leaves `./data`, `./keys`, and `./certs` in place by default (so a later re-`Dep
 - `image.tar` — the pre-built Docker image (`docker load`'d by `Deploy.sh`, nothing built at install time).
 - `webapp-query.py` — the SSH forced-command wrapper Deploy.sh installs onto the EM's host OS.
 - `high-admission-trace.sh` — admission analysis (Live Analyze tab, bundle Analyze buttons); installed next to the wrapper.
-- `bundle-correlate.py` — multi-bundle offline correlation (Upload & Review Bundle tab's Correlate: an EM bundle plus its appliance bundle(s), clocks aligned, EM-to-appliance disconnect timeline, error/performance sweep); installed next to the wrapper, runs on the EM's own python3.
+- `bundle-correlate.py` — multi-bundle offline correlation (Upload & Review Bundle tab's Correlate: an EM bundle plus its appliance bundle(s), clocks aligned, EM-to-appliance disconnect timeline, error/performance sweep); installed next to the wrapper.
+- `radius-analyze.py` — RADIUS log analysis (Live Analyze and Upload & Review tabs); installed next to the wrapper. On an appliance without `python3` the logs are streamed to the EM and analysed there.
+- `python-runtime.tar.gz` — portable CPython 3.12 (python-build-standalone, x86_64, glibc 2.17+). Unpacked to `/root/scripts/webapp-query/python/` only when the EM has no `python3` of its own; `Remove.sh --purge` removes it.
 - `keys/`, `certs/`, `data/` — created by `Deploy.sh` on first install; not shipped in the package.

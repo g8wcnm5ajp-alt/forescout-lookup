@@ -84,6 +84,11 @@ if [ "$PURGE" -eq 1 ]; then
     fi
     # the wrapper's own scratch: per-host identity cache written by IP Lookup (v1.5.5)
     rm -rf "$(dirname "$WEBAPP_QUERY_WRAPPER")/alias-cache"
+    # the bundled portable Python runtime Deploy.sh unpacks on an EM without python3 (v1.17.0)
+    if [ -d "$(dirname "$WEBAPP_QUERY_WRAPPER")/python" ]; then
+        rm -rf "$(dirname "$WEBAPP_QUERY_WRAPPER")/python"
+        echo "Removed the bundled Python runtime from $(dirname "$WEBAPP_QUERY_WRAPPER")/python"
+    fi
     echo "Removed ${DIR}/keys, ${DIR}/certs, ${DIR}/data"
 else
     echo

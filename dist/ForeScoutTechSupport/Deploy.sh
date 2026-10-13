@@ -22,6 +22,19 @@
 #      fstool's own addhook mechanism (survives an EM firewall
 #      reactivation/reboot, unlike a raw iptables rule added by hand).
 #
+# Python: webapp-query.py and its sibling scripts run on this EM's own
+# OS, outside the container (they need fstool, the EM's root trust to
+# the appliances and the EM's own log files -- none of which exist in
+# the image). A 9.x EM ships python3 (3.9 on RHEL 9) and that is used
+# as-is. An 8.x EM (CentOS 7) has no python3 at all -- confirmed live
+# 2026-10-13 on an 8.5.2.2 EM ("Error: python3 not found") -- so the
+# package carries its own portable CPython (python-build-standalone
+# install_only build, glibc >= 2.17 = CentOS/RHEL 7 or newer) and this
+# script unpacks it ONLY when the host has no usable python3. Nothing
+# is downloaded on the EM; the package is self-contained (David's rule,
+# 2026-10-13: "Can't download anything, everything needs to be self
+# contained").
+#
 # Usage: sudo ./Deploy.sh
 set -euo pipefail
 
@@ -64,6 +77,18 @@ BUNDLED_CORRELATE_SCRIPT="${DIR}/bundle-correlate.py"
 # radius-analyze.py (RADIUS Log Analysis on the Live Analyze and Upload & Review tabs)
 RADIUS_SCRIPT="/root/scripts/webapp-query/radius-analyze.py"
 BUNDLED_RADIUS_SCRIPT="${DIR}/radius-analyze.py"
+# Portable Python runtime -- see the header. Unpacked next to the wrapper
+# only when this EM has no python3 of its own.
+BUNDLED_PYTHON_TARBALL="${DIR}/python-runtime.tar.gz"
+BUNDLED_PYTHON_DIR="/root/scripts/webapp-query/python"
+BUNDLED_PYTHON_BIN="${BUNDLED_PYTHON_DIR}/bin/python3"
+
+# True when "$1" is an executable Python 3.8+ (the oldest the host-side
+# scripts are written for).
+python_ok() {
+    [ -n "${1:-}" ] && [ -x "$1" ] || return 1
+    "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 8) else 1)' >/dev/null 2>&1
+}
 
 if [ "$(id -u)" -ne 0 ]; then
     echo "Must be run as root." >&2
@@ -91,9 +116,17 @@ if [ ! -x "$(command -v fstool)" ]; then
     exit 1
 fi
 
-if ! command -v python3 >/dev/null 2>&1; then
-    echo "Error: python3 not found on this EM's host OS -- required to run webapp-query.py." >&2
-    exit 1
+HOST_PYTHON="$(command -v python3 2>/dev/null || true)"
+if python_ok "$HOST_PYTHON"; then
+    PYTHON_BIN="$HOST_PYTHON"
+    PYTHON_SOURCE="this EM's own $("$PYTHON_BIN" -c 'import platform; print("Python " + platform.python_version())')"
+else
+    if [ ! -f "$BUNDLED_PYTHON_TARBALL" ]; then
+        echo "Error: this EM has no python3 (3.8+) and ${BUNDLED_PYTHON_TARBALL} is missing -- run this from inside the unpacked package." >&2
+        exit 1
+    fi
+    PYTHON_BIN="$BUNDLED_PYTHON_BIN"
+    PYTHON_SOURCE="the bundled portable runtime (this EM has no python3 of its own)"
 fi
 
 if [ ! -f "$BUNDLED_WEBAPP_QUERY" ]; then
@@ -111,14 +144,44 @@ fi
 
 echo "=== 1. SSH key for this app's own EM->appliance/EM calls ==="
 mkdir -p "$(dirname "$WEBAPP_QUERY_WRAPPER")"
-cp "$BUNDLED_WEBAPP_QUERY" "$WEBAPP_QUERY_WRAPPER"
-chmod 755 "$WEBAPP_QUERY_WRAPPER"
+
+if [ "$PYTHON_BIN" = "$BUNDLED_PYTHON_BIN" ]; then
+    # Idempotent: the unpacked tree is stamped with the tarball's sha256, so
+    # a redeploy with the same runtime skips the 34 MB extraction and a
+    # package carrying a newer runtime replaces the old tree cleanly.
+    WANT_STAMP="$(sha256sum "$BUNDLED_PYTHON_TARBALL" | cut -d' ' -f1)"
+    HAVE_STAMP="$(cat "${BUNDLED_PYTHON_DIR}/.runtime-sha256" 2>/dev/null || true)"
+    if [ "$WANT_STAMP" != "$HAVE_STAMP" ] || ! python_ok "$BUNDLED_PYTHON_BIN"; then
+        rm -rf "$BUNDLED_PYTHON_DIR"
+        mkdir -p "$BUNDLED_PYTHON_DIR"
+        # the archive's single top-level dir (python/) is stripped so bin/ and lib/ land directly here
+        tar -xzf "$BUNDLED_PYTHON_TARBALL" -C "$BUNDLED_PYTHON_DIR" --strip-components=1
+        echo "$WANT_STAMP" > "${BUNDLED_PYTHON_DIR}/.runtime-sha256"
+        echo "Unpacked the bundled Python runtime to $BUNDLED_PYTHON_DIR"
+    else
+        echo "Bundled Python runtime already in place at $BUNDLED_PYTHON_DIR -- not re-extracting"
+    fi
+    if ! python_ok "$BUNDLED_PYTHON_BIN"; then
+        echo "Error: the bundled Python runtime does not run on this EM ($("$BUNDLED_PYTHON_BIN" --version 2>&1 | tail -1))." >&2
+        echo "It needs x86_64 and glibc 2.17 or newer (CentOS/RHEL 7 or later): $(uname -m), $(ldd --version 2>&1 | head -1)" >&2
+        exit 1
+    fi
+fi
+echo "Host-side scripts will run on ${PYTHON_SOURCE}: ${PYTHON_BIN}"
+
+# Pin each installed script to the chosen interpreter: sshd runs the forced
+# command by its shebang, and webapp-query.py launches its siblings with
+# sys.executable, so this one line per file is the whole wiring.
+install_py() {
+    cp "$1" "$2"
+    sed -i "1s|^#!.*|#!${PYTHON_BIN}|" "$2"
+    chmod 755 "$2"
+}
+install_py "$BUNDLED_WEBAPP_QUERY" "$WEBAPP_QUERY_WRAPPER"
 cp "$BUNDLED_HAT_SCRIPT" "$HAT_SCRIPT"
 chmod 755 "$HAT_SCRIPT"
-cp "$BUNDLED_CORRELATE_SCRIPT" "$CORRELATE_SCRIPT"
-chmod 755 "$CORRELATE_SCRIPT"
-cp "$BUNDLED_RADIUS_SCRIPT" "$RADIUS_SCRIPT"
-chmod 755 "$RADIUS_SCRIPT"
+install_py "$BUNDLED_CORRELATE_SCRIPT" "$CORRELATE_SCRIPT"
+install_py "$BUNDLED_RADIUS_SCRIPT" "$RADIUS_SCRIPT"
 echo "Installed webapp-query.py at $WEBAPP_QUERY_WRAPPER"
 echo "Installed high-admission-trace.sh at $HAT_SCRIPT"
 echo "Installed bundle-correlate.py at $CORRELATE_SCRIPT"
