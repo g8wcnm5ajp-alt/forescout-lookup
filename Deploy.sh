@@ -233,11 +233,29 @@ else
     echo "(browsers will show a one-time trust warning; replace it later via the app's own Certificate page)"
     EM_IP_FOR_CERT="$(hostname -I 2>/dev/null | awk '{print $1}')"
     EM_FQDN="$(hostname -f 2>/dev/null || hostname)"
+    # The SAN goes in via a temporary openssl config, NOT `-addext`: that
+    # flag only exists in OpenSSL 1.1.1+, and an 8.x EM (CentOS 7) ships
+    # OpenSSL 1.0.2, which rejects it and -- under `set -e` -- aborts the
+    # whole deploy (confirmed live 2026-10-13 on an 8.5.3-582 EM:
+    # "unknown option -addext"). A config file with an x509v3 extensions
+    # section is understood by 1.0.2 and 1.1.1+ alike, so this one path
+    # covers every EM.
+    CERT_CONF="$(mktemp)"
+    cat > "$CERT_CONF" <<EOF
+[req]
+distinguished_name = dn
+x509_extensions = v3_ext
+prompt = no
+[dn]
+CN = ${EM_FQDN}
+[v3_ext]
+subjectAltName = DNS:${EM_FQDN},IP:${EM_IP_FOR_CERT:-127.0.0.1}
+EOF
     openssl req -x509 -newkey rsa:4096 -nodes \
         -keyout "$CERT_DIR/private.key" -out "$CERT_DIR/cert.pem" \
-        -days 825 -subj "/CN=${EM_FQDN}" \
-        -addext "subjectAltName=DNS:${EM_FQDN},IP:${EM_IP_FOR_CERT:-127.0.0.1}" \
+        -days 825 -config "$CERT_CONF" \
         >/dev/null 2>&1
+    rm -f "$CERT_CONF"
     chmod 600 "$CERT_DIR/private.key"
     echo "Generated a self-signed cert for ${EM_FQDN} in $CERT_DIR"
 fi

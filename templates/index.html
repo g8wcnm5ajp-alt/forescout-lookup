@@ -1422,6 +1422,8 @@
         <div class="card">
             <h3>What's changed <span class="muted">(release history)</span></h3>
             <dl class="changelog">
+                <dt>v1.17.1 <span class="muted">2026-10-13</span></dt>
+                <dd>8.x cert fix: the self-signed HTTPS cert is generated via an openssl config instead of the 1.1.1-only <code>-addext</code> flag, so Deploy.sh completes on an 8.x EM's OpenSSL 1.0.2.</dd>
                 <dt>v1.17.0 <span class="muted">2026-10-13</span></dt>
                 <dd>Deploys on 8.x EMs: a bundled portable Python for the host-side scripts when the EM has no python3 (nothing downloaded); RADIUS live analysis of appliances without python3 streams their logs to the EM.</dd>
                 <dt>v1.16.x <span class="muted">2026-10-09</span></dt>
