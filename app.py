@@ -48,7 +48,7 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.17.1"
+APP_VERSION = "1.18.0"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
@@ -1358,7 +1358,11 @@ def start_techsupport_run(
     kind, hosts, case_ref, level=None, minutes=None, duration=None, selected_plugins=None, selected_dbtables=None,
     company=None, send=False, estate_targets=None,
     trace_changes=None, trace_scope="all", include_hostinfo_all=False, estate_dbtables=None,
+    plugin_levels=None,
 ):
+    # plugin_levels ("host" kind, David 2026-10-14): {(target, plugin): level} per checked plugin row; a row
+    # without one uses `level`. Flows into the preview (so the reviewed commands show the real levels), the
+    # debugsetappliance spec (what actually gets enabled) and the collect token (kept identical to the preview's).
     # trace_scope (David 2026-10-09, estate): "all" selected boxes, or one selected box IP -- trace (and its
     # Trace_cu* attach) are applied only to those. estate_dbtables = {target: [table,...]} selected DB tables
     # per box (replaces the old blanket include_dbs).
@@ -1447,14 +1451,15 @@ def start_techsupport_run(
                 # built from (hostinfo could in principle have shifted
                 # slightly since; accepted as a simplification).
                 preview = preview_techsupport(
-                    hosts, level, minutes, selected_plugins=selected_plugins,
+                    hosts, level, minutes, selected_plugins=selected_plugins, plugin_levels=plugin_levels,
                     selected_dbtables=selected_dbtables, company=company, case_ref=case_ref, timeout=45,
                 )
                 any_debug_enabled = False
                 host_targets = []
+                lvls = plugin_levels or {}
                 for t in preview.get("targets", []):
                     host_targets.append(t["target"])
-                    spec = ",".join(f"{p}:{level}:{minutes}" for p in t["plugins"])
+                    spec = ",".join(f"{p}:{lvls.get((t['target'], p), level)}:{minutes}" for p in t["plugins"])
                     if spec:
                         # "adhoc" fallback (not the bare case_ref, which can
                         # be None when nothing was typed) -- so this run's
@@ -1479,7 +1484,7 @@ def start_techsupport_run(
                 # well past 8 minutes total -- confirmed live this was
                 # cutting a real multi-plugin build off mid-way.
                 result = collect_techsupport(
-                    hosts, minutes, selected_plugins=selected_plugins,
+                    hosts, minutes, selected_plugins=selected_plugins, plugin_levels=plugin_levels,
                     selected_dbtables=selected_dbtables, company=company, send=send, case_ref=case_ref,
                     trace_tgz=bool(trace_changes), timeout=3600,
                 )
@@ -2843,8 +2848,11 @@ def _parse_ts_send():
 
 
 def _parse_ts_level_minutes():
-    """Shared debug level + duration for the host debug-enable step (same value applied to every checked host's
-    relevant plugins, per David's design) -- returns (level, minutes, error_message_or_None)."""
+    """Shared duration for the host debug-enable step, plus the FALLBACK debug level (ts_level, default 4) for
+    any checked plugin row that didn't send its own level. Since 2026-10-14 (David: each listed plugin's level
+    is set individually, as on the Estate panel) the UI sends a level per plugin via plugin_level_<target>:<plugin>
+    -- see _checked_ts_plugin_levels -- and no longer renders the shared selector. Returns (level, minutes,
+    error_message_or_None)."""
     level = request.form.get("ts_level", "4").strip()
     if not LEVEL_RE.match(level):
         return None, None, "Debug level must be 0-12."
@@ -2874,6 +2882,24 @@ def _checked_ts_plugins():
             if target and plugin:
                 selected.setdefault(target, []).append(plugin)
     return selected
+
+
+def _checked_ts_plugin_levels():
+    """({(target, plugin): level_str}, error_or_None) from plugin_level_<target>:<plugin>=<0-12> fields -- the
+    Appliance Host panel's per-plugin debug level (David 2026-10-14: "debug level for each listed plugin ...
+    settable individually", matching the Estate panel). Only rows that are also checked matter downstream;
+    a checked row with no level field falls back to the shared ts_level. A malformed level is a 400, not a
+    silent default, so a bad value can never quietly become level 4."""
+    levels = {}
+    for key, v in request.form.items():
+        if key.startswith("plugin_level_"):
+            target, _, plugin = key[len("plugin_level_"):].partition(":")
+            if not (target and plugin):
+                continue
+            if not LEVEL_RE.match(v.strip()):
+                return None, f"Debug level for {plugin} must be 0-12."
+            levels[(target, plugin)] = v.strip()
+    return levels, None
 
 
 def _checked_ts_dbtables():
@@ -3090,10 +3116,13 @@ def do_techsupport_preview_route():
         if lvl_err:
             return jsonify({"error": lvl_err}), 400
         selected_plugins = _checked_ts_plugins()
+        plugin_levels, pl_err = _checked_ts_plugin_levels()
+        if pl_err:
+            return jsonify({"error": pl_err}), 400
         selected_dbtables = _checked_ts_dbtables()
         try:
             preview = preview_techsupport(
-                host_ips, level, minutes, selected_plugins=selected_plugins,
+                host_ips, level, minutes, selected_plugins=selected_plugins, plugin_levels=plugin_levels,
                 selected_dbtables=selected_dbtables, company=company, send=send, case_ref=case_ref,
             )
         except ForescoutClientError as e:
@@ -3158,12 +3187,15 @@ def do_techsupport_proceed():
         if lvl_err:
             return jsonify({"error": lvl_err}), 400
         selected_plugins = _checked_ts_plugins()
+        plugin_levels, pl_err = _checked_ts_plugin_levels()
+        if pl_err:
+            return jsonify({"error": pl_err}), 400
         selected_dbtables = _checked_ts_dbtables()
         trace_changes = _parse_trace_changes_form() or None
         run_id = start_techsupport_run(
             "host", host_ips, case_ref, level=level, minutes=minutes,
             selected_plugins=selected_plugins, selected_dbtables=selected_dbtables, company=company, send=send,
-            trace_changes=trace_changes,
+            trace_changes=trace_changes, plugin_levels=plugin_levels,
         )
         key = ", ".join(sorted(host_ips))
         (skipped if run_id is None else started).append(key if run_id is None else {"key": key, "run_id": run_id})

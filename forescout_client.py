@@ -254,7 +254,7 @@ def _validated_minutes(minutes):
     return minutes
 
 
-def _selected_plugins_token(selected_plugins):
+def _selected_plugins_token(selected_plugins, plugin_levels=None):
     """
     selected_plugins: None (no selection at all -- use the full auto-
     detected set; not exercised by the real UI, kept for API
@@ -269,9 +269,15 @@ def _selected_plugins_token(selected_plugins):
     to nothing" ({}). Shape-validated here (which targets/plugins are
     real is re-checked EM-side against the actual detected set -- this
     layer only blocks garbage before it ever reaches SSH).
+
+    plugin_levels: optional {(target, plugin): level} -- David's per-
+    plugin debug level on the Appliance Host panel (2026-10-14). A pair
+    with a level goes on the wire as target:plugin:level; one without
+    stays target:plugin and the EM side falls back to the shared level.
     """
     if selected_plugins is None:
         return "-"
+    plugin_levels = plugin_levels or {}
     pairs = []
     for target, plugins in selected_plugins.items():
         if not valid_target(target):
@@ -279,7 +285,8 @@ def _selected_plugins_token(selected_plugins):
         for plugin in plugins:
             if not PLUGIN_NAME_RE.match(plugin):
                 raise ForescoutClientError(f"'{plugin}' is not a valid plugin name.")
-            pairs.append(f"{target}:{plugin}")
+            lvl = plugin_levels.get((target, plugin))
+            pairs.append(f"{target}:{plugin}" if lvl is None else f"{target}:{plugin}:{_validated_level(lvl)}")
     return ",".join(pairs) if pairs else "0"
 
 
@@ -323,22 +330,23 @@ def _send_token(send):
 
 def preview_techsupport(
     ips, level, minutes, selected_plugins=None, selected_dbtables=None, company=None, send=False, case_ref=None,
-    timeout=45,
+    timeout=45, plugin_levels=None,
 ):
     """
     Read-only -- returns the exact command sequence collect_techsupport
     (plus the debug-enable the caller fires just before it) would run
     for these hosts/level/minutes/case_ref, without executing anything.
     David's ask: review the commands before proceeding. selected_plugins:
-    see _selected_plugins_token. selected_dbtables: see
-    _selected_dbtables_token. company: see _company_token -- David's ask
-    2026-08-26, an editable override for the previously-hardcoded
-    company name. send: see _send_token.
+    see _selected_plugins_token. plugin_levels: per-plugin level
+    overrides, see _selected_plugins_token (level stays the fallback).
+    selected_dbtables: see _selected_dbtables_token. company: see
+    _company_token -- David's ask 2026-08-26, an editable override for
+    the previously-hardcoded company name. send: see _send_token.
     """
     ips = _validated_ips(ips)
     level = _validated_level(level)
     minutes = _validated_minutes(minutes)
-    plugins_token = _selected_plugins_token(selected_plugins)
+    plugins_token = _selected_plugins_token(selected_plugins, plugin_levels)
     dbtables_token = _selected_dbtables_token(selected_dbtables)
     return _run_verb(
         f"techsupportpreview {','.join(ips)} {level} {minutes} {plugins_token} {dbtables_token} "
@@ -349,7 +357,7 @@ def preview_techsupport(
 
 def collect_techsupport(
     ips, minutes, selected_plugins=None, selected_dbtables=None, company=None, send=False, case_ref=None,
-    trace_tgz=False, timeout=480,
+    trace_tgz=False, timeout=480, plugin_levels=None,
 ):
     """
     One or more host IPs at once -- webapp-query.py's do_techsupport_collect
@@ -372,7 +380,9 @@ def collect_techsupport(
     """
     ips = _validated_ips(ips)
     minutes = _validated_minutes(minutes)
-    plugins_token = _selected_plugins_token(selected_plugins)
+    # plugin_levels only matter to the debug-enable step, but the same token keeps preview and collect
+    # byte-identical (their docstrings' "must agree" rule); the EM side ignores the levels on collect.
+    plugins_token = _selected_plugins_token(selected_plugins, plugin_levels)
     dbtables_token = _selected_dbtables_token(selected_dbtables)
     return _run_verb(
         f"techsupportcollect {','.join(ips)} {minutes} {plugins_token} {dbtables_token} "

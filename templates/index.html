@@ -917,15 +917,16 @@
             </div>
 
             <table id="techsupport-plugin-table" style="display:none">
-                <thead><tr><th></th><th>Plugin</th><th>Source appliance</th></tr></thead>
+                <thead><tr><th></th><th>Plugin</th><th>Debug level</th><th>Source appliance</th></tr></thead>
                 <tbody id="techsupport-plugin-tbody"></tbody>
             </table>
             <p id="techsupport-plugin-hint" class="hint" style="display:none">Plugins relevant to the checked
-                host(s), one row each -- tick which ones to include in this build. None ticked is fine -- each
-                checked host's own managing appliance always gets a bundle regardless (general category set,
-                plus its hostinfo attached). The source appliance defaults to whatever this app detected live
-                (marked "detected"), but can be changed to any known box -- useful when the detected source is
-                wrong or ambiguous, e.g. a plugin that's genuinely enabled on more than one appliance.</p>
+                host(s), one row each -- tick which ones to include in this build and set each one's own debug
+                level (0-12, default 4). None ticked is fine -- each checked host's own managing appliance
+                always gets a bundle regardless (general category set, plus its hostinfo attached). The source
+                appliance defaults to whatever this app detected live (marked "detected"), but can be changed to
+                any known box -- useful when the detected source is wrong or ambiguous, e.g. a plugin that's
+                genuinely enabled on more than one appliance.</p>
 
             <div class="tree-filter-row">
                 <label class="tree-filter-toggle">
@@ -953,13 +954,6 @@
             </div>
 
             <div class="tree-filter-row">
-                <label class="tree-filter-toggle">Debug level
-                    <select id="techsupport-level">
-                        {% for lvl in range(13) %}
-                        <option value="{{ lvl }}"{% if lvl == 4 %} selected{% endif %}>{{ lvl }}</option>
-                        {% endfor %}
-                    </select>
-                </label>
                 <label class="tree-filter-toggle">Duration
                     <input type="number" id="techsupport-duration-value" value="60" min="1" max="9999" step="1" style="width:5em">
                 </label>
@@ -968,10 +962,10 @@
                     <option value="h">Hours</option>
                 </select>
             </div>
-            <p class="hint">Enables debug at this level on each relevant plugin for every checked host, waits out the
-                duration, then collects -- guarantees the bundle actually contains fresh debug-level data instead of
-                whatever happened to already be logged. Every relevant plugin that resolves to the same appliance
-                collects in one combined bundle, not one per plugin or per host.</p>
+            <p class="hint">Enables debug on each ticked plugin at that plugin's own level (set per row above), waits
+                out the shared duration, then collects -- guarantees the bundle actually contains fresh debug-level
+                data instead of whatever happened to already be logged. Every relevant plugin that resolves to the
+                same appliance collects in one combined bundle, not one per plugin or per host.</p>
 
             <div class="tree-filter-row">
                 <label class="tree-filter-toggle">Enhanced Trace (optional)
@@ -1313,8 +1307,8 @@
                         first. Two panels, and every build previews its exact commands before anything runs.</p>
                     <p><strong>Appliance Host</strong> -- driven by a host. Enter the host IP(s); the app groups
                         each plugin onto the box that actually owns it. Tick the plugins (and any DB tables) to
-                        include, set one debug level + duration, <strong>Review commands…</strong>, then
-                        <strong>Proceed</strong>.</p>
+                        include, set each plugin's own <strong>debug level</strong> plus one shared duration,
+                        <strong>Review commands…</strong>, then <strong>Proceed</strong>.</p>
                     <p><strong>Estate Debug Bundles</strong> -- no host needed. Tick any appliances and/or the EM
                         (<strong>All Appliances &amp; EM</strong>), then pick plugins with a <strong>per-plugin
                         debug level</strong>, or <strong>All plugins</strong> (everything installed on each box).
@@ -1422,6 +1416,8 @@
         <div class="card">
             <h3>What's changed <span class="muted">(release history)</span></h3>
             <dl class="changelog">
+                <dt>v1.18.0 <span class="muted">2026-10-14</span></dt>
+                <dd>Appliance Host bundles: each listed plugin now has its own debug level (0-12) in the plugin table, like the Estate panel; the single shared level is gone, duration stays shared.</dd>
                 <dt>v1.17.1 <span class="muted">2026-10-13</span></dt>
                 <dd>8.x cert fix: the self-signed HTTPS cert is generated via an openssl config instead of the 1.1.1-only <code>-addext</code> flag, so Deploy.sh completes on an 8.x EM's OpenSSL 1.0.2.</dd>
                 <dt>v1.17.0 <span class="muted">2026-10-13</span></dt>
@@ -4563,7 +4559,12 @@
             const tsPluginHint = document.getElementById("techsupport-plugin-hint");
             let tsAllTargets = [];
             try { tsAllTargets = JSON.parse(tsPanelEl.dataset.allTargets || "[]"); } catch (e) {}
-            const tsPluginState = new Map(); // plugin -> {checked, target}
+            const tsPluginState = new Map(); // plugin -> {checked, target, level}  (level: per-plugin debug level, David 2026-10-14)
+            function tsLevelOptions(selected) {   // 0-12 <option>s for a per-plugin debug level select
+                let o = "";
+                for (let n = 0; n <= 12; n++) o += "<option value=\"" + n + "\"" + (n === selected ? " selected" : "") + ">" + n + "</option>";
+                return o;
+            }
 
             // Advanced Trace -- David's ask, 2026-08-26: an "Enhance Trace" picker (reusing tsAllTargets,
             // the same EM+appliance list the plugin override select above already uses) that opens a
@@ -4765,6 +4766,7 @@
                     const candidates = candidatesByPlugin.get(plugin);
                     const state = tsPluginState.get(plugin);
                     const checked = state && state.checked ? " checked" : "";
+                    const level = state && Number.isInteger(state.level) ? state.level : 4;
                     const targetPool = tsAllTargets.length ? tsAllTargets : Array.from(candidates).sort();
                     const defaultTarget = (state && state.target) || Array.from(candidates).sort()[0];
                     const options = targetPool.map(t => {
@@ -4774,28 +4776,21 @@
                     }).join("");
                     return "<tr><td><input type=\"checkbox\" class=\"techsupport-plugin-checkbox\" data-plugin=\"" +
                         escapeHtml(plugin) + "\"" + checked + "></td><td>" + escapeHtml(plugin) + "</td><td>" +
+                        "<select class=\"techsupport-plugin-level\" data-plugin=\"" + escapeHtml(plugin) + "\">" +
+                        tsLevelOptions(level) + "</select></td><td>" +
                         "<select class=\"techsupport-plugin-target-select\" data-plugin=\"" + escapeHtml(plugin) + "\">" +
                         options + "</select></td></tr>";
                 }).join("");
 
-                tsPluginTbody.querySelectorAll(".techsupport-plugin-checkbox").forEach(cb => {
-                    cb.addEventListener("change", () => {
-                        const plugin = cb.dataset.plugin;
-                        const select = tsPluginTbody.querySelector(
-                            ".techsupport-plugin-target-select[data-plugin=\"" + CSS.escape(plugin) + "\"]"
-                        );
-                        tsPluginState.set(plugin, { checked: cb.checked, target: select ? select.value : null });
-                    });
-                });
-                tsPluginTbody.querySelectorAll(".techsupport-plugin-target-select").forEach(select => {
-                    select.addEventListener("change", () => {
-                        const plugin = select.dataset.plugin;
-                        const checkbox = tsPluginTbody.querySelector(
-                            ".techsupport-plugin-checkbox[data-plugin=\"" + CSS.escape(plugin) + "\"]"
-                        );
-                        tsPluginState.set(plugin, { checked: checkbox ? checkbox.checked : false, target: select.value });
-                    });
-                });
+                // One state record per plugin row (checked / level / source target), rebuilt from the row's
+                // three controls on any change so a host toggle that re-renders the table keeps all of them.
+                function tsRowState(plugin) {
+                    const q = sel => tsPluginTbody.querySelector(sel + "[data-plugin=\"" + CSS.escape(plugin) + "\"]");
+                    const cb = q(".techsupport-plugin-checkbox"), lvl = q(".techsupport-plugin-level"), tgt = q(".techsupport-plugin-target-select");
+                    return { checked: cb ? cb.checked : false, level: lvl ? parseInt(lvl.value, 10) : 4, target: tgt ? tgt.value : null };
+                }
+                tsPluginTbody.querySelectorAll(".techsupport-plugin-checkbox, .techsupport-plugin-level, .techsupport-plugin-target-select")
+                    .forEach(el => el.addEventListener("change", () => tsPluginState.set(el.dataset.plugin, tsRowState(el.dataset.plugin))));
             }
 
             // Attach DBs -- David's ask, 2026-08-26 (after a same-day detour assuming whole separate
@@ -4924,8 +4919,15 @@
                         const select = tsPluginTbody.querySelector(
                             ".techsupport-plugin-target-select[data-plugin=\"" + CSS.escape(cb.dataset.plugin) + "\"]"
                         );
+                        const levelSel = tsPluginTbody.querySelector(
+                            ".techsupport-plugin-level[data-plugin=\"" + CSS.escape(cb.dataset.plugin) + "\"]"
+                        );
                         const target = select ? select.value : null;
-                        if (target) formData.set("include_plugin_" + target + ":" + cb.dataset.plugin, "1");
+                        if (target) {
+                            formData.set("include_plugin_" + target + ":" + cb.dataset.plugin, "1");
+                            // per-plugin debug level (David 2026-10-14) -- the server falls back to 4 if absent
+                            if (levelSel) formData.set("plugin_level_" + target + ":" + cb.dataset.plugin, levelSel.value);
+                        }
                     });
                     if (tsDbToggle.checked) {
                         tsDbTbody.querySelectorAll(".techsupport-dbtable-checkbox:checked").forEach(cb => {
@@ -4936,7 +4938,6 @@
                             if (target) formData.set("include_dbtable_" + target + ":" + cb.dataset.table, "1");
                         });
                     }
-                    formData.set("ts_level", document.getElementById("techsupport-level").value);
                     formData.set("ts_duration_value", document.getElementById("techsupport-duration-value").value);
                     formData.set("ts_duration_unit", document.getElementById("techsupport-duration-unit").value);
                     formData.set("ts_send", document.getElementById("techsupport-send").checked ? "1" : "0");

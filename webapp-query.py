@@ -2901,7 +2901,10 @@ def _group_plugins_by_target(ips_csv, selected_plugins=None, case_ref=None):
     return ips, plugins_by_target, hostinfo_by_target, verdict_by_ip, unresolved
 
 
-TARGET_PLUGIN_PAIR_RE = rf"{TARGET_RE}:{DEBUGSET_PLUGIN_RE}"
+# target:plugin, optionally :level (0-12) -- the per-plugin debug level David asked for on the Appliance Host
+# panel (2026-10-14; the Estate panel already had one). Pairs without a level fall back to the verb's shared
+# <level> argument, so older callers keep working unchanged.
+TARGET_PLUGIN_PAIR_RE = rf"{TARGET_RE}:{DEBUGSET_PLUGIN_RE}(?::{DEBUGSET_LEVEL_RE})?"
 SELECTED_PLUGINS_RE = rf"(?:{TARGET_PLUGIN_PAIR_RE}(?:,{TARGET_PLUGIN_PAIR_RE})*|-|0)"
 
 
@@ -2915,9 +2918,10 @@ def _parse_selected_plugins(selected_plugins_token):
     collects a plain hostinfo-only bundle -- distinct from "-"/None:
     {} still runs the selected_plugins filter below, correctly zeroing
     out every target's plugin set rather than leaving it unfiltered).
-    Otherwise "target:plugin,target:plugin,..." -> {target: set(plugin)}.
-    Shape only, matches SELECTED_PLUGINS_RE already checked at the
-    dispatch boundary.
+    Otherwise "target:plugin[:level],..." -> {target: set(plugin)} (the
+    optional per-plugin level is read separately by
+    _parse_selected_plugin_levels). Shape only, matches
+    SELECTED_PLUGINS_RE already checked at the dispatch boundary.
     """
     if selected_plugins_token == "-":
         return None
@@ -2925,9 +2929,23 @@ def _parse_selected_plugins(selected_plugins_token):
         return {}
     selected = {}
     for pair in selected_plugins_token.split(","):
-        target, plugin = pair.split(":", 1)
+        target, plugin = pair.split(":")[:2]
         selected.setdefault(target, set()).add(plugin)
     return selected
+
+
+def _parse_selected_plugin_levels(selected_plugins_token):
+    """{(target, plugin): level_str} for every pair in the token that carries its own :level -- pairs
+    without one are simply absent, so the caller falls back to the shared level (David's per-plugin debug
+    level on the Appliance Host panel, 2026-10-14)."""
+    levels = {}
+    if selected_plugins_token in ("-", "0"):
+        return levels
+    for pair in selected_plugins_token.split(","):
+        parts = pair.split(":")
+        if len(parts) == 3:
+            levels[(parts[0], parts[1])] = parts[2]
+    return levels
 
 
 TARGET_DBTABLE_PAIR_RE = rf"{TARGET_RE}:{DATABASE_NAME_RE.pattern[1:-1]}"
@@ -2992,6 +3010,7 @@ def do_techsupport_preview(
     """
     company = company or DEFAULT_COMPANY
     selected_plugins = _parse_selected_plugins(selected_plugins_token)
+    plugin_levels = _parse_selected_plugin_levels(selected_plugins_token)
     selected_dbtables = _parse_selected_dbtables(selected_dbtables_token)
     ips, plugins_by_target, hostinfo_by_target, verdict_by_ip, unresolved = _group_plugins_by_target(
         ips_csv, selected_plugins
@@ -3013,7 +3032,8 @@ def do_techsupport_preview(
             until = get_debug_until(plugin, target_mode, target)
             if until > now:
                 already_active.append(plugin)
-            commands.append(_debug_enable_cmd(plugin, level, minutes))
+            # per-plugin level when the UI sent one (Appliance Host panel, 2026-10-14), else the shared level
+            commands.append(_debug_enable_cmd(plugin, plugin_levels.get((target, plugin), level), minutes))
         commands.append(f"wait {duration}")
 
         hostinfo_ips = sorted(hostinfo_by_target.get(target, {}).keys())
