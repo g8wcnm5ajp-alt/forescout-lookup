@@ -23,6 +23,7 @@
                 &middot; <a href="{{ url_for('change_password_route') }}">Change password</a>
                 &middot; <a href="#" id="openDebugLogBtn">Debug Log</a>
                 &middot; <a href="#" id="openSupportLogBtn">Support Log</a>
+                &middot; <a href="#" id="restartAppBtn" title="Restart this app's own process (the container comes straight back). Running jobs are marked failed.">Restart app</a>
                 &middot; <form method="post" action="{{ url_for('logout_route') }}" style="display:inline;"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit" class="btn-small btn-secondary">Logout</button></form>
             </div>
         </div>
@@ -877,7 +878,7 @@
         <div class="card actions" id="techsupport-panel" data-active-runs="{{ active_techsupport_runs|tojson|forceescape }}"
             data-all-targets="{{ (successful[0].result.all_targets if successful else [])|tojson|forceescape }}"
             data-databases="{{ (successful[0].result.databases if successful else {})|tojson|forceescape }}">
-            <h3>Appliance Host Tech Support Bundle Generation
+            <h3>Host Tracked Support Bundle Generator
                 <form method="post" action="/admin/clear_log/techsupport_runs" class="inline-form" style="display:inline"
                     onsubmit="return confirm('Clear tech-support build history (Host + EM, currently running included)? This does not touch bundles already saved on the EM.');">
                     <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
@@ -910,12 +911,14 @@
                 <label class="tree-filter-toggle">
                     <input type="checkbox" class="techsupport-ip-checkbox" data-target="{{ entry.result.ip }}"
                         data-debug-targets="{{ entry.result.debug_targets|tojson|forceescape }}"
+                        data-field-count="{{ entry.result.raw_field_count }}"
                         data-own-appliance="{{ entry.result.own_appliance }}">
                     {{ entry.result.ip }} <span class="verdict verdict-{{ entry.result.wired_or_wireless }}">{{ entry.result.wired_or_wireless }}</span>
                 </label>
                 {% endfor %}
             </div>
 
+            <p id="techsupport-noplugin-hint" class="hint preview-warning" style="display:none"></p>
             <table id="techsupport-plugin-table" style="display:none">
                 <thead><tr><th></th><th>Plugin</th><th>Debug level</th><th>Source appliance</th></tr></thead>
                 <tbody id="techsupport-plugin-tbody"></tbody>
@@ -1416,6 +1419,14 @@
         <div class="card">
             <h3>What's changed <span class="muted">(release history)</span></h3>
             <dl class="changelog">
+                <dt>v1.19.2 <span class="muted">2026-10-16</span></dt>
+                <dd>Host Tracked Support Bundle Generator (renamed): a checked host with no plugin data now says so ("Forescout holds no plugin data for &lt;ip&gt; (host record has N fields) -- nothing to debug") instead of a silently empty plugin list.</dd>
+                <dt>v1.19.1 <span class="muted">2026-10-16</span></dt>
+                <dd>Job cards: a run with no debug window says so ("No debug window -- collecting straight away") and every running phase shows how long it has been going ("m:ss so far"). Survives Docker-daemon restarts: the container now runs with restart policy <code>always</code>; the app exits cleanly on SIGTERM (no 10 s force-kill on stop); <code>Reset.sh</code> restarts by asking the app to exit so Docker's restart policy does the restart, instead of a manual <code>docker restart</code> that could leave the container stopped for good.</dd>
+                <dt>v1.19.0 <span class="muted">2026-10-16</span></dt>
+                <dd>Restart app link in the header (the container restarts itself); <code>Reset.sh</code> on the EM captures the container log, state and the Docker daemon journal before restarting the app from outside -- the newest capture rides inside the Support Log zip; Debug Log / Support Log say "the app isn't answering, retrying" and retry for a minute instead of failing silently when the container is being bounced (an EM engine restart restarts Docker).</dd>
+                <dt>v1.18.1 <span class="muted">2026-10-16</span></dt>
+                <dd>Tech-support bundles: while a job waits out its debug window, the job card and the commands-log popup show a live countdown to when the tech-support collection fires (anchored to the EM's clock).</dd>
                 <dt>v1.18.0 <span class="muted">2026-10-14</span></dt>
                 <dd>Appliance Host bundles: each listed plugin now has its own debug level (0-12) in the plugin table, like the Estate panel; the single shared level is gone, duration stays shared.</dd>
                 <dt>v1.17.1 <span class="muted">2026-10-13</span></dt>
@@ -4122,6 +4133,63 @@
                 return "Working…";
             }
 
+            // Countdown to "collection fires" (David 2026-10-16): while a run sits in its debug
+            // window the card (and the commands-log popup banner) show how long until the worker
+            // wakes and runs the tech-support commands. Anchored to the server's clock: each poll
+            // hands back waiting_until + server_now, the browser only keeps the remaining seconds
+            // and ticks them down locally between polls -- a browser clock that is off by minutes
+            // can't skew it, and every 5-second poll re-seeds it so it can't drift.
+            // Per-run anchor (David 2026-10-16, second ask: "see the count down in this line" on a
+            // run that had no debug window): every running card ticks once a second -- a waiting
+            // run counts DOWN to its collection, any other phase counts UP ("m:ss so far"), so a
+            // long collection never looks dead. mode "waiting": t = fire time; mode "elapsed":
+            // base = phase text, t = start time (null when the server gave none).
+            const tsAnchor = {};    // run_id -> {mode, t, base}
+            const tsTickers = {};   // run_id -> setInterval id for the once-a-second refresh
+
+            function tsCountdownText(ms) {
+                let secs = Math.max(0, Math.round(ms / 1000));
+                const h = Math.floor(secs / 3600); secs -= h * 3600;
+                const m = Math.floor(secs / 60); const sec = secs - m * 60;
+                const mm = (h ? String(m).padStart(2, "0") : String(m));
+                return (h ? h + ":" : "") + mm + ":" + String(sec).padStart(2, "0");
+            }
+
+            function tsFiresAtText(fireMs) {
+                const d = new Date(fireMs);
+                return String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0") + ":" +
+                    String(d.getSeconds()).padStart(2, "0");
+            }
+
+            function tsWaitingLabel(fireMs) {
+                const left = fireMs - Date.now();
+                if (left <= 0) return "Debug window closed -- tech-support collection firing now…";
+                return "Debug enabled -- tech-support collection fires in <strong>" + tsCountdownText(left) +
+                    "</strong> (at " + tsFiresAtText(fireMs) + " local)";
+            }
+
+            function tsStopCountdown(runId) {
+                if (tsTickers[runId]) { clearInterval(tsTickers[runId]); delete tsTickers[runId]; }
+                delete tsAnchor[runId];
+            }
+
+            function tsLabelFor(runId) {
+                const a = tsAnchor[runId];
+                if (!a) return "Working…";
+                if (a.mode === "waiting") return tsWaitingLabel(a.t);
+                return a.base + (a.t ? " <span class=\"muted\">" + tsCountdownText(Date.now() - a.t) + " so far</span>" : "");
+            }
+
+            // Soonest pending collection across every tracked job, for the popup banner.
+            function tsSoonestWaiting() {
+                let best = null;
+                Object.keys(tsAnchor).forEach(id => {
+                    const a = tsAnchor[id];
+                    if (a.mode === "waiting" && (best === null || a.t < best)) best = a.t;
+                });
+                return best;
+            }
+
             function downloadLink(path, label) {
                 if (!path) return "";
                 return "<div>" +
@@ -4281,13 +4349,29 @@
                         pre.textContent = text || "(nothing logged yet)";
                         if (nearBottom) tsLogWindow.scrollTo(0, tsLogWindow.document.body.scrollHeight);
                     }
-                    if (bannerText) bannerText.textContent = finished ? "All jobs finished." : "Running…";
+                    if (bannerText) {
+                        const soonest = finished ? null : tsSoonestWaiting();
+                        bannerText.textContent = finished ? "All jobs finished."
+                            : (soonest === null ? "Running…"
+                               : "Running… next tech-support collection fires in " + tsCountdownText(soonest - Date.now()) +
+                                 " (at " + tsFiresAtText(soonest) + " local)");
+                    }
                     if (banner) banner.style.background = finished ? "#2e7d32" : "#333";
                 } catch (e) {}
             }
 
+            let tsLogBannerTicker = null;
             function pollTsLog() {
-                if (!tsLogWindow || tsLogWindow.closed) return;
+                if (!tsLogWindow || tsLogWindow.closed) { if (tsLogBannerTicker) { clearInterval(tsLogBannerTicker); tsLogBannerTicker = null; } return; }
+                if (!tsLogBannerTicker) {
+                    tsLogBannerTicker = setInterval(() => {
+                        if (!tsLogWindow || tsLogWindow.closed) return;
+                        try {
+                            const pre = tsLogWindow.document.getElementById("log");
+                            tsLogWrite(pre ? pre.textContent : "", tsPendingRunIds.size === 0);
+                        } catch (e) {}
+                    }, 1000);
+                }
                 fetch("/api/techsupport_log")
                     .then(r => r.json())
                     .then(d => tsLogWrite(d.log, tsPendingRunIds.size === 0))
@@ -4436,6 +4520,7 @@
                             .then(d4 => {
                                 if (d4.error) { window.alert("Failed to delete: " + d4.error); delBtn.disabled = false; delBtn.textContent = "Delete"; return; }
                                 tsLogJobDone(run.run_id);
+                                tsStopCountdown(run.run_id);
                                 el.remove();
                             })
                             .catch(err => { window.alert("Failed to delete: " + err); delBtn.disabled = false; delBtn.textContent = "Delete"; });
@@ -4449,10 +4534,30 @@
                             const el = document.getElementById(opts.jobsId + "-" + run.run_id);
                             if (!el) return;
                             if (d.status === "running") {
+                                // Re-seed the per-run anchor from the server's own clock on every poll
+                                // and tick it locally once a second in between (see tsAnchor above).
+                                const serverNow = d.server_now || Math.floor(Date.now() / 1000);
+                                if (d.phase === "waiting" && d.waiting_until) {
+                                    tsAnchor[run.run_id] = { mode: "waiting", t: Date.now() + (d.waiting_until - serverNow) * 1000 };
+                                } else {
+                                    let base = phaseLabel(d.phase);
+                                    if (d.phase === "collecting" && d.wait_skipped) {
+                                        base = "No debug window (nothing ticked to debug) -- collecting straight away…";
+                                    }
+                                    tsAnchor[run.run_id] = { mode: "elapsed", base: base,
+                                                             t: d.started_at ? Date.now() - (serverNow - d.started_at) * 1000 : null };
+                                }
                                 el.innerHTML = "<p class=\"hint\"><span class=\"spinner\"></span>" +
-                                    escapeHtml(run.key) + " -- " + phaseLabel(d.phase) + " " +
+                                    escapeHtml(run.key) + " -- <span class=\"ts-phase-label\">" + tsLabelFor(run.run_id) + "</span> " +
                                     "<button type=\"button\" class=\"btn-small btn-secondary techsupport-kill-btn\">Kill</button> " +
                                     "<button type=\"button\" class=\"btn-small btn-secondary techsupport-delete-btn\">Delete</button></p>";
+                                if (!tsTickers[run.run_id]) {
+                                    tsTickers[run.run_id] = setInterval(() => {
+                                        const span = el.querySelector(".ts-phase-label");
+                                        if (!span || !tsAnchor[run.run_id]) { tsStopCountdown(run.run_id); return; }
+                                        span.innerHTML = tsLabelFor(run.run_id);
+                                    }, 1000);
+                                }
                                 const killBtn = el.querySelector(".techsupport-kill-btn");
                                 if (killBtn) {
                                     killBtn.addEventListener("click", () => {
@@ -4471,6 +4576,7 @@
                                 setTimeout(() => pollJob(run), 5000);
                                 return;
                             }
+                            tsStopCountdown(run.run_id);
                             if (d.status === "failed") {
                                 el.innerHTML = "<h4>" + escapeHtml(run.key) + "</h4><div class=\"error\">" +
                                     escapeHtml(d.error || "failed") + "</div>" +
@@ -4557,6 +4663,7 @@
             const tsPluginTable = document.getElementById("techsupport-plugin-table");
             const tsPluginTbody = document.getElementById("techsupport-plugin-tbody");
             const tsPluginHint = document.getElementById("techsupport-plugin-hint");
+            const tsNoPluginHint = document.getElementById("techsupport-noplugin-hint");
             let tsAllTargets = [];
             try { tsAllTargets = JSON.parse(tsPanelEl.dataset.allTargets || "[]"); } catch (e) {}
             const tsPluginState = new Map(); // plugin -> {checked, target, level}  (level: per-plugin debug level, David 2026-10-14)
@@ -4756,9 +4863,27 @@
                     tsPluginTable.style.display = "none";
                     tsPluginHint.style.display = "none";
                     tsPluginTbody.innerHTML = "";
+                    // Say WHY there is nothing to tick (David 2026-10-16: a host whose record had aged
+                    // down to its assigned-to pointer looked like the plugin list had broken). Plugins are
+                    // detected from the fields they contributed to the host's own record, so an empty
+                    // record means nothing to debug -- Review still builds a general bundle.
+                    const checked = Array.from(document.querySelectorAll(".techsupport-ip-checkbox:checked"));
+                    if (tsNoPluginHint) {
+                        if (checked.length) {
+                            const parts = checked.map(cb => cb.dataset.target + " (host record has " +
+                                (cb.dataset.fieldCount || "?") + " field" + (cb.dataset.fieldCount === "1" ? "" : "s") + ")");
+                            tsNoPluginHint.textContent = "Forescout holds no plugin data for " + parts.join(", ") +
+                                " -- no plugin has contributed fields to this host, so there is nothing to debug. " +
+                                "Review commands will build a general bundle (hostinfo only) with no debug window.";
+                            tsNoPluginHint.style.display = "";
+                        } else {
+                            tsNoPluginHint.style.display = "none";
+                        }
+                    }
                     return;
                 }
 
+                if (tsNoPluginHint) tsNoPluginHint.style.display = "none";
                 tsPluginTable.style.display = "";
                 tsPluginHint.style.display = "";
                 const plugins = Array.from(candidatesByPlugin.keys()).sort();
@@ -5720,6 +5845,7 @@
             const openBtn = document.getElementById("openDebugLogBtn");
             if (!openBtn) return;
             let logWindow = null;
+            let debugLogDownSince = 0;
 
             function pollDebugLog() {
                 if (!logWindow || logWindow.closed) return;
@@ -5733,8 +5859,17 @@
                             pre.textContent = d.log || "(nothing logged yet -- run a lookup first)";
                             if (nearBottom) logWindow.scrollTo(0, logWindow.document.body.scrollHeight);
                         }
+                        debugLogDownSince = 0;
                     })
-                    .catch(() => {});
+                    .catch(() => {
+                        // The app itself isn't answering (David 2026-10-16: on a customer site the log
+                        // buttons "crashed" with nothing to show for it). Say so and keep polling --
+                        // the container is usually being bounced (an EM engine restart restarts Docker).
+                        if (!logWindow || logWindow.closed) return;
+                        if (!debugLogDownSince) debugLogDownSince = Date.now();
+                        const pre = logWindow.document.getElementById("log");
+                        if (pre) pre.textContent = window.appDownMessage(debugLogDownSince);
+                    });
                 setTimeout(pollDebugLog, 4000);
             }
 
@@ -5777,6 +5912,60 @@
             });
         })();
 
+        // "The app isn't answering" wording shared by the Debug Log popup and the Support Log
+        // modal (David 2026-10-16) -- one sentence that says what is probably happening and how
+        // long it has been going on, instead of a silent failure.
+        window.appDownMessage = function (since) {
+            const secs = Math.max(0, Math.round((Date.now() - since) / 1000));
+            return "The app isn't answering (" + secs + " s). It may be restarting -- an EM engine restart " +
+                "restarts Docker and the app container with it. Retrying…";
+        };
+
+        // Restart app (David 2026-10-16): header link -> confirm -> POST /admin/restart_app -> the
+        // app exits and Docker brings a fresh process up. An overlay polls /login every 2 s and
+        // reloads the page once it answers; after 90 s it points at Reset.sh on the EM.
+        (function () {
+            const btn = document.getElementById("restartAppBtn");
+            if (!btn) return;
+            function overlay(text) {
+                let el = document.getElementById("restart-app-overlay");
+                if (!el) {
+                    el = document.createElement("div");
+                    el.id = "restart-app-overlay";
+                    el.className = "modal-overlay";
+                    el.style.display = "flex";
+                    el.innerHTML = "<div class=\"modal-box\"><h3>Restarting the app</h3><p id=\"restart-app-status\" class=\"hint\"></p></div>";
+                    document.body.appendChild(el);
+                }
+                const p = document.getElementById("restart-app-status");
+                if (p) p.textContent = text;
+            }
+            function waitForApp(started) {
+                const secs = Math.round((Date.now() - started) / 1000);
+                if (secs > 90) {
+                    overlay("Still not answering after 90 s. On the EM, run ./Reset.sh (next to Deploy.sh): it saves the container log and state, then restarts the app from outside.");
+                    return;
+                }
+                overlay("Waiting for the app to come back… (" + secs + " s)");
+                fetch("/login", { cache: "no-store", credentials: "same-origin" })
+                    .then(r => { if (r.ok) { overlay("Back -- reloading…"); window.location.reload(); } else { setTimeout(() => waitForApp(started), 2000); } })
+                    .catch(() => setTimeout(() => waitForApp(started), 2000));
+            }
+            btn.addEventListener("click", (e) => {
+                e.preventDefault();
+                if (!window.confirm("Restart the app now? Any running job (lookups, bundle builds, analyses) will be marked failed and must be started again. The app is back in a few seconds.")) return;
+                overlay("Asking the app to restart…");
+                const started = Date.now();
+                fetch("/admin/restart_app", { method: "POST", body: new URLSearchParams({ csrf_token: CSRF_TOKEN }), credentials: "same-origin" })
+                    .then(r => r.json())
+                    .then(d => {
+                        if (d.error) { overlay("Not restarted: " + d.error); setTimeout(() => { const el = document.getElementById("restart-app-overlay"); if (el) el.remove(); }, 4000); return; }
+                        setTimeout(() => waitForApp(started), 2500);
+                    })
+                    .catch(() => setTimeout(() => waitForApp(started), 2500));   // the exit may beat the reply
+            });
+        })();
+
         // Support log download modal -- David's ask, 2026-09-12: for
         // problems with this app itself (not a specific lookup's trace,
         // which the Debug Log popup above already covers). Describe the
@@ -5809,10 +5998,13 @@
             cancelBtn.addEventListener("click", closeModal);
             modal.addEventListener("click", (e) => { if (e.target === modal) closeModal(); });
 
-            generateBtn.addEventListener("click", () => {
+            let supportLogDownSince = 0;
+            // Named (not an inline listener) so the "app isn't answering" retry below can call it
+            // directly -- a .click() on the disabled button would do nothing.
+            function runGenerate() {
                 generateBtn.disabled = true;
                 generateBtn.textContent = "Generating…";
-                statusEl.textContent = "Collecting logs…";
+                if (!supportLogDownSince) statusEl.textContent = "Collecting logs…";
                 resultEl.style.display = "none";
                 fetch("/api/support_log", {
                     method: "POST",
@@ -5821,6 +6013,7 @@
                 })
                     .then(r => r.json())
                     .then(d => {
+                        supportLogDownSince = 0;
                         generateBtn.disabled = false;
                         generateBtn.textContent = "Generate";
                         if (d.error) {
@@ -5851,11 +6044,22 @@
                             .catch(e => { statusEl.textContent = "Generated, but saving failed: " + e.message + " -- use the link below."; });
                     })
                     .catch(() => {
+                        // Network failure = the app isn't answering (not an app error, which comes back
+                        // as JSON above). Retry every 5 s for a minute -- the container is usually being
+                        // bounced (an EM engine restart restarts Docker) -- then say what to do.
+                        if (!supportLogDownSince) supportLogDownSince = Date.now();
+                        if (Date.now() - supportLogDownSince < 60000) {
+                            statusEl.textContent = window.appDownMessage(supportLogDownSince);
+                            setTimeout(runGenerate, 5000);
+                            return;
+                        }
+                        supportLogDownSince = 0;
                         generateBtn.disabled = false;
                         generateBtn.textContent = "Generate";
-                        statusEl.textContent = "Something went wrong generating the support log -- try again.";
+                        statusEl.textContent = "The app has not answered for a minute. On the EM, run ./Reset.sh (next to Deploy.sh) -- it saves the container log and state first, then restarts the app; the saved capture comes back inside the next support log.";
                     });
-            });
+            }
+            generateBtn.addEventListener("click", runGenerate);
         })();
     </script>
 </body>

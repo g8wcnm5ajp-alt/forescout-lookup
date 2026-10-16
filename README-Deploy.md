@@ -15,7 +15,7 @@ Run this **on the EM itself**, as root, from inside this unpacked directory. It:
 1. Installs the bundled `webapp-query.py` forced-command wrapper onto this EM (if not already present), generates a dedicated SSH keypair for this app, and registers it in this EM's own `authorized_keys`, restricted to that wrapper. The private key never leaves this box.
 2. Generates a self-signed HTTPS cert on first install (browsers show a one-time trust warning). Reused as-is on any rerun — replace it later via the app's own Certificate page, or drop a real cert/key into `certs/` by hand before rerunning `Deploy.sh`.
 3. Creates the `TechSupportBridge` docker network.
-4. Loads and starts the container (auto-restarts on reboot).
+4. Loads and starts the container (restart policy `always`: it comes back after a reboot, after the app exits, and on every Docker-daemon start regardless of how it was last stopped).
 5. Opens port 8443 through this EM's own firewall via `fstool fw addhook` (survives a firewall reactivation/reboot).
 6. On a genuinely fresh install, waits briefly for the container to generate the initial admin account and **prints the login straight to this console** — no need to dig through `docker logs` or the data volume by hand.
 
@@ -31,6 +31,20 @@ https://<this-EM's-IP>:8443/
 
 Default login: `admin` / a random password generated on first boot -- `Deploy.sh` prints it directly to the console on a fresh install (see step 6 above). Also in the container logs (`docker logs`) and written once to `/data/initial-admin-password.txt` if you need it again before first sign-in — you'll be forced to change it on first sign-in, after which that file is deleted. On a redeploy into existing data (an account already set up), `Deploy.sh` says so instead of showing a password, since the login hasn't changed.
 
+## Reset / restart
+
+If the app stops answering (the page does not load, or the Debug Log / Support Log buttons fail):
+
+```
+sudo ./Reset.sh
+```
+
+It first saves evidence under `./data/reset-logs/<timestamp>/` (container log and state, memory/disk, the Docker daemon's journal), then asks the app to exit by itself so Docker's restart policy starts a fresh one (a stopped container is simply started; `docker restart` is only the fallback for a hung app), and waits for the login page to answer. The app's **Support Log** zip includes the newest capture automatically, so generate one afterwards and send it. `sudo ./Reset.sh --logs-only` captures without restarting.
+
+While the app is still answering, the **Restart app** link at the top of the page does the same restart from the browser (the container restarts itself; running jobs are marked failed).
+
+Note: a Forescout engine start/restart on the EM also restarts the Docker daemon, which stops every container for 10-20 s. The app comes back by itself afterwards, but anything in flight at that moment is lost -- the page says "the app isn't answering, retrying" while that happens.
+
 ## Uninstall
 
 ```
@@ -41,7 +55,7 @@ Leaves `./data`, `./keys`, and `./certs` in place by default (so a later re-`Dep
 
 ## What's in this package
 
-- `Deploy.sh` / `Remove.sh` — install/uninstall scripts.
+- `Deploy.sh` / `Remove.sh` / `Reset.sh` — install / uninstall / capture-and-restart scripts.
 - `image.tar` — the pre-built Docker image (`docker load`'d by `Deploy.sh`, nothing built at install time).
 - `webapp-query.py` — the SSH forced-command wrapper Deploy.sh installs onto the EM's host OS.
 - `high-admission-trace.sh` — admission analysis (Live Analyze tab, bundle Analyze buttons); installed next to the wrapper.

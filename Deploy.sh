@@ -319,7 +319,7 @@ ACCOUNT_ALREADY_EXISTED=0
 docker run -d \
     --name "$CONTAINER_NAME" \
     --network "$NETWORK_NAME" \
-    --restart unless-stopped \
+    --restart always \
     --add-host="host.docker.internal:${BRIDGE_GATEWAY}" \
     -p "${HTTPS_PORT}:5000" \
     -v "${KEY_DIR}:/keys:ro" \

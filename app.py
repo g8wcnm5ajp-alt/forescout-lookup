@@ -11,8 +11,10 @@ import os
 import re
 import secrets
 import shutil
+import signal
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import zipfile
@@ -48,7 +50,7 @@ app = Flask(__name__)
 # start.sh), so this is always accurate without needing to remember to
 # update it separately from the version string. Shown next to the page
 # title (David's ask, 2026-09-12) and in the Help tab's own detail table.
-APP_VERSION = "1.18.0"
+APP_VERSION = "1.19.2"
 APP_AUTHOR = "David"
 DEPLOYED_AT = datetime.now(timezone.utc)
 
@@ -1475,7 +1477,9 @@ def start_techsupport_run(
                 if any_debug_enabled or trace_changes:
                     _update_ts_run(run_id, phase="waiting", waiting_until=int(time.time()) + minutes * 60)
                     time.sleep(minutes * 60)
-                _update_ts_run(run_id, phase="collecting")
+                # wait_skipped (David 2026-10-16): the card says out loud that there was no debug
+                # window, instead of jumping to "collecting" with no explanation.
+                _update_ts_run(run_id, phase="collecting", wait_skipped=not (any_debug_enabled or trace_changes))
                 # A much longer timeout than collect_techsupport's own
                 # 480s default -- that default exists for a caller
                 # actually waiting on the HTTP response. Nothing waits
@@ -1512,7 +1516,7 @@ def start_techsupport_run(
                 # for the tar inside collect_techsupport_target.
                 if trace_changes and trace_targets:
                     _revert_trace_targets(trace_targets)
-                _update_ts_run(run_id, phase="collecting")
+                _update_ts_run(run_id, phase="collecting", wait_skipped=not (any_debug or (trace_changes and trace_targets)))
                 bundles, failures = [], 0
                 _dbtables = estate_dbtables or {}
                 for tgt, plugs in estate_targets.items():
@@ -3217,7 +3221,10 @@ def api_techsupport_run(run_id):
     run = get_ts_run(run_id)
     if run is None:
         return jsonify({"error": "unknown run id"}), 404
-    return jsonify(run)
+    # server_now (David 2026-10-16): the panel's countdown to "collection fires" is anchored to
+    # this clock, not the browser's -- waiting_until is a server epoch, so a browser whose clock
+    # is off would otherwise show a wrong remaining time.
+    return jsonify(dict(run, server_now=int(time.time())))
 
 
 @app.route("/api/techsupport_log", methods=["GET"])
@@ -3417,6 +3424,20 @@ def api_support_log():
         if os.path.isfile(CASE_LOG_PATH):
             zf.writestr("case_log.jsonl", _redact_secrets(_redact_jsonl_username(CASE_LOG_PATH)))
 
+        # Reset.sh evidence (David 2026-10-16, after an app "crash" on a customer site left
+        # nothing to diagnose): the newest capture under /data/reset-logs/ -- container log,
+        # state, memory/disk, dockerd journal -- comes home inside this zip.
+        reset_root = os.path.join(DATA_DIR, "reset-logs")
+        if os.path.isdir(reset_root):
+            caps = sorted(d for d in os.listdir(reset_root) if os.path.isdir(os.path.join(reset_root, d)))
+            if caps:
+                cap_dir = os.path.join(reset_root, caps[-1])
+                for fn in sorted(os.listdir(cap_dir)):
+                    fp = os.path.join(cap_dir, fn)
+                    if os.path.isfile(fp) and os.path.getsize(fp) <= 2_000_000:
+                        with open(fp, "rb") as fh:
+                            zf.writestr(f"reset-logs/{caps[-1]}/{fn}", _redact_secrets(fh.read().decode("utf-8", "replace")))
+
         # Best-effort -- an SSH hiccup to the EM shouldn't block getting
         # the rest of the bundle back, same reasoning as the live-poll
         # log views above.
@@ -3454,6 +3475,32 @@ def support_log_download_route():
         SUPPORT_LOG_PATH, mimetype="application/zip", as_attachment=True,
         download_name="forescout-lookup-support-log.zip",
     )
+
+
+# ---------------------------------------------------------------------
+# Restart app (David 2026-10-16): "a reset button on the top of the screen that will hopefully
+# restart the service". The app is one process (`python app.py`) in a container started with
+# --restart unless-stopped, so the cleanest restart is to EXIT: Docker starts a fresh process
+# in a few seconds, every thread and stuck subprocess is gone, and the start-up sweep
+# (_mark_interrupted_runs) marks whatever was running as failed with a clear reason. No docker
+# socket in the container, no privilege needed. Honest limit: this only works while the app can
+# still answer one request -- for a fully hung app, Reset.sh on the EM does the same from
+# outside (and captures evidence first). A plain `python app.py` run outside Docker just stops.
+# ---------------------------------------------------------------------
+@app.route("/admin/restart_app", methods=["POST"])
+def admin_restart_app():
+    if not _check_csrf():
+        return jsonify({"error": "Session expired -- please refresh and try again."}), 403
+    _log_activity("app_restart", username=session.get("username"))
+
+    def _exit_soon():
+        time.sleep(1.0)   # let this response reach the browser first
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(3)
+
+    threading.Thread(target=_exit_soon, daemon=True).start()
+    return jsonify({"ok": True})
 
 
 @app.route("/api/techsupport_run/<run_id>/kill", methods=["POST"])
@@ -3888,6 +3935,13 @@ def clear_log_section(section):
 
 
 if __name__ == "__main__":
+    # SIGTERM = `docker stop` / `docker restart` / a Docker-daemon restart (every EM engine
+    # start or restart does one). This process is PID 1 in the container, and PID 1 gets no
+    # default signal action, so without this handler every stop was a 10 s wait and a
+    # force-kill (seen live 2026-10-16). Exit at once instead; nothing here needs a graceful
+    # shutdown (the run stores are rewritten atomically, and the start-up sweep below marks
+    # whatever was running as failed).
+    signal.signal(signal.SIGTERM, lambda signum, frame: os._exit(0))
     _interrupted = _mark_interrupted_runs()
     if _interrupted:
         print(f"Marked runs cut off by the last restart as failed: {_interrupted}", flush=True)
